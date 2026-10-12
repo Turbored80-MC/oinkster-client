@@ -10,14 +10,18 @@ namespace OinksterClient.Tests;
 // tests check the launcher can load it and that it is internally consistent.
 public sealed class ModuleCatalogTests
 {
-    // Capabilities the native runtime provides itself (its own DX12 hook and
-    // window routing). Every other capability needs a validated game adapter.
+    // Capabilities the shipped native client has a reviewed implementation for
+    // (its own DX12 hook and window routing, plus the game adapters).
+    // Mirrors Native/src/Capabilities.cpp.
     private static readonly HashSet<string> SupportedCapabilities =
-        ["render-metrics", "frame-composition", "local-input", "input-synthesis", "local-player-position"];
+    [
+        "render-metrics", "frame-composition", "local-input", "input-synthesis", "local-player-position",
+        "local-player-rotation", "effects", "equipment", "inventory"
+    ];
 
     private static readonly HashSet<string> KnownCapabilities =
     [
-        .. SupportedCapabilities, "local-player-rotation", "inventory", "equipment", "effects",
+        .. SupportedCapabilities,
         "network-metrics", "server-state", "resource-packs", "combat-events", "selected-block-render", "damage-render",
         "sound-events", "chat-events", "camera-presentation", "hand-presentation"
     ];

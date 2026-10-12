@@ -6,6 +6,8 @@
 #include "Oinkster/PlayerSkinLayout.hpp"
 #include "Oinkster/ClickGui.hpp"
 #include "Oinkster/Dx12Overlay.hpp"
+#include "Oinkster/EnttRegistry.hpp"
+#include "Oinkster/GameItems.hpp"
 #include "Oinkster/InputState.hpp"
 #include "Oinkster/Json.hpp"
 #include "Oinkster/StatusPipe.hpp"
@@ -26,15 +28,18 @@
 #include <chrono>
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <functional>
 #include <iostream>
 #include <set>
+#include <span>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
 #include <unordered_set>
+#include <vector>
 
 // Deterministic: every time-based test drives explicit timestamps. Nothing
 // here sleeps.
@@ -810,6 +815,196 @@ void EquipmentInventoryAndEffects() {
         "Effects sort by remaining time and warn when expiring");
 }
 
+void EnttRegistryLookupMirrorsTheGame() {
+    namespace E = Oinkster::EnttRegistry;
+    namespace L = Oinkster::EnttRegistry::Layout;
+    Require(E::TypeHash("ActorRotationComponent") == 0x75DF36B7U, "Bare clang type names hash like the 1.26.5203 immediates");
+    Require(E::TypeHash("MobEffectsComponent") == 0xE6A1B550U, "MobEffectsComponent hash");
+
+    struct Rotation { float pitch; float yaw; float previousPitch; float previousYaw; };
+    constexpr std::uint32_t rotationHash = E::TypeHash("ActorRotationComponent");
+    constexpr std::uint32_t version = 3U << 18U;
+    constexpr std::uint32_t entityIndex = 5000;   // sparse page 2, slot 904
+    constexpr std::uint32_t payloadIndex = 130;   // payload page 1, slot 2
+
+    std::vector<Rotation> payloadPage(L::PayloadPageEntries);
+    payloadPage[payloadIndex % L::PayloadPageEntries] = {12.5F, -45.0F, 0.0F, 0.0F};
+    std::array<const void*, 2> payloadPages{nullptr, payloadPage.data()};
+    std::vector<std::uint32_t> sparsePage(L::SparsePageEntries, 0xFFFFFFFFU);
+    sparsePage[entityIndex % L::SparsePageEntries] = version | payloadIndex;
+    std::array<const void*, 3> sparsePages{nullptr, nullptr, sparsePage.data()};
+
+    std::array<std::uint8_t, 0x60> storage{};
+    auto put = [](auto& buffer, std::size_t offset, auto value) { std::memcpy(buffer.data() + offset, &value, sizeof(value)); };
+    put(storage, L::StorageSparseBegin, sparsePages.data());
+    put(storage, L::StorageSparseEnd, sparsePages.data() + sparsePages.size());
+    put(storage, L::StoragePayloadBegin, payloadPages.data());
+    put(storage, L::StoragePayloadEnd, payloadPages.data() + payloadPages.size());
+
+    // Two pools chained in one bucket: the walk must follow node.next.
+    std::array<std::uint8_t, 2 * L::PoolNodeSize> nodes{};
+    put(nodes, L::PoolNodeNext, static_cast<std::size_t>(-1));
+    put(nodes, L::PoolNodeKey, rotationHash);
+    put(nodes, L::PoolNodeStorage, static_cast<const void*>(storage.data()));
+    put(nodes, L::PoolNodeSize + L::PoolNodeNext, std::size_t{0});
+    put(nodes, L::PoolNodeSize + L::PoolNodeKey, E::TypeHash("StateVectorComponent"));
+    std::array<std::size_t, 4> buckets;
+    buckets.fill(static_cast<std::size_t>(-1));
+    buckets[rotationHash & 3U] = 1;
+
+    std::array<std::uint8_t, 0x80> registry{};
+    put(registry, L::RegistryPoolBucketsBegin, buckets.data());
+    put(registry, L::RegistryPoolBucketsEnd, buckets.data() + buckets.size());
+    put(registry, L::RegistryPoolNodesBegin, nodes.data());
+    put(registry, L::RegistryPoolNodesEnd, nodes.data() + nodes.size());
+
+    std::array<std::uint8_t, 0x20> actor{};
+    put(actor, L::ActorRegistry, static_cast<const void*>(registry.data()));
+    put(actor, L::ActorEntity, version | entityIndex);
+    E::EntityRef entity;
+    Require(E::ReadActorEntity(actor.data(), entity), "Actor EntityContext reads");
+    const auto* found = static_cast<const Rotation*>(E::FindComponent(entity, rotationHash, sizeof(Rotation)));
+    Require(found == &payloadPage[payloadIndex % L::PayloadPageEntries], "Lookup lands on the payload slot");
+    Require(found->yaw == -45.0F, "Component bytes are the payload's");
+
+    Require(!E::FindComponent({registry.data(), (4U << 18U) | entityIndex}, rotationHash, sizeof(Rotation)), "Stale versions are not members");
+    Require(!E::FindComponent({registry.data(), version | 1U}, rotationHash, sizeof(Rotation)), "Entities without a sparse page are not members");
+    Require(!E::FindComponent(entity, E::TypeHash("MobEffectsComponent"), 0x18), "Missing pools fail closed");
+    buckets[rotationHash & 3U] = 7;
+    Require(!E::FindComponent(entity, rotationHash, sizeof(Rotation)), "Out-of-range node indices fail closed");
+    std::array<std::size_t, 3> oddBuckets{};
+    put(registry, L::RegistryPoolBucketsBegin, oddBuckets.data());
+    put(registry, L::RegistryPoolBucketsEnd, oddBuckets.data() + oddBuckets.size());
+    Require(!E::FindComponent(entity, rotationHash, sizeof(Rotation)), "Non-power-of-two bucket counts are misreads");
+    Require(!E::ReadActorEntity(nullptr, entity), "Null actors fail");
+}
+
+void MobEffectRecordsAndRotationPlausibility() {
+    const auto speed = M::ToStatusEffect({1, 1680, 1});
+    Require(speed && speed->effectId == "minecraft:speed" && speed->amplifier == 1, "Speed II maps by id");
+    Require(speed->remaining == std::chrono::milliseconds(84'000), "Ticks are 50 ms");
+    const auto infinite = M::ToStatusEffect({16, -1, 0});
+    Require(infinite && infinite->effectId == "minecraft:night_vision" && !infinite->remaining, "-1 ticks is infinite");
+    Require(M::FormatStatusEffect(*infinite, true) == "Night vision  **:**", "Readable name from the id");
+    Require(!M::ToStatusEffect({0, 200, 0}), "Id 0 is the empty slot");
+    Require(!M::ToStatusEffect({1, 0, 0}) && !M::ToStatusEffect({1, -5, 0}), "Expired slots are dropped");
+    Require(!M::ToStatusEffect({1, 20, -1}) && !M::ToStatusEffect({1, 20, 256}) && !M::ToStatusEffect({65, 20, 0}), "Implausible records are dropped");
+    const auto unknown = M::ToStatusEffect({37, 20, 0});
+    Require(unknown && unknown->effectId == "minecraft:effect_37", "Unknown ids keep a stable fallback id");
+
+    Require(M::IsPlausibleRotation(-90.0F, 179.9F) && M::IsPlausibleRotation(45.0F, -360.0F), "Valid rotations pass");
+    Require(!M::IsPlausibleRotation(91.0F, 0.0F) && !M::IsPlausibleRotation(0.0F, 1e9F)
+        && !M::IsPlausibleRotation(std::nanf(""), 0.0F), "Misread rotations fail");
+}
+
+// An MSVC std::string as laid out in memory, for building fake game objects.
+struct FakeMsvcString {
+    char buffer[16]{};
+    std::size_t size{};
+    std::size_t capacity{15};
+    explicit FakeMsvcString(const std::string& text) {
+        if (text.size() < 16) {
+            std::memcpy(buffer, text.data(), text.size());
+        } else {
+            const char* heap = text.data();
+            std::memcpy(buffer, &heap, sizeof(heap));
+            capacity = text.size();
+        }
+        size = text.size();
+    }
+};
+static_assert(sizeof(FakeMsvcString) == 0x20);
+
+void GameItemsReadStacksAndDamage() {
+    namespace G = Oinkster::GameItems;
+    namespace L = Oinkster::GameItems::Layout;
+    auto put = [](auto& buffer, std::size_t offset, auto value) { std::memcpy(buffer.data() + offset, &value, sizeof(value)); };
+
+    // Item with a heap-allocated raw name and an SSO namespace.
+    const std::string longName = "netherite_chestplate";
+    std::array<std::uint8_t, 0x140> item{};
+    put(item, L::ItemRawName, FakeMsvcString(longName));
+    put(item, L::ItemNamespace, FakeMsvcString("minecraft"));
+    const void* itemPointer = item.data();
+    std::array<const void*, 2> counter{itemPointer, nullptr};
+
+    // CompoundTag { vptr; map head } with a 3-node tree: "Damage" (root),
+    // "Count" (left), "RepairCost" (right), so the walk must branch.
+    struct Node { std::array<std::uint8_t, 0x70> bytes{}; };
+    Node head, damageNode, countNode, repairNode;
+    auto key = [&](Node& node, const char* text) { put(node.bytes, L::MapNodeKey, FakeMsvcString(text)); };
+    key(damageNode, "Damage");
+    key(countNode, "Count");
+    key(repairNode, "RepairCost");
+    put(head.bytes, L::MapNodeParent, static_cast<const void*>(&damageNode));
+    head.bytes[L::MapNodeIsNil] = 1;
+    for (Node* leaf : {&countNode, &repairNode}) {
+        put(leaf->bytes, L::MapNodeLeft, static_cast<const void*>(&head));
+        put(leaf->bytes, L::MapNodeRight, static_cast<const void*>(&head));
+    }
+    put(damageNode.bytes, L::MapNodeLeft, static_cast<const void*>(&countNode));
+    put(damageNode.bytes, L::MapNodeRight, static_cast<const void*>(&repairNode));
+    damageNode.bytes[L::MapNodeVariantIndex] = L::VariantIntTag;
+    put(damageNode.bytes, L::MapNodeValue + L::IntTagValue, 120);
+    repairNode.bytes[L::MapNodeVariantIndex] = L::VariantIntTag;
+    put(repairNode.bytes, L::MapNodeValue + L::IntTagValue, 7);
+    countNode.bytes[L::MapNodeVariantIndex] = 1;  // ByteTag: not an IntTag
+    std::array<std::uint8_t, 0x18> tag{};
+    put(tag, L::TagMapHead, static_cast<const void*>(&head));
+
+    int value{};
+    Require(G::ReadIntTag(tag.data(), "Damage", value) && value == 120, "Root key");
+    Require(G::ReadIntTag(tag.data(), "RepairCost", value) && value == 7, "Right branch");
+    Require(!G::ReadIntTag(tag.data(), "Count", value), "Non-IntTag variants are refused");
+    Require(!G::ReadIntTag(tag.data(), "Missing", value), "Missing keys reach the nil head");
+
+    std::vector<std::uint8_t> stacks(3 * L::ItemStackSize);
+    std::span<std::uint8_t> armored(stacks.data() + L::ItemStackSize, L::ItemStackSize);
+    put(armored, L::StackItem, static_cast<const void*>(counter.data()));
+    put(armored, L::StackUserData, static_cast<const void*>(tag.data()));
+    armored[L::StackCount] = 1;
+
+    Oinkster::Modules::ItemRecord record;
+    Require(G::ReadItemRecord(stacks.data(), record) && record.count == 0, "Null item pointers are empty slots");
+    Require(G::ReadItemRecord(armored.data(), record), "Stack reads");
+    Require(record.name == longName && record.itemNamespace == "minecraft" && record.count == 1 && record.damage == 120, "Fields");
+    const auto stack = Oinkster::Modules::ToItemStack(record);
+    Require(stack && stack->itemId == "minecraft:netherite_chestplate" && stack->durabilityMax == 592
+        && stack->durabilityRemaining == 472, "Durability = vanilla max - Damage");
+
+    std::array<std::uint8_t, 0x1B8> container{};
+    put(container, L::SimpleContainerItems, reinterpret_cast<std::uintptr_t>(stacks.data()));
+    put(container, L::SimpleContainerItems + 8, reinterpret_cast<std::uintptr_t>(stacks.data() + stacks.size()));
+    std::uintptr_t begin{};
+    std::size_t count{};
+    Require(G::ReadStackVector(container.data(), L::SimpleContainerItems, 64, begin, count) && count == 3, "Vector bounds");
+    Require(!G::ReadStackVector(container.data(), L::SimpleContainerItems, 2, begin, count), "Oversized vectors are misreads");
+    put(container, L::SimpleContainerItems + 8, reinterpret_cast<std::uintptr_t>(stacks.data() + 5));
+    Require(!G::ReadStackVector(container.data(), L::SimpleContainerItems, 64, begin, count), "Unaligned vectors are misreads");
+}
+
+void ItemRecordsAndVanillaDurability() {
+    namespace S = Oinkster::Modules;
+    Require(S::VanillaMaxDurability("minecraft:diamond_sword") == 1561 && S::VanillaMaxDurability("minecraft:wooden_hoe") == 59
+        && S::VanillaMaxDurability("minecraft:iron_boots") == 195 && S::VanillaMaxDurability("minecraft:chainmail_helmet") == 165
+        && S::VanillaMaxDurability("minecraft:golden_leggings") == 105 && S::VanillaMaxDurability("minecraft:elytra") == 432
+        && S::VanillaMaxDurability("minecraft:copper_boots") == 143 && S::VanillaMaxDurability("minecraft:copper_axe") == 190,
+        "Vanilla durability table");
+    Require(!S::VanillaMaxDurability("minecraft:stick") && !S::VanillaMaxDurability("minecraft:stone_helmet")
+        && !S::VanillaMaxDurability("custom:diamond_sword"), "Non-durable and custom items");
+    Require(S::IsPlausibleIdentifier("diamond_sword") && !S::IsPlausibleIdentifier("Diamond Sword")
+        && !S::IsPlausibleIdentifier("") && !S::IsPlausibleIdentifier("\x01garbage"), "Identifier check");
+
+    const auto stone = S::ToItemStack({"", "cobblestone", 64, std::nullopt});
+    Require(stone && stone->itemId == "minecraft:cobblestone" && stone->count == 64 && !stone->durabilityMax, "Default namespace");
+    const auto fresh = S::ToItemStack({"minecraft", "bow", 1, std::nullopt});
+    Require(fresh && fresh->durabilityRemaining == 384, "Untouched items are at full durability");
+    const auto overDamaged = S::ToItemStack({"minecraft", "bow", 1, 999});
+    Require(overDamaged && !overDamaged->durabilityMax, "Implausible damage drops durability, not the item");
+    Require(!S::ToItemStack({"minecraft", "bow", 0, std::nullopt}) && !S::ToItemStack({"minecraft", "Bow!", 1, std::nullopt}),
+        "Empty and garbage stacks");
+}
+
 void ServerNamesNeverExposeAddresses() {
     Require(M::LooksLikeAddress(L"192.168.1.20") && M::LooksLikeAddress(L"play.example.net") && M::LooksLikeAddress(L"example:19132")
         && M::LooksLikeAddress(L"fe80::1"), "Addresses and hostnames are detected");
@@ -1475,7 +1670,7 @@ void PreservedShutdownTests() {
 }
 
 int main() {
-    const std::array<std::pair<const char*, void (*)()>, 39> tests{{
+    const std::array<std::pair<const char*, void (*)()>, 43> tests{{
         {"CatalogIdsAreUniqueAndWellFormed", CatalogIdsAreUniqueAndWellFormed},
         {"NativeCatalogMatchesLauncherJson", NativeCatalogMatchesLauncherJson},
         {"AvailabilityFollowsCapabilities", AvailabilityFollowsCapabilities},
@@ -1500,6 +1695,10 @@ int main() {
         {"ClockAndSessionStatistics", ClockAndSessionStatistics},
         {"TelemetryDirectionAndSpeed", TelemetryDirectionAndSpeed},
         {"EquipmentInventoryAndEffects", EquipmentInventoryAndEffects},
+        {"EnttRegistryLookupMirrorsTheGame", EnttRegistryLookupMirrorsTheGame},
+        {"MobEffectRecordsAndRotationPlausibility", MobEffectRecordsAndRotationPlausibility},
+        {"GameItemsReadStacksAndDamage", GameItemsReadStacksAndDamage},
+        {"ItemRecordsAndVanillaDurability", ItemRecordsAndVanillaDurability},
         {"ServerNamesNeverExposeAddresses", ServerNamesNeverExposeAddresses},
         {"ComboResetRules", ComboResetRules},
         {"HitDistanceUsesNearestBoundingBoxPoint", HitDistanceUsesNearestBoundingBoxPoint},

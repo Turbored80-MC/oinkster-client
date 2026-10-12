@@ -41,6 +41,12 @@ bool IsPlausibleWorldPosition(const Vec3& position) noexcept {
         && position.y >= -4096.0 && position.y <= 4096.0;
 }
 
+bool IsPlausibleRotation(float pitchDegrees, float yawDegrees) noexcept {
+    return std::isfinite(pitchDegrees) && std::isfinite(yawDegrees)
+        && pitchDegrees >= -90.0F && pitchDegrees <= 90.0F
+        && yawDegrees >= -360.0F && yawDegrees <= 360.0F;
+}
+
 Vec3 FeetFromEye(const Vec3& eye) noexcept {
     return {eye.x, eye.y - PlayerEyeHeight, eye.z};
 }

@@ -3,6 +3,7 @@
 #include "Oinkster/Modules/StatusLogic.hpp"
 #include "Oinkster/Modules/TelemetryLogic.hpp"
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <ctime>
 #include <cwctype>
@@ -117,6 +118,109 @@ std::string FormatStatusEffect(const StatusEffect& effect, bool showLevel) {
     if (showLevel && effect.amplifier > 0) name += " " + EffectLevel(effect.amplifier);
     const std::string remaining = effect.remaining ? FormatDuration(*effect.remaining) : std::string("**:**");
     return name + "  " + remaining;
+}
+
+std::string_view EffectIdName(std::uint32_t id) noexcept {
+    // Bedrock's MobEffect registry order (the ids MobEffectInstance stores).
+    static constexpr std::array<std::string_view, 37> Names{
+        "", "minecraft:speed", "minecraft:slowness", "minecraft:haste", "minecraft:mining_fatigue",
+        "minecraft:strength", "minecraft:instant_health", "minecraft:instant_damage", "minecraft:jump_boost",
+        "minecraft:nausea", "minecraft:regeneration", "minecraft:resistance", "minecraft:fire_resistance",
+        "minecraft:water_breathing", "minecraft:invisibility", "minecraft:blindness", "minecraft:night_vision",
+        "minecraft:hunger", "minecraft:weakness", "minecraft:poison", "minecraft:wither",
+        "minecraft:health_boost", "minecraft:absorption", "minecraft:saturation", "minecraft:levitation",
+        "minecraft:fatal_poison", "minecraft:conduit_power", "minecraft:slow_falling", "minecraft:bad_omen",
+        "minecraft:village_hero", "minecraft:darkness", "minecraft:trial_omen", "minecraft:wind_charged",
+        "minecraft:weaving", "minecraft:oozing", "minecraft:infested", "minecraft:raid_omen"};
+    return id < Names.size() ? Names[id] : std::string_view{};
+}
+
+std::optional<StatusEffect> ToStatusEffect(const MobEffectRecord& record) {
+    // Ids are small registry indices; amplifiers are a byte in the protocol.
+    constexpr std::uint32_t MaxEffectId = 64;
+    constexpr std::int32_t InfiniteDuration = -1;
+    constexpr std::int32_t MillisecondsPerTick = 50;
+    if (record.id == 0 || record.id > MaxEffectId) return std::nullopt;
+    if (record.amplifier < 0 || record.amplifier > 255) return std::nullopt;
+    if (record.durationTicks <= 0 && record.durationTicks != InfiniteDuration) return std::nullopt;
+
+    StatusEffect effect;
+    const auto name = EffectIdName(record.id);
+    effect.effectId = name.empty() ? std::format("minecraft:effect_{}", record.id) : std::string(name);
+    effect.amplifier = record.amplifier;
+    if (record.durationTicks != InfiniteDuration) {
+        effect.remaining = std::chrono::milliseconds(static_cast<std::int64_t>(record.durationTicks) * MillisecondsPerTick);
+    }
+    return effect;
+}
+
+bool IsPlausibleIdentifier(std::string_view text) noexcept {
+    if (text.empty() || text.size() > 96) return false;
+    return std::ranges::all_of(text, [](char c) {
+        return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '.' || c == '-' || c == '/';
+    });
+}
+
+std::optional<int> VanillaMaxDurability(std::string_view itemId) noexcept {
+    constexpr std::string_view prefix = "minecraft:";
+    if (!itemId.starts_with(prefix)) return std::nullopt;
+    const auto name = itemId.substr(prefix.size());
+
+    struct Entry { std::string_view name; int durability; };
+    static constexpr std::array<Entry, 22> Exact{{
+        {"bow", 384}, {"crossbow", 465}, {"trident", 250}, {"fishing_rod", 384}, {"shears", 238},
+        {"flint_and_steel", 64}, {"shield", 336}, {"elytra", 432}, {"carrot_on_a_stick", 25},
+        {"warped_fungus_on_a_stick", 100}, {"mace", 500}, {"brush", 64}, {"turtle_helmet", 275},
+        {"wolf_armor", 64},
+        {"leather_helmet", 55}, {"leather_chestplate", 80}, {"leather_leggings", 75}, {"leather_boots", 65},
+        {"copper_helmet", 121}, {"copper_chestplate", 176}, {"copper_leggings", 165}, {"copper_boots", 143}}};
+    for (const auto& entry : Exact) if (entry.name == name) return entry.durability;
+
+    // <material>_<piece> armor and tools.
+    struct Material { std::string_view material; int tool; std::array<int, 4> armor; };
+    static constexpr std::array<Material, 7> Materials{{
+        {"wooden", 59, {0, 0, 0, 0}}, {"stone", 131, {0, 0, 0, 0}}, {"copper", 190, {0, 0, 0, 0}},
+        {"iron", 250, {165, 240, 225, 195}}, {"golden", 32, {77, 112, 105, 91}},
+        {"diamond", 1561, {363, 528, 495, 429}}, {"netherite", 2031, {407, 592, 555, 481}}}};
+    static constexpr std::array<std::string_view, 6> Tools{"sword", "pickaxe", "axe", "shovel", "hoe", "spear"};
+    static constexpr std::array<std::string_view, 4> Armor{"helmet", "chestplate", "leggings", "boots"};
+    const auto split = name.find('_');
+    if (split != std::string_view::npos) {
+        const auto material = name.substr(0, split);
+        const auto piece = name.substr(split + 1);
+        if (material == "chainmail") {
+            for (std::size_t index = 0; index < Armor.size(); ++index) {
+                if (piece == Armor[index]) return std::array{165, 240, 225, 195}[index];
+            }
+        }
+        for (const auto& entry : Materials) {
+            if (entry.material != material) continue;
+            for (const auto tool : Tools) if (piece == tool) return entry.tool;
+            for (std::size_t index = 0; index < Armor.size(); ++index) {
+                if (piece == Armor[index] && entry.armor[index] > 0) return entry.armor[index];
+            }
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<ItemStack> ToItemStack(const ItemRecord& record) {
+    if (record.count <= 0 || record.count > 255) return std::nullopt;
+    if (!IsPlausibleIdentifier(record.name)) return std::nullopt;
+    const std::string itemNamespace = record.itemNamespace.empty() ? std::string("minecraft") : record.itemNamespace;
+    if (!IsPlausibleIdentifier(itemNamespace)) return std::nullopt;
+
+    ItemStack stack;
+    stack.itemId = itemNamespace + ":" + record.name;
+    stack.count = record.count;
+    if (const auto max = VanillaMaxDurability(stack.itemId)) {
+        const int damage = record.damage.value_or(0);
+        if (damage >= 0 && damage <= *max) {
+            stack.durabilityMax = *max;
+            stack.durabilityRemaining = *max - damage;
+        }
+    }
+    return stack;
 }
 
 std::string_view ArmorSlotName(ArmorSlot slot) noexcept {

@@ -3,6 +3,7 @@
 #include "Oinkster/HookManager.hpp"
 #include "Oinkster/Diagnostics.hpp"
 #include "Oinkster/PlayerSkinTelemetry.hpp"
+#include "Oinkster/PlayerStateTelemetry.hpp"
 #include "Oinkster/SafeMemory.hpp"
 #include "Oinkster/SignatureScan.hpp"
 #include "Oinkster/SupportedBuild.hpp"
@@ -121,6 +122,9 @@ void HookedRenderLevelPrep(void* screen, void* screenContext, void* levelRendere
     // A misread offset yields NaNs or astronomically large values; those are
     // dropped here and never reach a module.
     if (!Modules::IsPlausibleWorldPosition(transform.position)) return;
+    // Rotation (and, on its own slower cadence, status effects) come from the
+    // same Actor's entt components.
+    PlayerStateTelemetry::Observe(actor, transform, now);
     lastPublished = now;
     moduleManager->Publish(transform);
 }
@@ -167,6 +171,7 @@ bool Install(ModuleManager& modules, std::wstring& detail) noexcept {
     }
 
     renderLevelPrepTarget = target;
+    PlayerStateTelemetry::Attach(modules);
     lastPublished = {};
     lastSampleLogged = {};
     samplesLogged = 0;
@@ -205,6 +210,7 @@ void Remove() noexcept {
             Diagnostics::LogLine("warning", "world_telemetry_remove",
                 "render thread still inside the _renderLevelPrep detour; leaving its trampoline installed");
             UnloadGuard::Block("world telemetry trampoline still had a live thread at detach");
+            PlayerStateTelemetry::Detach();
             moduleManager = nullptr;
             return;
         }
@@ -212,6 +218,8 @@ void Remove() noexcept {
         renderLevelPrepTarget = nullptr;
         originalRenderLevelPrep = nullptr;
     }
+    // The hook is drained (or was never installed), so Observe cannot run.
+    PlayerStateTelemetry::Detach();
     moduleManager = nullptr;
 }
 

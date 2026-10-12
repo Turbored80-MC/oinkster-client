@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <string>
 
 // ---------------------------------------------------------------------------
 // Guarded reads of the game's address space.
@@ -67,6 +68,27 @@ template <typename T>
     constexpr DWORD executable = PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
     if ((information.Protect & executable) == 0) return nullptr;
     return slot;
+}
+
+// Reads an MSVC std::string (16-byte SSO buffer or heap pointer, then size,
+// then capacity) stored at base+offset. Fails on any implausible header and
+// on strings longer than maxLength, so a misread offset never allocates or
+// copies an attacker- or garbage-sized buffer.
+[[nodiscard]] inline bool ReadMsvcString(const void* base, std::size_t offset, std::string& value, std::size_t maxLength = 256) {
+    struct Header { char buffer[16]; std::size_t size; std::size_t capacity; } header{};
+    if (!ReadField(base, offset, header)) return false;
+    if (header.size > maxLength || header.capacity < 15 || header.size > header.capacity) return false;
+    if (header.capacity < 16) {
+        value.assign(header.buffer, header.size);
+        return true;
+    }
+    const void* heap{};
+    std::memcpy(&heap, header.buffer, sizeof(heap));
+    if (!heap || !IsReadable(heap, header.size + 1)) return false;
+    std::string result(header.size, '\0');
+    if (header.size != 0 && !CopyGuarded(result.data(), heap, header.size)) return false;
+    value = std::move(result);
+    return true;
 }
 
 }

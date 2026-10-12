@@ -69,6 +69,38 @@ struct SessionCounters {
 // "Speed II  1:24", "Night vision  **:**" (infinite, as Bedrock shows it).
 [[nodiscard]] std::string FormatStatusEffect(const StatusEffect& effect, bool showLevel);
 
+// One MobEffectInstance as read from game memory: the effect's numeric id,
+// remaining duration in game ticks (-1 = infinite) and 0-based amplifier.
+struct MobEffectRecord {
+    std::uint32_t id{};
+    std::int32_t durationTicks{};
+    std::int32_t amplifier{};
+};
+
+// Bedrock's numeric effect id -> "minecraft:<name>", or an empty view for ids
+// this build's table does not name.
+[[nodiscard]] std::string_view EffectIdName(std::uint32_t id) noexcept;
+// The typed effect for a record, or nullopt when the slot is empty, expired
+// or implausible (unknown ids still pass, named "minecraft:effect_<id>").
+[[nodiscard]] std::optional<StatusEffect> ToStatusEffect(const MobEffectRecord& record);
+
+// One ItemStack as read from game memory. Max durability is not read from the
+// game (that needs a call into Item::getComponent); it comes from
+// VanillaMaxDurability, so custom items report no durability.
+struct ItemRecord {
+    std::string itemNamespace;   // empty = "minecraft"
+    std::string name;            // raw name id, e.g. "diamond_sword"
+    int count{};
+    std::optional<int> damage;   // the "Damage" NBT tag; nullopt = untouched
+};
+
+// Lowercase identifier text as Bedrock uses it for namespaces and item names.
+[[nodiscard]] bool IsPlausibleIdentifier(std::string_view text) noexcept;
+// Vanilla max durability by namespaced id ("minecraft:iron_boots" -> 195).
+[[nodiscard]] std::optional<int> VanillaMaxDurability(std::string_view itemId) noexcept;
+// The typed stack for a record, or nullopt for empty or implausible slots.
+[[nodiscard]] std::optional<ItemStack> ToItemStack(const ItemRecord& record);
+
 [[nodiscard]] std::string_view ArmorSlotName(ArmorSlot slot) noexcept;
 [[nodiscard]] std::string_view SessionKindName(SessionKind kind) noexcept;
 

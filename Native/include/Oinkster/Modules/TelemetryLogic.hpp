@@ -22,6 +22,10 @@ namespace Oinkster::Modules {
 // band around the build limits. Anything else is a misread, never data.
 [[nodiscard]] bool IsPlausibleWorldPosition(const Vec3& position) noexcept;
 
+// Pitch must be finite and within [-90, 90]; yaw finite and within one turn
+// either way. Anything else means the rotation offset was misread.
+[[nodiscard]] bool IsPlausibleRotation(float pitchDegrees, float yawDegrees) noexcept;
+
 // Bedrock's standing eye height. World telemetry reads the first-person
 // render camera, which sits this far above the player's feet.
 inline constexpr double PlayerEyeHeight = 1.62;

@@ -50,8 +50,10 @@ add_library(OinksterCore STATIC
   src/ControlPipe.cpp
   src/ClickGui.cpp
   src/Diagnostics.cpp
+  src/EnttRegistry.cpp
   src/Dx12Overlay.cpp
   src/FrameBlend.cpp
+  src/GameItems.cpp
   src/HookManager.cpp
   src/Json.cpp
   src/Module.cpp
@@ -62,6 +64,7 @@ add_library(OinksterCore STATIC
   src/OverlayUi.cpp
   src/PipeWait.cpp
   src/PlayerSkinTelemetry.cpp
+  src/PlayerStateTelemetry.cpp
   src/ProcessInjector.cpp
   src/Renderer.cpp
   src/Runtime.cpp

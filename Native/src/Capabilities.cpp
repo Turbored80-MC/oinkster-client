@@ -17,10 +17,12 @@ constexpr std::array<CapabilityInfo, CapabilityCount> Infos{{
     // Reviewed WorldTelemetry implementation for 1.26.5203. It remains
     // Pending until its unique signature validates in the live process.
     {"local-player-position", L"local player position", true},
-    {"local-player-rotation", L"local player rotation", false},
-    {"inventory", L"inventory snapshot", false},
-    {"equipment", L"equipment snapshot", false},
-    {"effects", L"status effects", false},
+    // PlayerStateTelemetry reads these from the same validated hook's Actor
+    // through the entt registry; Pending until the first plausible read.
+    {"local-player-rotation", L"local player rotation", true},
+    {"inventory", L"inventory snapshot", true},
+    {"equipment", L"equipment snapshot", true},
+    {"effects", L"status effects", true},
     {"network-metrics", L"network metrics", false},
     {"server-state", L"server state", false},
     {"resource-packs", L"resource packs", false},
@@ -73,15 +75,17 @@ CapabilityStatus DefaultCapabilityStatus(Capability capability) {
         return {CapabilityState::Pending,
             L"Waiting for the world-telemetry signature to validate against Minecraft " + Build() + L"."};
     case Capability::LocalPlayerRotation:
-        return {CapabilityState::Unavailable,
-            L"No validated yaw/pitch source exists for Minecraft " + Build()
-            + L"; world telemetry reads only the camera position."};
+        return {CapabilityState::Pending,
+            L"Waiting for the first validated ActorRotationComponent read in Minecraft " + Build() + L"."};
     case Capability::Inventory:
-        return {CapabilityState::Unavailable, L"No validated inventory reader exists for Minecraft " + Build() + L"."};
+        return {CapabilityState::Pending,
+            L"Waiting for the first validated player inventory read in Minecraft " + Build() + L"."};
     case Capability::Equipment:
-        return {CapabilityState::Unavailable, L"No validated equipment reader exists for Minecraft " + Build() + L"."};
+        return {CapabilityState::Pending,
+            L"Waiting for the first validated ActorEquipmentComponent read in Minecraft " + Build() + L"."};
     case Capability::Effects:
-        return {CapabilityState::Unavailable, L"No validated status-effect reader exists for Minecraft " + Build() + L"."};
+        return {CapabilityState::Pending,
+            L"Waiting for the first validated MobEffectsComponent read in Minecraft " + Build() + L"."};
     case Capability::NetworkMetrics:
         return {CapabilityState::Unavailable, L"No validated network-latency source exists for Minecraft " + Build() + L"."};
     case Capability::ServerState:
