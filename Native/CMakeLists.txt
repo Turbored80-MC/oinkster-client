@@ -48,6 +48,7 @@ add_library(OinksterCore STATIC
   src/BedrockIntegration.cpp
   src/Capabilities.cpp
   src/ControlPipe.cpp
+  src/ChatTelemetry.cpp
   src/ClickGui.cpp
   src/CombatTelemetry.cpp
   src/Diagnostics.cpp

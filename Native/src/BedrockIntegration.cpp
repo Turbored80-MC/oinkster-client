@@ -1,5 +1,6 @@
 #include "Oinkster/BedrockIntegration.hpp"
 #include "Oinkster/CapabilityAdapter.hpp"
+#include "Oinkster/ChatTelemetry.hpp"
 #include "Oinkster/Diagnostics.hpp"
 #include "Oinkster/PlayerSkinTelemetry.hpp"
 #include "Oinkster/SessionTelemetry.hpp"
@@ -58,6 +59,20 @@ private:
     static constexpr std::array capabilities_{Capability::SoundEvents};
 };
 
+class ChatAdapter final : public ICapabilityAdapter {
+public:
+    [[nodiscard]] std::string_view Name() const noexcept override { return "chat-events"; }
+    [[nodiscard]] std::span<const Capability> Capabilities() const noexcept override { return capabilities_; }
+    [[nodiscard]] CapabilityAdapterResult Install(ModuleManager& modules) noexcept override {
+        std::wstring detail;
+        return {ChatTelemetry::Install(modules, detail), std::move(detail)};
+    }
+    void Remove() noexcept override { ChatTelemetry::Remove(); }
+
+private:
+    static constexpr std::array capabilities_{Capability::ChatEvents};
+};
+
 std::string NarrowAscii(std::wstring_view value) {
     std::string result;
     result.reserve(value.size());
@@ -82,6 +97,7 @@ bool Install(ModuleManager& modules, std::wstring& detail) noexcept {
         adapters.push_back(std::make_unique<SessionStateAdapter>());
         adapters.push_back(std::make_unique<WorldStateAdapter>());
         adapters.push_back(std::make_unique<SoundAdapter>());
+        adapters.push_back(std::make_unique<ChatAdapter>());
         for (auto& adapter : adapters) {
             const auto result = adapter->Install(modules);
             Diagnostics::LogLine(result.installed ? "info" : "warn",

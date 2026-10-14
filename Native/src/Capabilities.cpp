@@ -36,7 +36,8 @@ constexpr std::array<CapabilityInfo, CapabilityCount> Infos{{
     {"damage-render", L"damage render data", false},
     // SoundTelemetry: the LevelRenderer world-sound helper.
     {"sound-events", L"sound events", true},
-    {"chat-events", L"chat events", false},
+    // ChatTelemetry: the client chat-line sink.
+    {"chat-events", L"chat events", true},
     {"camera-presentation", L"camera presentation", false},
     {"hand-presentation", L"hand presentation", false},
 }};
@@ -108,7 +109,7 @@ CapabilityStatus DefaultCapabilityStatus(Capability capability) {
     case Capability::SoundEvents:
         return {CapabilityState::Pending, L"Waiting for the first world sound in Minecraft " + Build() + L"."};
     case Capability::ChatEvents:
-        return {CapabilityState::Unavailable, L"No validated chat-message source exists for Minecraft " + Build() + L"."};
+        return {CapabilityState::Pending, L"Waiting for the first chat line in Minecraft " + Build() + L"."};
     case Capability::CameraPresentation:
         return {CapabilityState::Unavailable, L"No validated camera/FOV render hook exists for Minecraft " + Build() + L"."};
     case Capability::HandPresentation:
