@@ -5,6 +5,7 @@
 #include "Oinkster/PlayerSkinTelemetry.hpp"
 #include "Oinkster/PlayerStateTelemetry.hpp"
 #include "Oinkster/SafeMemory.hpp"
+#include "Oinkster/SessionTelemetry.hpp"
 #include "Oinkster/SignatureScan.hpp"
 #include "Oinkster/SupportedBuild.hpp"
 #include "Oinkster/UnloadGuard.hpp"
@@ -125,6 +126,8 @@ void HookedRenderLevelPrep(void* screen, void* screenContext, void* levelRendere
     // Rotation (and, on its own slower cadence, status effects) come from the
     // same Actor's entt components.
     PlayerStateTelemetry::Observe(actor, transform, now);
+    // Ping and world identity, on their own ~1 s cadence.
+    SessionTelemetry::Observe(actor, now);
     lastPublished = now;
     moduleManager->Publish(transform);
 }

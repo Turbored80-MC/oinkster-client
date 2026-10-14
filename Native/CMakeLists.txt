@@ -68,6 +68,7 @@ add_library(OinksterCore STATIC
   src/ProcessInjector.cpp
   src/Renderer.cpp
   src/Runtime.cpp
+  src/SessionTelemetry.cpp
   src/SettingsStore.cpp
   src/SignatureScan.cpp
   src/SkinHead.cpp

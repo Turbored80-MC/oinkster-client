@@ -2,7 +2,10 @@
 
 #include "Oinkster/Events.hpp"
 #include "Oinkster/Modules/RollingWindow.hpp"
+#include <array>
+#include <cstdint>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 
@@ -66,6 +69,24 @@ private:
     RingBuffer<Sample> samples_;
     std::optional<int> dimension_;
 };
+
+// RakNet keeps the last few round-trip times per remote system; this value
+// marks a slot that has not been filled yet.
+inline constexpr std::uint16_t RakNetEmptyPing = 0xFFFF;
+// Mean of the filled slots (what RakPeer::GetAveragePing reports), or nullopt
+// when none is filled.
+[[nodiscard]] std::optional<std::uint32_t> AveragePing(std::span<const std::uint16_t> samples) noexcept;
+
+// Session kind from the connected remote's address: loopback is the local
+// world, private/link-local ranges are LAN, anything else is a server. The
+// address itself never leaves the adapter.
+[[nodiscard]] SessionKind ClassifyRemoteIpv4(const std::array<std::uint8_t, 4>& address) noexcept;
+[[nodiscard]] SessionKind ClassifyRemoteIpv6(const std::array<std::uint8_t, 16>& address) noexcept;
+
+// A world name as the HUD shows it: UTF-8 decoded, formatting codes removed,
+// whitespace trimmed, at most MaxWorldNameLength characters.
+inline constexpr std::size_t MaxWorldNameLength = 64;
+[[nodiscard]] std::wstring CleanWorldName(std::string_view utf8);
 
 // Latest validated ping; stale samples read as unavailable.
 class PingTracker {

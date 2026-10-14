@@ -754,6 +754,23 @@ void TelemetryDirectionAndSpeed() {
     ping.Update({At(11), std::nullopt});
     Require(!ping.Current(At(11), 5s), "A sample without a value is not data");
 
+    constexpr std::uint16_t Empty = M::RakNetEmptyPing;
+    Require(M::AveragePing(std::array<std::uint16_t, 5>{40, 50, Empty, 60, Empty}) == 50U, "Average skips empty RakNet ping slots");
+    Require(!M::AveragePing(std::array<std::uint16_t, 5>{Empty, Empty, Empty, Empty, Empty}), "An unfilled ring is no ping");
+    using Kind = Oinkster::SessionKind;
+    Require(M::ClassifyRemoteIpv4({127, 0, 0, 1}) == Kind::Singleplayer, "Loopback is the local world");
+    Require(M::ClassifyRemoteIpv4({192, 168, 1, 20}) == Kind::Lan && M::ClassifyRemoteIpv4({10, 1, 2, 3}) == Kind::Lan
+        && M::ClassifyRemoteIpv4({172, 20, 0, 1}) == Kind::Lan, "Private IPv4 ranges are LAN");
+    Require(M::ClassifyRemoteIpv4({172, 32, 0, 1}) == Kind::Server && M::ClassifyRemoteIpv4({8, 8, 8, 8}) == Kind::Server,
+        "Public IPv4 is a server");
+    Require(M::ClassifyRemoteIpv6({0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}) == Kind::Singleplayer, "IPv6 loopback");
+    Require(M::ClassifyRemoteIpv6({0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 192, 168, 0, 9}) == Kind::Lan, "IPv4-mapped IPv6");
+    Require(M::ClassifyRemoteIpv6({0xFD, 0x12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}) == Kind::Lan
+        && M::ClassifyRemoteIpv6({0xFE, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}) == Kind::Lan, "ULA and link-local IPv6");
+    Require(M::ClassifyRemoteIpv6({0x26, 0x06, 0x47, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}) == Kind::Server, "Global IPv6 is a server");
+    Require(M::CleanWorldName("  \xC2\xA7" "6The \xC2\xA7lHive\xC2\xA7r ") == L"The Hive", "World names drop formatting codes and padding");
+    Require(M::CleanWorldName(std::string(200, 'a')).size() == M::MaxWorldNameLength, "World names are bounded");
+
     Catalog catalog;
     catalog.manager.SetCapability(Capability::NetworkMetrics, {CapabilityState::Available, {}});
     Require(catalog.manager.SetEnabled("ping", true), "Ping enables once its adapter validates");

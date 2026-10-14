@@ -23,8 +23,10 @@ constexpr std::array<CapabilityInfo, CapabilityCount> Infos{{
     {"inventory", L"inventory snapshot", true},
     {"equipment", L"equipment snapshot", true},
     {"effects", L"status effects", true},
-    {"network-metrics", L"network metrics", false},
-    {"server-state", L"server state", false},
+    // SessionTelemetry: RakPeer ping ring and LevelData::mLevelName, each
+    // Pending until its first plausible read.
+    {"network-metrics", L"network metrics", true},
+    {"server-state", L"server state", true},
     {"resource-packs", L"resource packs", false},
     {"combat-events", L"combat events", false},
     {"selected-block-render", L"selected-block render data", false},
@@ -87,9 +89,9 @@ CapabilityStatus DefaultCapabilityStatus(Capability capability) {
         return {CapabilityState::Pending,
             L"Waiting for the first validated MobEffectsComponent read in Minecraft " + Build() + L"."};
     case Capability::NetworkMetrics:
-        return {CapabilityState::Unavailable, L"No validated network-latency source exists for Minecraft " + Build() + L"."};
+        return {CapabilityState::Pending, L"Waiting for a connected RakNet peer in Minecraft " + Build() + L"."};
     case Capability::ServerState:
-        return {CapabilityState::Unavailable, L"No validated server/world identity source exists for Minecraft " + Build() + L"."};
+        return {CapabilityState::Pending, L"Waiting for the first validated LevelData read in Minecraft " + Build() + L"."};
     case Capability::ResourcePacks:
         return {CapabilityState::Unavailable, L"No validated resource-pack stack reader exists for Minecraft " + Build() + L"."};
     case Capability::CombatEvents:

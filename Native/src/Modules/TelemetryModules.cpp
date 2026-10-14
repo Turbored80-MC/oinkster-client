@@ -1,4 +1,6 @@
 #include "Oinkster/Modules/Factories.hpp"
+#include "Oinkster/Modules/AccessibilityLogic.hpp"
+#include "Oinkster/Modules/HudFormat.hpp"
 #include "Oinkster/Modules/TelemetryLogic.hpp"
 #include <algorithm>
 #include <array>
@@ -105,6 +107,52 @@ std::optional<double> SpeedEstimator::Speed(bool horizontalOnly) const {
     const double seconds = std::chrono::duration<double>(samples_.Back().at - samples_.Front().at).count();
     if (seconds <= 0.0) return std::nullopt;
     return path / seconds;
+}
+
+std::optional<std::uint32_t> AveragePing(std::span<const std::uint16_t> samples) noexcept {
+    std::uint32_t sum{};
+    std::uint32_t filled{};
+    for (const auto sample : samples) {
+        if (sample == RakNetEmptyPing) continue;
+        sum += sample;
+        ++filled;
+    }
+    if (filled == 0) return std::nullopt;
+    return sum / filled;
+}
+
+SessionKind ClassifyRemoteIpv4(const std::array<std::uint8_t, 4>& address) noexcept {
+    const auto a = address[0];
+    const auto b = address[1];
+    if (a == 127) return SessionKind::Singleplayer;
+    if (a == 10 || (a == 172 && b >= 16 && b <= 31) || (a == 192 && b == 168) || (a == 169 && b == 254)) {
+        return SessionKind::Lan;
+    }
+    return SessionKind::Server;
+}
+
+SessionKind ClassifyRemoteIpv6(const std::array<std::uint8_t, 16>& address) noexcept {
+    const bool leadingZeros = std::all_of(address.begin(), address.begin() + 10, [](std::uint8_t byte) { return byte == 0; });
+    if (leadingZeros && address[10] == 0xFF && address[11] == 0xFF) {
+        return ClassifyRemoteIpv4({address[12], address[13], address[14], address[15]});
+    }
+    if (leadingZeros && address[10] == 0 && address[11] == 0 && address[12] == 0 && address[13] == 0
+        && address[14] == 0 && address[15] == 1) {
+        return SessionKind::Singleplayer;
+    }
+    if ((address[0] & 0xFE) == 0xFC || (address[0] == 0xFE && (address[1] & 0xC0) == 0x80)) return SessionKind::Lan;
+    return SessionKind::Server;
+}
+
+std::wstring CleanWorldName(std::string_view utf8) {
+    std::wstring name = StripFormattingCodes(FromUtf8(utf8));
+    const auto isSpace = [](wchar_t character) { return character == L' ' || character == L'\t' || character == L'\r' || character == L'\n'; };
+    while (!name.empty() && isSpace(name.back())) name.pop_back();
+    std::size_t start = 0;
+    while (start < name.size() && isSpace(name[start])) ++start;
+    name.erase(0, start);
+    if (name.size() > MaxWorldNameLength) name.resize(MaxWorldNameLength);
+    return name;
 }
 
 void PingTracker::Update(const NetworkMetrics& metrics) noexcept {
