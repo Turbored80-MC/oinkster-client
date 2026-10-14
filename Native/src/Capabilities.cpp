@@ -33,7 +33,8 @@ constexpr std::array<CapabilityInfo, CapabilityCount> Infos{{
     {"combat-events", L"combat events", true},
     {"selected-block-render", L"selected-block render data", false},
     {"damage-render", L"damage render data", false},
-    {"sound-events", L"sound events", false},
+    // SoundTelemetry: the LevelRenderer world-sound helper.
+    {"sound-events", L"sound events", true},
     {"chat-events", L"chat events", false},
     {"camera-presentation", L"camera presentation", false},
     {"hand-presentation", L"hand presentation", false},
@@ -104,7 +105,7 @@ CapabilityStatus DefaultCapabilityStatus(Capability capability) {
     case Capability::DamageRender:
         return {CapabilityState::Unavailable, L"No validated damage-tint render hook exists for Minecraft " + Build() + L"."};
     case Capability::SoundEvents:
-        return {CapabilityState::Unavailable, L"No validated sound-event source exists for Minecraft " + Build() + L"."};
+        return {CapabilityState::Pending, L"Waiting for the first world sound in Minecraft " + Build() + L"."};
     case Capability::ChatEvents:
         return {CapabilityState::Unavailable, L"No validated chat-message source exists for Minecraft " + Build() + L"."};
     case Capability::CameraPresentation:

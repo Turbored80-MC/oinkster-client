@@ -4,10 +4,12 @@
 #include "Oinkster/Modules/TelemetryLogic.hpp"
 #include <Windows.h>
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <ctime>
 #include <cwctype>
 #include <format>
+#include <vector>
 
 namespace Oinkster::Modules {
 
@@ -36,6 +38,36 @@ std::string_view DirectionGlyph(RelativeDirection direction) noexcept {
     case RelativeDirection::Unknown: break;
     }
     return " ";
+}
+
+std::string CaptionForSound(std::string_view soundId) {
+    if (soundId.empty() || soundId.size() > 96) return {};
+    for (const std::string_view skipped : {"music.", "record.", "ui.", "random.click", "random.pop2"}) {
+        if (soundId.starts_with(skipped)) return {};
+    }
+    std::vector<std::string_view> parts;
+    for (std::size_t start = 0; start <= soundId.size();) {
+        const auto dot = soundId.find('.', start);
+        const auto end = dot == std::string_view::npos ? soundId.size() : dot;
+        if (end > start) parts.push_back(soundId.substr(start, end - start));
+        start = end + 1;
+    }
+    // Category prefixes that carry no meaning on their own.
+    while (parts.size() > 1 && (parts.front() == "mob" || parts.front() == "random" || parts.front() == "game"
+        || parts.front() == "ambient" || parts.front() == "block" || parts.front() == "entity")) {
+        parts.erase(parts.begin());
+    }
+    std::string text;
+    for (const auto part : parts) {
+        if (!text.empty()) text += ' ';
+        text += part;
+    }
+    for (auto& character : text) {
+        if (character == '_') character = ' ';
+        else if (static_cast<unsigned char>(character) < 0x20 || static_cast<unsigned char>(character) > 0x7E) character = '?';
+    }
+    if (!text.empty()) text[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(text[0])));
+    return text;
 }
 
 bool SubtitleQueue::Add(const SoundEvent& event, const std::optional<Vec3>& listener) {

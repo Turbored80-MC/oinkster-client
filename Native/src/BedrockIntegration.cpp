@@ -3,6 +3,7 @@
 #include "Oinkster/Diagnostics.hpp"
 #include "Oinkster/PlayerSkinTelemetry.hpp"
 #include "Oinkster/SessionTelemetry.hpp"
+#include "Oinkster/SoundTelemetry.hpp"
 #include "Oinkster/WorldTelemetry.hpp"
 #include <array>
 #include <memory>
@@ -43,6 +44,20 @@ private:
     static constexpr std::array capabilities_{Capability::NetworkMetrics, Capability::ServerState};
 };
 
+class SoundAdapter final : public ICapabilityAdapter {
+public:
+    [[nodiscard]] std::string_view Name() const noexcept override { return "sound-events"; }
+    [[nodiscard]] std::span<const Capability> Capabilities() const noexcept override { return capabilities_; }
+    [[nodiscard]] CapabilityAdapterResult Install(ModuleManager& modules) noexcept override {
+        std::wstring detail;
+        return {SoundTelemetry::Install(modules, detail), std::move(detail)};
+    }
+    void Remove() noexcept override { SoundTelemetry::Remove(); }
+
+private:
+    static constexpr std::array capabilities_{Capability::SoundEvents};
+};
+
 std::string NarrowAscii(std::wstring_view value) {
     std::string result;
     result.reserve(value.size());
@@ -66,6 +81,7 @@ bool Install(ModuleManager& modules, std::wstring& detail) noexcept {
         // calls SessionTelemetry::Observe) is drained before it.
         adapters.push_back(std::make_unique<SessionStateAdapter>());
         adapters.push_back(std::make_unique<WorldStateAdapter>());
+        adapters.push_back(std::make_unique<SoundAdapter>());
         for (auto& adapter : adapters) {
             const auto result = adapter->Install(modules);
             Diagnostics::LogLine(result.installed ? "info" : "warn",

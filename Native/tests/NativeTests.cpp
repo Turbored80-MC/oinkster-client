@@ -1175,6 +1175,11 @@ void CrosshairGeometryAndPresentation() {
 // ------------------------------------------------------------------ accessibility
 
 void SubtitlesExpireDeduplicateAndOrient() {
+    Require(M::CaptionForSound("mob.zombie.say") == "Zombie say", "Mob sounds drop the category");
+    Require(M::CaptionForSound("random.explode") == "Explode" && M::CaptionForSound("step.grass") == "Step grass", "Readable captions");
+    Require(M::CaptionForSound("music.game").empty() && M::CaptionForSound("random.click").empty() && M::CaptionForSound("ui.cartography_table.take_result").empty(),
+        "Music and UI sounds are not captioned");
+    Require(M::CaptionForSound("mob.wither.spawn_sound") == "Wither spawn sound" && M::CaptionForSound("").empty(), "Underscores become spaces");
     const Oinkster::Vec3 listener{0, 64, 0};
     Require(M::DirectionTo(listener, 0, {0, 64, 5}) == M::RelativeDirection::Ahead, "Yaw 0 faces +Z");
     Require(M::DirectionTo(listener, 0, {0, 64, -5}) == M::RelativeDirection::Behind, "Behind");

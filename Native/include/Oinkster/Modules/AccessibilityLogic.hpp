@@ -20,6 +20,11 @@ enum class RelativeDirection : std::uint8_t { Unknown, Ahead, Behind, Left, Righ
 [[nodiscard]] RelativeDirection DirectionTo(const Vec3& listener, float yawDegrees, const Vec3& source) noexcept;
 [[nodiscard]] std::string_view DirectionGlyph(RelativeDirection direction) noexcept;
 
+// Caption for a Bedrock sound event name ("mob.zombie.say" -> "Zombie say",
+// "random.explode" -> "Explode", "step.grass" -> "Step grass"), or empty for
+// sounds that are not worth captioning (music, UI clicks).
+[[nodiscard]] std::string CaptionForSound(std::string_view soundId);
+
 struct Caption {
     std::string key;
     std::string text;

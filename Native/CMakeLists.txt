@@ -73,6 +73,7 @@ add_library(OinksterCore STATIC
   src/SettingsStore.cpp
   src/SignatureScan.cpp
   src/SkinHead.cpp
+  src/SoundTelemetry.cpp
   src/StatusPipe.cpp
   src/UnloadGuard.cpp
   src/WorldTelemetry.cpp
