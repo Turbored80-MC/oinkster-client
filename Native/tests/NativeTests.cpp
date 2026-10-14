@@ -884,6 +884,15 @@ void EnttRegistryLookupMirrorsTheGame() {
     Require(found == &payloadPage[payloadIndex % L::PayloadPageEntries], "Lookup lands on the payload slot");
     Require(found->yaw == -45.0F, "Component bytes are the payload's");
 
+    std::array<std::uint32_t, 3> packed{version | entityIndex, 0xFFFFFFFFU, (1U << 18U) | 7U};
+    put(storage, L::StoragePackedBegin, packed.data());
+    put(storage, L::StoragePackedEnd, packed.data() + packed.size());
+    std::vector<std::uint32_t> pool;
+    Require(E::ReadPoolEntities(registry.data(), rotationHash, 16, pool) && pool.size() == 2
+        && pool[0] == (version | entityIndex) && pool[1] == ((1U << 18U) | 7U), "Pool entities skip tombstones");
+    Require(E::ReadPoolEntities(registry.data(), rotationHash, 1, pool) && pool.size() == 1, "Pool reads are bounded");
+    Require(!E::ReadPoolEntities(registry.data(), E::TypeHash("MobEffectsComponent"), 16, pool) && pool.empty(), "Missing pools read nothing");
+
     Require(!E::FindComponent({registry.data(), (4U << 18U) | entityIndex}, rotationHash, sizeof(Rotation)), "Stale versions are not members");
     Require(!E::FindComponent({registry.data(), version | 1U}, rotationHash, sizeof(Rotation)), "Entities without a sparse page are not members");
     Require(!E::FindComponent(entity, E::TypeHash("MobEffectsComponent"), 0x18), "Missing pools fail closed");
@@ -1066,6 +1075,36 @@ void HitDistanceUsesNearestBoundingBoxPoint() {
     RequireNear(M::DistanceToAabb({0.0, 3.8, 0.0}, box), std::sqrt(8.0), 1e-9, "Distance runs to the nearest edge");
     RequireNear(M::DistanceToAabb({2.3, 1.0, 0.0}, box), 0.0, 1e-9, "Inside the box is zero");
     RequireNear(M::DistanceToAabb({0.0, 1.0, 0.0}, {{2.6, 1.8, 0.3}, {2.0, 0.0, -0.3}}), 2.0, 1e-9, "Inverted bounds are tolerated");
+
+    const auto south = M::LookDirection(0.0F, 0.0F);
+    RequireNear(south.z, 1.0, 1e-9, "Yaw 0 looks south (+Z)");
+    const auto west = M::LookDirection(90.0F, 0.0F);
+    RequireNear(west.x, -1.0, 1e-9, "Yaw 90 looks west (-X)");
+    RequireNear(M::LookDirection(0.0F, 90.0F).y, -1.0, 1e-9, "Positive pitch looks down");
+    const Oinkster::Vec3 eye{0.0, 1.0, 0.0};
+    const Oinkster::Vec3 east{1.0, 0.0, 0.0};
+    RequireNear(*M::RayEntryDistance(eye, east, box), 2.0, 1e-9, "The ray enters the near face");
+    Require(!M::RayEntryDistance(eye, {-1.0, 0.0, 0.0}, box), "A ray pointing away misses");
+    Require(!M::RayEntryDistance({0.0, 3.0, 0.0}, east, box), "A ray passing above misses");
+    RequireNear(*M::RayEntryDistance({2.3, 1.0, 0.0}, east, box), 0.0, 1e-9, "Inside the box is distance zero");
+
+    M::AttackConfirmer confirmer;
+    Require(!confirmer.Observe(At(0), 10), "Nothing is confirmed without an armed attack");
+    confirmer.Arm({At(1.0), 42, eye, box, 0});
+    Require(!confirmer.Observe(At(1.05), 0), "No hurt rise, no hit");
+    const auto hit = confirmer.Observe(At(1.2), 10);
+    Require(hit && hit->kind == Oinkster::CombatEventKind::LocalHitConfirmed && hit->targetId == 42, "A hurt rise confirms the armed target");
+    Require(!confirmer.Observe(At(1.3), 9), "One attack confirms at most once");
+    confirmer.Arm({At(2.0), 42, eye, box, 8});
+    Require(!confirmer.Observe(At(2.1), 7), "A timer still counting down is not a new hit");
+    Require(confirmer.Observe(At(2.2), 10).has_value(), "A rise after counting down is a new hit");
+    confirmer.Arm({At(3.0), 7, eye, box, 0});
+    Require(!confirmer.Observe(At(4.0), 10) && !confirmer.PendingTarget(At(4.0)), "Armed attacks expire unconfirmed");
+
+    M::HurtRiseWatcher watcher;
+    Require(!watcher.Observe(0) && !watcher.Observe(0), "No rise while unhurt");
+    Require(watcher.Observe(10) && !watcher.Observe(9) && !watcher.Observe(0), "Only the rise counts");
+    Require(!M::IsPlausibleHurtTicks(-1) && !M::IsPlausibleHurtTicks(500) && M::IsPlausibleHurtTicks(10), "Hurt ticks are bounded");
 }
 
 void EquipmentWarningsAreNotSpammy() {

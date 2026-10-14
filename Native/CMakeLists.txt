@@ -49,6 +49,7 @@ add_library(OinksterCore STATIC
   src/Capabilities.cpp
   src/ControlPipe.cpp
   src/ClickGui.cpp
+  src/CombatTelemetry.cpp
   src/Diagnostics.cpp
   src/EnttRegistry.cpp
   src/Dx12Overlay.cpp

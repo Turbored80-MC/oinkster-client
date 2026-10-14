@@ -7,9 +7,9 @@
 #include <string>
 #include <vector>
 
-// Observational PvP feedback. Everything here consumes authoritative
-// CombatEvents / snapshots from a validated adapter; nothing reacts to, or
-// is derived from, local mouse clicks.
+// Observational PvP feedback. Modules consume authoritative CombatEvents /
+// snapshots from a validated adapter; a hit is never derived from a local
+// click alone (see AttackConfirmer).
 namespace Oinkster::Modules {
 
 // Combo rule:
@@ -41,6 +41,59 @@ private:
 // it) - the same geometry Bedrock's reach check uses, so it is directly
 // comparable to the game's 3-block reach.
 [[nodiscard]] double DistanceToAabb(const Vec3& point, const Aabb& box) noexcept;
+
+// Unit view vector for a Bedrock rotation (yaw 0 = +Z, 90 = -X; pitch
+// positive looks down).
+[[nodiscard]] Vec3 LookDirection(float yawDegrees, float pitchDegrees) noexcept;
+
+// Distance along a unit ray to where it enters `box` (0 when the origin is
+// inside), or nullopt when the ray misses it.
+[[nodiscard]] std::optional<double> RayEntryDistance(const Vec3& origin, const Vec3& direction, const Aabb& box) noexcept;
+
+// Turns the game's own hurt timer into confirmed hits (used by the combat
+// adapter). An attack is only *armed* by a local click on the entity under the
+// look ray; it is confirmed only when that entity's hurt timer - which
+// Bedrock starts when the server reports the entity was damaged - rises
+// within `window`. A click alone never yields a hit, and an armed attack that
+// expires produces nothing (invulnerability frames make a "miss" ambiguous).
+class AttackConfirmer {
+public:
+    struct Attack {
+        SteadyTime at{};
+        std::uint64_t targetId{};
+        Vec3 eye{};
+        Aabb bounds{};
+        int hurtTicks{};  // the target's hurt timer when the attack was armed
+    };
+    static constexpr auto Window = std::chrono::milliseconds(800);
+
+    void Arm(const Attack& attack) noexcept { pending_ = attack; }
+    [[nodiscard]] std::optional<std::uint64_t> PendingTarget(SteadyTime now) noexcept;
+    // `hurtTicks` is the pending target's current hurt timer (nullopt when it
+    // could not be read this frame).
+    [[nodiscard]] std::optional<CombatEvent> Observe(SteadyTime now, std::optional<int> hurtTicks) noexcept;
+    void Clear() noexcept { pending_.reset(); }
+
+private:
+    std::optional<Attack> pending_;
+};
+
+// LocalDamaged whenever the local player's hurt timer rises.
+class HurtRiseWatcher {
+public:
+    [[nodiscard]] bool Observe(int hurtTicks) noexcept {
+        const bool rose = last_ && hurtTicks > *last_;
+        last_ = hurtTicks;
+        return rose;
+    }
+    void Clear() noexcept { last_.reset(); }
+
+private:
+    std::optional<int> last_;
+};
+
+// Bedrock's hurt timer starts at 10 ticks; anything outside this is a misread.
+[[nodiscard]] constexpr bool IsPlausibleHurtTicks(int ticks) noexcept { return ticks >= 0 && ticks <= 20; }
 
 // Non-spammy low-durability warnings with hysteresis. A slot warns once when
 // its durability first drops to <= threshold; it re-arms only when the item

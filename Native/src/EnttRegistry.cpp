@@ -78,6 +78,27 @@ bool ReadActorEntity(const void* actor, EntityRef& entity) noexcept {
     return true;
 }
 
+bool ReadPoolEntities(const void* registry, std::uint32_t typeHash, std::size_t maxCount, std::vector<std::uint32_t>& entities) {
+    entities.clear();
+    if (!registry || maxCount == 0) return false;
+    const void* storage = FindStorage(registry, typeHash);
+    if (!storage) return false;
+    std::uintptr_t packed{};
+    std::size_t count{};
+    if (!ReadVector(storage, StoragePackedBegin, StoragePackedEnd, sizeof(std::uint32_t), packed, count)) return false;
+    if (count > EntityMask) return false;
+    const std::size_t limit = count < maxCount ? count : maxCount;
+    entities.reserve(limit);
+    for (std::size_t index = 0; index < limit; ++index) {
+        std::uint32_t entity{};
+        if (!Read(reinterpret_cast<const void*>(packed), index * sizeof(entity), entity)) return false;
+        // In-place-delete pools leave tombstones (entity bits all set) in place.
+        if ((entity & EntityMask) == EntityMask) continue;
+        entities.push_back(entity);
+    }
+    return true;
+}
+
 const void* FindComponent(const EntityRef& entity, std::uint32_t typeHash, std::size_t componentSize) noexcept {
     if (!entity.registry || componentSize == 0) return nullptr;
     const void* storage = FindStorage(entity.registry, typeHash);

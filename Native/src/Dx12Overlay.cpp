@@ -1317,6 +1317,8 @@ void QueueMouseWheel(float delta) noexcept {
     extraVerticalWheel.fetch_add(static_cast<int>(delta * static_cast<float>(WHEEL_DELTA)), std::memory_order_relaxed);
 }
 
+bool IsMenuVisible() noexcept { return menuVisible.load(std::memory_order_relaxed); }
+
 void Remove() noexcept {
     if (!installed.exchange(false)) return;
     // Wake a render thread parked in a dynamic-FPS wait before draining.

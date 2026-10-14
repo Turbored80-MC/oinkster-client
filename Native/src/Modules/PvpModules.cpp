@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <format>
+#include <limits>
 
 namespace Oinkster::Modules {
 
@@ -43,6 +44,52 @@ double DistanceToAabb(const Vec3& point, const Aabb& box) noexcept {
     const double dy = axis(point.y, box.minimum.y, box.maximum.y);
     const double dz = axis(point.z, box.minimum.z, box.maximum.z);
     return std::sqrt(dx * dx + dy * dy + dz * dz);
+}
+
+Vec3 LookDirection(float yawDegrees, float pitchDegrees) noexcept {
+    constexpr double Radians = 3.14159265358979323846 / 180.0;
+    const double yaw = static_cast<double>(yawDegrees) * Radians;
+    const double pitch = static_cast<double>(pitchDegrees) * Radians;
+    return {-std::sin(yaw) * std::cos(pitch), -std::sin(pitch), std::cos(yaw) * std::cos(pitch)};
+}
+
+std::optional<double> RayEntryDistance(const Vec3& origin, const Vec3& direction, const Aabb& box) noexcept {
+    double entry = 0.0;
+    double exit = std::numeric_limits<double>::infinity();
+    const auto slab = [&](double start, double step, double low, double high) {
+        if (low > high) std::swap(low, high);
+        if (std::abs(step) < 1e-12) return start >= low && start <= high;
+        double enter = (low - start) / step;
+        double leave = (high - start) / step;
+        if (enter > leave) std::swap(enter, leave);
+        entry = std::max(entry, enter);
+        exit = std::min(exit, leave);
+        return entry <= exit;
+    };
+    if (!slab(origin.x, direction.x, box.minimum.x, box.maximum.x)
+        || !slab(origin.y, direction.y, box.minimum.y, box.maximum.y)
+        || !slab(origin.z, direction.z, box.minimum.z, box.maximum.z)) {
+        return std::nullopt;
+    }
+    return entry;
+}
+
+std::optional<std::uint64_t> AttackConfirmer::PendingTarget(SteadyTime now) noexcept {
+    if (pending_ && (now < pending_->at || now - pending_->at > Window)) pending_.reset();
+    if (!pending_) return std::nullopt;
+    return pending_->targetId;
+}
+
+std::optional<CombatEvent> AttackConfirmer::Observe(SteadyTime now, std::optional<int> hurtTicks) noexcept {
+    if (!PendingTarget(now) || !hurtTicks) return std::nullopt;
+    if (*hurtTicks <= pending_->hurtTicks) {
+        // The timer only counts down; follow it so a later rise is detected.
+        pending_->hurtTicks = *hurtTicks;
+        return std::nullopt;
+    }
+    CombatEvent event{CombatEventKind::LocalHitConfirmed, now, pending_->targetId, pending_->eye, pending_->bounds};
+    pending_.reset();
+    return event;
 }
 
 std::vector<EquipmentWarningTracker::Warning> EquipmentWarningTracker::Evaluate(

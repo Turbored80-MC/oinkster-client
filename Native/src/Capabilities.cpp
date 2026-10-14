@@ -28,7 +28,9 @@ constexpr std::array<CapabilityInfo, CapabilityCount> Infos{{
     {"network-metrics", L"network metrics", true},
     {"server-state", L"server state", true},
     {"resource-packs", L"resource packs", false},
-    {"combat-events", L"combat events", false},
+    // CombatTelemetry: MobHurtTimeComponent of the _renderLevelPrep Actor
+    // and the entity a click was aimed at; Pending until the first read.
+    {"combat-events", L"combat events", true},
     {"selected-block-render", L"selected-block render data", false},
     {"damage-render", L"damage render data", false},
     {"sound-events", L"sound events", false},
@@ -95,9 +97,8 @@ CapabilityStatus DefaultCapabilityStatus(Capability capability) {
     case Capability::ResourcePacks:
         return {CapabilityState::Unavailable, L"No validated resource-pack stack reader exists for Minecraft " + Build() + L"."};
     case Capability::CombatEvents:
-        return {CapabilityState::Unavailable,
-            L"No validated authoritative hit/damage event source exists for Minecraft " + Build()
-            + L"; local clicks are never treated as confirmed hits."};
+        return {CapabilityState::Pending,
+            L"Waiting for the first validated MobHurtTimeComponent read in Minecraft " + Build() + L"."};
     case Capability::SelectedBlockRender:
         return {CapabilityState::Unavailable, L"No validated selected-block outline render hook exists for Minecraft " + Build() + L"."};
     case Capability::DamageRender:

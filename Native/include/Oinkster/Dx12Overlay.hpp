@@ -16,6 +16,8 @@ namespace Oinkster::Dx12Overlay {
 void ConfigureControlKeys(std::uint32_t menuKey, std::uint32_t unloadKey) noexcept;
 [[nodiscard]] std::uint32_t MenuKey() noexcept;
 [[nodiscard]] std::uint32_t UnloadKey() noexcept;
+// True while the ClickGUI owns input (clicks never reach gameplay).
+[[nodiscard]] bool IsMenuVisible() noexcept;
 void QueueMouseWheel(float delta) noexcept;
 void Remove() noexcept;
 

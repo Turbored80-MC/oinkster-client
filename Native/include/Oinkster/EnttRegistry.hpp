@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string_view>
+#include <vector>
 
 // ---------------------------------------------------------------------------
 // Guarded, read-only lookups in Bedrock's entt component registry.
@@ -44,6 +45,12 @@ struct EntityRef {
 // is game memory: read it only through SafeMemory.
 [[nodiscard]] const void* FindComponent(const EntityRef& entity, std::uint32_t typeHash, std::size_t componentSize) noexcept;
 
+// Up to `maxCount` live entities that own a component in the pool keyed by
+// `typeHash`, in the pool's packed order. Tombstones are skipped; false when
+// the pool or its packed vector is missing or implausible.
+[[nodiscard]] bool ReadPoolEntities(const void* registry, std::uint32_t typeHash, std::size_t maxCount,
+    std::vector<std::uint32_t>& entities);
+
 // Layout constants, exposed for the unit test that builds a fake registry.
 namespace Layout {
 // entt::basic_registry: pools (dense_map<id_type, shared_ptr<sparse_set>>).
@@ -60,6 +67,10 @@ inline constexpr std::size_t PoolNodeStorage = 0x10;           // shared_ptr::ge
 // adds its own vector<T*> payload pages at +0x50.
 inline constexpr std::size_t StorageSparseBegin = 0x08;
 inline constexpr std::size_t StorageSparseEnd = 0x10;
+// vector<EntityId> packed (basic_sparse_set::push_back at RVA 0x21FF90 indexes
+// it at +0x20/+0x28 with a 4-byte stride).
+inline constexpr std::size_t StoragePackedBegin = 0x20;
+inline constexpr std::size_t StoragePackedEnd = 0x28;
 inline constexpr std::size_t StoragePayloadBegin = 0x50;
 inline constexpr std::size_t StoragePayloadEnd = 0x58;
 // EntityId traits: 18-bit entity, 14-bit version, 2048-entry sparse pages.
