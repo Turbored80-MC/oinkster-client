@@ -16,14 +16,14 @@ public sealed class ModuleCatalogTests
     private static readonly HashSet<string> SupportedCapabilities =
     [
         "render-metrics", "frame-composition", "local-input", "input-synthesis", "local-player-position",
-        "local-player-rotation", "effects", "equipment", "inventory"
+        "local-player-rotation", "effects", "equipment", "inventory", "network-metrics", "server-state",
+        "resource-packs", "combat-events", "sound-events", "chat-events"
     ];
 
     private static readonly HashSet<string> KnownCapabilities =
     [
         .. SupportedCapabilities,
-        "network-metrics", "server-state", "resource-packs", "combat-events", "selected-block-render", "damage-render",
-        "sound-events", "chat-events", "camera-presentation", "hand-presentation"
+        "selected-block-render", "damage-render", "camera-presentation", "hand-presentation"
     ];
 
     [Fact]
