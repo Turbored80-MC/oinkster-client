@@ -27,7 +27,8 @@ constexpr std::array<CapabilityInfo, CapabilityCount> Infos{{
     // Pending until its first plausible read.
     {"network-metrics", L"network metrics", true},
     {"server-state", L"server state", true},
-    {"resource-packs", L"resource packs", false},
+    // ResourcePackTelemetry: the ILevel ResourcePackManager stacks.
+    {"resource-packs", L"resource packs", true},
     // CombatTelemetry: MobHurtTimeComponent of the _renderLevelPrep Actor
     // and the entity a click was aimed at; Pending until the first read.
     {"combat-events", L"combat events", true},
@@ -96,7 +97,7 @@ CapabilityStatus DefaultCapabilityStatus(Capability capability) {
     case Capability::ServerState:
         return {CapabilityState::Pending, L"Waiting for the first validated LevelData read in Minecraft " + Build() + L"."};
     case Capability::ResourcePacks:
-        return {CapabilityState::Unavailable, L"No validated resource-pack stack reader exists for Minecraft " + Build() + L"."};
+        return {CapabilityState::Pending, L"Waiting for the first validated resource-pack stack read in Minecraft " + Build() + L"."};
     case Capability::CombatEvents:
         return {CapabilityState::Pending,
             L"Waiting for the first validated MobHurtTimeComponent read in Minecraft " + Build() + L"."};

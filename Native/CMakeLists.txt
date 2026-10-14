@@ -68,6 +68,7 @@ add_library(OinksterCore STATIC
   src/PlayerStateTelemetry.cpp
   src/ProcessInjector.cpp
   src/Renderer.cpp
+  src/ResourcePackTelemetry.cpp
   src/Runtime.cpp
   src/SessionTelemetry.cpp
   src/SettingsStore.cpp

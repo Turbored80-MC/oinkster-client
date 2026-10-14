@@ -22,7 +22,7 @@
     {"id": "item-counter", "name": "Item counter", "description": "Count of the selected item.", "category": "Status", "hud": true, "capabilities": ["inventory"], "available": true},
     {"id": "potion-effects", "name": "Potion effects", "description": "Active effect names, levels, and durations.", "category": "Status", "hud": true, "capabilities": ["effects"], "available": true},
     {"id": "server-display", "name": "Server display", "description": "Current server or world name.", "category": "Status", "hud": true, "capabilities": ["server-state"], "available": true},
-    {"id": "resource-pack-display", "name": "Resource pack display", "description": "Active resource-pack names.", "category": "Status", "hud": true, "capabilities": ["resource-packs"], "available": false, "unavailableReason": "No validated resource-pack stack reader exists for Minecraft 1.26.5203."},
+    {"id": "resource-pack-display", "name": "Resource pack display", "description": "Active resource-pack names.", "category": "Status", "hud": true, "capabilities": ["resource-packs"], "available": true},
     {"id": "combo-counter", "name": "Combo counter", "description": "Confirmed consecutive hits.", "category": "PvP feedback", "hud": true, "capabilities": ["combat-events"], "available": true},
     {"id": "hit-distance", "name": "Hit distance", "description": "Distance of the last confirmed hit.", "category": "PvP feedback", "hud": true, "capabilities": ["combat-events"], "available": true},
     {"id": "equipment-warnings", "name": "Equipment warnings", "description": "Warns about low equipment durability.", "category": "PvP feedback", "hud": true, "capabilities": ["equipment"], "available": true},

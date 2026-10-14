@@ -5,6 +5,7 @@
 #include "Oinkster/Diagnostics.hpp"
 #include "Oinkster/PlayerSkinTelemetry.hpp"
 #include "Oinkster/PlayerStateTelemetry.hpp"
+#include "Oinkster/ResourcePackTelemetry.hpp"
 #include "Oinkster/SafeMemory.hpp"
 #include "Oinkster/SessionTelemetry.hpp"
 #include "Oinkster/SignatureScan.hpp"
@@ -129,6 +130,7 @@ void HookedRenderLevelPrep(void* screen, void* screenContext, void* levelRendere
     PlayerStateTelemetry::Observe(actor, transform, now);
     // Ping and world identity, on their own ~1 s cadence.
     SessionTelemetry::Observe(actor, now);
+    ResourcePackTelemetry::Observe(actor, now);
     // Hurt-timer driven combat events, from the unadjusted eye position.
     CombatTelemetry::Observe(actor, {position[0], position[1], position[2]}, transform, now);
     lastPublished = now;
@@ -179,6 +181,7 @@ bool Install(ModuleManager& modules, std::wstring& detail) noexcept {
     renderLevelPrepTarget = target;
     PlayerStateTelemetry::Attach(modules);
     CombatTelemetry::Attach(modules);
+    ResourcePackTelemetry::Attach(modules);
     lastPublished = {};
     lastSampleLogged = {};
     samplesLogged = 0;
@@ -219,6 +222,7 @@ void Remove() noexcept {
             UnloadGuard::Block("world telemetry trampoline still had a live thread at detach");
             PlayerStateTelemetry::Detach();
     CombatTelemetry::Detach();
+    ResourcePackTelemetry::Detach();
             moduleManager = nullptr;
             return;
         }
@@ -229,6 +233,7 @@ void Remove() noexcept {
     // The hook is drained (or was never installed), so Observe cannot run.
     PlayerStateTelemetry::Detach();
     CombatTelemetry::Detach();
+    ResourcePackTelemetry::Detach();
     moduleManager = nullptr;
 }
 
