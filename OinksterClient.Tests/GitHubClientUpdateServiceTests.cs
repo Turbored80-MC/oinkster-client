@@ -146,6 +146,41 @@ public sealed class GitHubClientUpdateServiceTests
         }
     }
 
+    [Fact]
+    public async Task InstallAsync_PreviousCopyStillLocked_InstallsUpdate()
+    {
+        using var signingKey = ECDsa.Create(ECCurve.NamedCurves.nistP256);
+        var dll = "abc"u8.ToArray();
+        var manifestBytes = Encoding.UTF8.GetBytes(CreateManifest(Convert.ToHexString(SHA256.HashData(dll))));
+        var signature = signingKey.SignData(manifestBytes, HashAlgorithmName.SHA256);
+        var directory = CreateTemporaryDirectory();
+
+        try
+        {
+            var service = new GitHubClientUpdateService(
+                new HttpClient(new ReleaseHandler(manifestBytes, signature, dll)),
+                new ReleaseTrustOptions("Turbored80-MC", "oinkster-client", signingKey.ExportSubjectPublicKeyInfoPem()),
+                directory);
+            var result = await service.CheckAsync("Release", "1.21.50.0");
+            var first = await service.InstallAsync(result.Release!);
+            var parked = first.DllPath + ".previous";
+            File.WriteAllBytes(parked, "old"u8.ToArray());
+
+            InstalledClientBuild second;
+            using (new FileStream(parked, FileMode.Open, FileAccess.Read, FileShare.None))
+            {
+                second = await service.InstallAsync(result.Release!);
+            }
+
+            Assert.Equal(dll, File.ReadAllBytes(second.DllPath));
+            Assert.Equal(UpdateStatus.Ready, (await service.CheckAsync("Release", "1.21.50.0")).Status);
+        }
+        finally
+        {
+            Directory.Delete(directory, true);
+        }
+    }
+
     private static string CreateManifest(string? dllSha256 = null) => JsonSerializer.Serialize(new
     {
         schemaVersion = 2,

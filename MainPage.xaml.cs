@@ -1008,7 +1008,10 @@ public sealed partial class MainPage : Page
             var installed = await updateService.InstallAsync(release, progress);
             ClientBuildText.Text = $"Build {installed.Version}";
             ActionInfo.Title = "Oinkster updated";
-            ActionInfo.Message = $"Version {installed.Version} was downloaded and verified.";
+            // A running game keeps the client it already loaded until restart.
+            ActionInfo.Message = bedrockService.TryGetRunningProcessId() is null
+                ? $"Version {installed.Version} was downloaded and verified."
+                : $"Version {installed.Version} was downloaded and verified. Restart Minecraft to load it.";
             ActionInfo.Severity = InfoBarSeverity.Success;
             ActionInfo.IsOpen = true;
             await RefreshClientStatusAsync();

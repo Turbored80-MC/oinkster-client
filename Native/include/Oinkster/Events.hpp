@@ -51,7 +51,8 @@ struct KeyboardEvent {
     std::uint32_t key{};
     bool pressed{};
     bool repeated{};
-    // True when the ClickGUI owns input (the event never reaches gameplay).
+    // True when gameplay does not own the keyboard: the ClickGUI is open (the
+    // event never reaches the game) or a game screen such as chat is up.
     bool uiCaptured{};
     SteadyTime occurredAt{SteadyClock::now()};
     mutable bool cancelled{};

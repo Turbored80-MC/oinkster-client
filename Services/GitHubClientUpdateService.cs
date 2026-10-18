@@ -153,7 +153,14 @@ public sealed class GitHubClientUpdateService : IClientUpdateService
         Directory.CreateDirectory(clientDirectory);
         var partialPath = Path.Combine(clientDirectory, DllAssetName + ".partial");
         var activePath = Path.Combine(clientDirectory, DllAssetName);
-        var previousPath = Path.Combine(clientDirectory, DllAssetName + ".previous");
+        // Minecraft keeps the old DLL mapped until it restarts (ejecting does
+        // not unmap it). Windows lets a mapped image be renamed but not deleted
+        // or replaced, so each update parks the old copy under a fresh name and
+        // removes parked copies only when nothing holds them any more. A fixed
+        // ".previous" name failed the update outright - and rolled it back -
+        // whenever the game still had the old client loaded.
+        DeleteParkedCopies();
+        var previousPath = Path.Combine(clientDirectory, $"{DllAssetName}.previous-{Guid.NewGuid():N}");
         var metadataPath = Path.Combine(clientDirectory, "installed.json");
         var metadataPartialPath = metadataPath + ".partial";
 
@@ -219,7 +226,6 @@ public sealed class GitHubClientUpdateService : IClientUpdateService
             {
                 File.Move(partialPath, activePath, true);
                 File.Move(metadataPartialPath, metadataPath, true);
-                File.Delete(previousPath);
             }
             catch
             {
@@ -231,6 +237,7 @@ public sealed class GitHubClientUpdateService : IClientUpdateService
                 throw;
             }
 
+            DeleteParkedCopies();
             return installed;
         }
         finally
@@ -243,6 +250,21 @@ public sealed class GitHubClientUpdateService : IClientUpdateService
             if (File.Exists(metadataPartialPath))
             {
                 File.Delete(metadataPartialPath);
+            }
+        }
+    }
+
+    // Best effort: a copy the game still has loaded stays until a later run.
+    private void DeleteParkedCopies()
+    {
+        foreach (var path in Directory.EnumerateFiles(clientDirectory, DllAssetName + ".previous*"))
+        {
+            try
+            {
+                File.Delete(path);
+            }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+            {
             }
         }
     }

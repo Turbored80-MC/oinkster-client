@@ -5,8 +5,8 @@
     <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
     <RootNamespace>OinksterClient</RootNamespace>
     <ApplicationManifest>app.manifest</ApplicationManifest>
-    <Version>1.0.0</Version>
-    <InformationalVersion>1.0.0-beta</InformationalVersion>
+    <Version>1.0.1</Version>
+    <InformationalVersion>1.0.1-beta</InformationalVersion>
     <ApplicationIcon Condition="Exists('Assets\OinksterAppIcon.ico')">Assets\OinksterAppIcon.ico</ApplicationIcon>
     <Platforms>x86;x64;ARM64</Platforms>
     <RuntimeIdentifier Condition="'$(RuntimeIdentifier)' == ''">win-$([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture.ToString().ToLowerInvariant())</RuntimeIdentifier>

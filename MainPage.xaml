@@ -92,14 +92,13 @@
         <Grid.ColumnDefinitions><ColumnDefinition x:Name="NavigationColumn" Width="78"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
         <Border Background="#FF100F13" BorderBrush="#FF211F25" BorderThickness="0,0,1,0">
             <Grid Margin="0,22,0,20">
-                <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+                <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
                 <Border Width="44" Height="44" HorizontalAlignment="Center" Background="#FFF7A0C1" CornerRadius="13"><Image Width="33" Height="33" Source="Assets/OinksterLogo.png" Stretch="Uniform"/></Border>
                 <StackPanel Grid.Row="1" HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="12">
                     <Button x:Name="HomeButton" Style="{StaticResource RailButtonStyle}" Click="HomeButton_Click" Background="#FF29232A" Foreground="#FFFFB1CD" ToolTipService.ToolTip="Play"><FontIcon FontSize="17" Glyph="&#xE768;"/></Button>
                     <Button x:Name="ModulesButton" Style="{StaticResource RailButtonStyle}" Click="ModulesButton_Click" ToolTipService.ToolTip="Modules"><FontIcon FontSize="17" Glyph="&#xE8F1;"/></Button>
                     <Button x:Name="SettingsButton" Style="{StaticResource RailButtonStyle}" Click="SettingsButton_Click" ToolTipService.ToolTip="Settings"><FontIcon FontSize="17" Glyph="&#xE713;"/></Button>
                 </StackPanel>
-                <Button Grid.Row="2" Style="{StaticResource RailButtonStyle}" ToolTipService.ToolTip="Guest profile"><Grid><Ellipse Width="34" Height="34" Fill="#FF2A252C"/><TextBlock HorizontalAlignment="Center" VerticalAlignment="Center" Foreground="#FFFFA5C6" FontSize="13" FontWeight="Bold" Text="G"/><Ellipse Width="9" Height="9" Margin="0,0,1,1" HorizontalAlignment="Right" VerticalAlignment="Bottom" Fill="#FF75D69A" Stroke="#FF100F13" StrokeThickness="2"/></Grid></Button>
             </Grid>
         </Border>
         <Grid Grid.Column="1">

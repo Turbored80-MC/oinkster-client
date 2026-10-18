@@ -182,6 +182,16 @@ bool minecraftPauseVisible{};
 std::chrono::steady_clock::time_point pauseCandidateUntil{};
 std::chrono::steady_clock::time_point pauseCursorHiddenSince{};
 bool previousFrameCursorVisible{};
+// Cursor state the game had when the ClickGUI opened, put back exactly on
+// close. Render thread only (ShowCursor's display count is per thread).
+int showCursorCountBeforeMenu{};
+bool cursorHiddenBeforeMenu{};
+bool cursorStateSaved{};
+// Focus loss closes the menu on the window thread; the render thread puts
+// the saved cursor state back on its next Present.
+std::atomic_bool cursorRestorePending{};
+
+bool IsCursorVisible() noexcept;
 
 UINT WINAPI HookGetRawInputData(HRAWINPUT input, UINT command, LPVOID data, PUINT size, UINT headerSize) noexcept;
 
@@ -309,8 +319,11 @@ void SetCoreWindowCursorVisible(bool visible) noexcept {
     try {
         auto window = winrt::Windows::UI::Core::CoreWindow::GetForCurrentThread();
         if (!window) {
-            Diagnostics::LogLine("warning", "corewindow_cursor",
-                "CoreWindow::GetForCurrentThread() returned null - this thread does not own the CoreWindow");
+            static std::atomic_bool logged{};
+            if (!logged.exchange(true)) {
+                Diagnostics::LogLine("warning", "corewindow_cursor",
+                    "CoreWindow::GetForCurrentThread() returned null - this thread does not own the CoreWindow");
+            }
             return;
         }
         if (visible) {
@@ -332,14 +345,31 @@ void SetCoreWindowCursorVisible(bool visible) noexcept {
 // when our menu opens and takes the mouse back from gameplay), same call
 // order as theirs: unclip, release capture, then show the cursor.
 void ReleaseCursorForMenu() noexcept {
+    cursorHiddenBeforeMenu = !IsCursorVisible();
     SetCoreWindowCursorVisible(true);
     // Call the trampoline directly, not the (now hooked) ClipCursor symbol:
     // menuVisible is already true here, so going through the hook would make
     // this call a no-op too.
     if (originalClipCursor) originalClipCursor(nullptr); else ClipCursor(nullptr);
     ReleaseCapture();
-    while (ShowCursor(TRUE) < 0) {}
+    int count = ShowCursor(TRUE);
+    showCursorCountBeforeMenu = count - 1;
+    cursorStateSaved = true;
+    while (count < 0) count = ShowCursor(TRUE);
     SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+}
+
+// Returns the ShowCursor display count to what the game had before the menu
+// opened. Bedrock hides the gameplay cursor by clearing its shape, not via
+// ShowCursor, so forcing the count negative here (as this used to) left the
+// pointer invisible on every game screen - inventory, chat, pause - until
+// restart.
+void RestoreShowCursorCount() noexcept {
+    if (!cursorStateSaved) return;
+    cursorStateSaved = false;
+    int count = ShowCursor(FALSE);
+    while (count > showCursorCountBeforeMenu) count = ShowCursor(FALSE);
+    while (count < showCursorCountBeforeMenu) count = ShowCursor(TRUE);
 }
 
 LPARAM KeyboardMessageData(std::uint32_t key, bool released) noexcept {
@@ -550,6 +580,11 @@ void ClearImGuiInput() noexcept {
 // SetCursorPos writes to, ahead of our GameInput-level freeze).
 void RestoreCursorToGame() noexcept {
     if (!gameWindow) return;
+    const bool regrab = cursorHiddenBeforeMenu;
+    RestoreShowCursorCount();
+    // Opened from a screen that shows the cursor (the pause screen): hand it
+    // back visible and free, exactly as that screen had it.
+    if (!regrab) return;
     RECT rect{};
     GetClientRect(gameWindow, &rect);
     rect.top = (rect.bottom + rect.top) / 2;
@@ -559,7 +594,6 @@ void RestoreCursorToGame() noexcept {
     rect.right = rect.left;
     ClipCursor(&rect);
     SetCapture(gameWindow);
-    while (ShowCursor(FALSE) >= 0) {}
     SetCoreWindowCursorVisible(false);
 }
 
@@ -580,10 +614,9 @@ void CloseMenuForFocusLoss() noexcept {
     if (wasVisible) {
         PlayerSkinTelemetry::NotifyMenuClosed();
         ClearImGuiInput();
-        if (!wasTheater) {
-            while (ShowCursor(FALSE) >= 0) {}
-            SetCoreWindowCursorVisible(false);
-        }
+        // This runs on the window thread; ShowCursor counts are per thread,
+        // so the render thread unwinds its own count on the next Present.
+        if (!wasTheater) cursorRestorePending.store(true, std::memory_order_release);
     }
     // Drop isolation bookkeeping without synthesizing key events into a window
     // that no longer has focus. Guarded because the render thread also touches
@@ -804,10 +837,14 @@ LRESULT CALLBACK WindowProcedure(HWND window, UINT message, WPARAM wParam, LPARA
             keyStateTracker.Observe(static_cast<std::uint32_t>(wParam), pressed);
         }
         if (moduleManager) {
+            // A game screen with a cursor (chat above all) owns typing as much
+            // as the ClickGUI does: letters typed there are not gameplay
+            // presses, so module keys and keybinds must ignore them.
+            const bool gameScreenOpen = !gameplayCaptured.load(std::memory_order_acquire);
             const KeyboardEvent event{static_cast<std::uint32_t>(wParam), pressed,
-                repeated, menuVisible || overlayControlsVisible.load(std::memory_order_acquire)};
+                repeated, menuVisible || overlayControlsVisible.load(std::memory_order_acquire) || gameScreenOpen};
             allowGameplay = moduleManager->PublishInput(event);
-            if (pressed && !event.repeated && !menuVisible && wParam != configuredMenuKey.load()
+            if (pressed && !event.repeated && !event.uiCaptured && wParam != configuredMenuKey.load()
                 && wParam != configuredUnloadKey.load()) {
                 // Only mark the settings dirty when a keybind actually toggled
                 // something. Setting it unconditionally meant every gameplay
@@ -1216,6 +1253,7 @@ HRESULT STDMETHODCALLTYPE HookPresent(IDXGISwapChain* baseSwapChain, UINT interv
         && (GetAsyncKeyState(static_cast<int>(configuredUnloadKey.load())) & 0x8000) != 0;
     if (unloadDown && !unloadKeyDown) ejectRequested.store(true);
     unloadKeyDown = unloadDown;
+    if (cursorRestorePending.exchange(false, std::memory_order_acq_rel) && !menuVisible) RestoreShowCursorCount();
     const bool cursorVisible = IsCursorVisible();
     const bool escapeDown = gameFocused && (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
     if (escapeDown && !escapeKeyDown && !menuVisible) {
@@ -1241,7 +1279,11 @@ HRESULT STDMETHODCALLTYPE HookPresent(IDXGISwapChain* baseSwapChain, UINT interv
     // While a replay plays, K opens its editor; the editor's gear button
     // switches to the ClickGUI.
     bool replayRunning = ReplayInjector::Running();
-    if (menuDown && !menuKeyDown && (menuVisible || inWorld)) {
+    // Only gameplay (cursor hidden) or the pause screen may open the menu: a
+    // visible cursor otherwise means a game screen such as chat is up, and K
+    // typed into chat must not toggle the overlay.
+    const bool menuKeyAllowed = menuVisible || (inWorld && (!cursorVisible || minecraftPauseVisible));
+    if (menuDown && !menuKeyDown && menuKeyAllowed) {
         SetMenuVisible(!menuVisible, replayRunning ? MenuKind::ReplayEditor : MenuKind::ClickGui);
     }
     menuKeyDown = menuDown;

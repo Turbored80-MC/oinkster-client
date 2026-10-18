@@ -6,6 +6,6 @@ namespace OinksterClient.Models;
 /// </summary>
 public static class AppVersion
 {
-    public const string Display = "1.0.0 Beta";
-    public const string SemVer = "1.0.0-beta";
+    public const string Display = "1.0.1 Beta";
+    public const string SemVer = "1.0.1-beta";
 }
