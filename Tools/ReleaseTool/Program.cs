@@ -45,6 +45,13 @@ static int SignRelease(string[] arguments)
     var version = Version.Parse(arguments[2]);
     var channel = arguments[3];
     var exactBedrock = Version.Parse(arguments[4]);
+    // The launcher matches this against the installed package version and the
+    // package folder name, both of which always carry four parts (1.26.5203.0).
+    if (exactBedrock.Revision < 0)
+    {
+        Console.Error.WriteLine($"The Bedrock version must have four parts, e.g. {exactBedrock}.0");
+        return 2;
+    }
     var output = Path.GetFullPath(arguments[5]);
     Directory.CreateDirectory(output);
     const string dllName = "oinkster-client-x64.dll";

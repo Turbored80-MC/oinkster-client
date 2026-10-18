@@ -20,14 +20,10 @@
          the C# equivalent, so the documented convention is actually checked
          rather than relying on reviewers noticing.
 
-         Debug only, deliberately. Release trims the app, and the trim analyzer
-         reports warnings this project cannot act on: IL2026/IL3050 on every
-         reflection-based System.Text.Json call site (fixable only by moving to
-         source-generated JsonSerializerContexts), plus IL2104 from WinUI's own
-         Microsoft.Windows.SDK.NET and WinRT.Runtime assemblies. Promoting
-         those to errors would just make Release unbuildable. Debug is the
-         configuration the documented build command uses, so this is where the
-         rule earns its keep. -->
+         Debug only. Debug is the configuration the documented build command
+         uses, so this is where the rule earns its keep. Release is not trimmed
+         (see PublishTrimmed below): trimming disables the reflection-based
+         System.Text.Json the launcher depends on. -->
     <TreatWarningsAsErrors Condition="'$(Configuration)' == 'Debug'">true</TreatWarningsAsErrors>
   </PropertyGroup>
 
@@ -157,7 +153,8 @@
   <PropertyGroup>
     <PublishReadyToRun Condition="'$(Configuration)' == 'Debug'">False</PublishReadyToRun>
     <PublishReadyToRun Condition="'$(Configuration)' != 'Debug'">True</PublishReadyToRun>
-    <PublishTrimmed Condition="'$(Configuration)' == 'Debug'">False</PublishTrimmed>
-    <PublishTrimmed Condition="'$(Configuration)' != 'Debug'">True</PublishTrimmed>
+    <!-- Not trimmed: trimming turns off reflection-based System.Text.Json,
+         which every settings, catalog and release-manifest read relies on. -->
+    <PublishTrimmed>False</PublishTrimmed>
   </PropertyGroup>
 </Project>
