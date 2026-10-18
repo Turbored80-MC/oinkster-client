@@ -1,0 +1,10 @@
+{
+  "profiles": {
+    "OinksterClient (Package)": {
+      "commandName": "MsixPackage"
+    },
+    "OinksterClient (Unpackaged)": {
+      "commandName": "Project"
+    }
+  }
+}

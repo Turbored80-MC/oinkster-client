@@ -1,0 +1,37 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows10.0.26100.0</TargetFramework>
+    <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <PlatformTarget>x64</PlatformTarget>
+    <!-- Matches the main project; see the note in OinksterClient.csproj. -->
+    <TreatWarningsAsErrors Condition="'$(Configuration)' == 'Debug'">true</TreatWarningsAsErrors>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
+    <PackageReference Include="xunit" Version="2.9.3" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="3.1.1">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+  </ItemGroup>
+  <ItemGroup>
+    <Compile Include="..\Models\AppVersion.cs" Link="Models\AppVersion.cs" />
+    <Compile Include="..\Models\ClientReleaseManifest.cs" Link="Models\ClientReleaseManifest.cs" />
+    <Compile Include="..\Models\ClientUpdateResult.cs" Link="Models\ClientUpdateResult.cs" />
+    <Compile Include="..\Models\CrosshairSettings.cs" Link="Models\CrosshairSettings.cs" />
+    <Compile Include="..\Models\ModuleDefinition.cs" Link="Models\ModuleDefinition.cs" />
+    <Compile Include="..\Models\NativeClientStatus.cs" Link="Models\NativeClientStatus.cs" />
+    <Compile Include="..\Services\IClientUpdateService.cs" Link="Services\IClientUpdateService.cs" />
+    <Compile Include="..\Services\ReleaseTrustOptions.cs" Link="Services\ReleaseTrustOptions.cs" />
+    <Compile Include="..\Services\GitHubClientUpdateService.cs" Link="Services\GitHubClientUpdateService.cs" />
+    <Compile Include="..\Services\ModuleSettingsService.cs" Link="Services\ModuleSettingsService.cs" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- The shipped catalog, at the same relative path the launcher loads it from. -->
+    <Content Include="..\Assets\module-catalog.json" Link="Assets\module-catalog.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>

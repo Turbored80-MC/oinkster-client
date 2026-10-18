@@ -1,0 +1,4 @@
+#include "resource.h"
+
+IDR_OINKSTER_SKIN RCDATA "../../Assets/oinksterv2-skin-reference.png"
+IDR_OINKSTER_UI_FONT RCDATA "../../Assets/OinksterUiFont.ttf"

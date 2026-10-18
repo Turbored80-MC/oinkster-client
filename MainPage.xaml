@@ -1,0 +1,224 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<Page x:Class="OinksterClient.MainPage" xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" Background="#FF0B0A0D" Loaded="Page_Loaded" RequestedTheme="Dark">
+    <Page.Resources>
+        <Style x:Key="RailButtonStyle" TargetType="Button"><Setter Property="Width" Value="46"/><Setter Property="Height" Value="46"/><Setter Property="Padding" Value="0"/><Setter Property="Background" Value="Transparent"/><Setter Property="Foreground" Value="#FF8D878F"/><Setter Property="BorderThickness" Value="0"/><Setter Property="CornerRadius" Value="12"/></Style>
+        <Style x:Key="MetaLabelStyle" TargetType="TextBlock"><Setter Property="Foreground" Value="#FF777179"/><Setter Property="FontSize" Value="12"/></Style>
+        <Style x:Key="SettingTitleStyle" TargetType="TextBlock"><Setter Property="Foreground" Value="#FFF4EFF3"/><Setter Property="FontSize" Value="14"/><Setter Property="FontWeight" Value="SemiBold"/></Style>
+        <Style x:Key="OinkComboBoxItemStyle" TargetType="ComboBoxItem">
+            <Setter Property="MinHeight" Value="40"/>
+            <Setter Property="Padding" Value="12,8"/>
+            <Setter Property="Foreground" Value="#FFF0EBEF"/>
+            <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
+            <Setter Property="FocusVisualPrimaryBrush" Value="#FFFF9FC2"/>
+            <Setter Property="FocusVisualSecondaryBrush" Value="#FF201D23"/>
+        </Style>
+        <Style x:Key="OinkComboBoxStyle" TargetType="ComboBox">
+            <Setter Property="Height" Value="44"/>
+            <Setter Property="Padding" Value="12,0,38,0"/>
+            <Setter Property="Background" Value="#FF201D23"/>
+            <Setter Property="Foreground" Value="#FFF0EBEF"/>
+            <Setter Property="BorderBrush" Value="#FF3B3540"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="CornerRadius" Value="9"/>
+            <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
+            <Setter Property="ItemContainerStyle" Value="{StaticResource OinkComboBoxItemStyle}"/>
+            <Setter Property="FocusVisualPrimaryBrush" Value="#FFFF9FC2"/>
+            <Setter Property="FocusVisualSecondaryBrush" Value="#FF201D23"/>
+        </Style>
+    </Page.Resources>
+    <Grid>
+        <VisualStateManager.VisualStateGroups>
+            <VisualStateGroup x:Name="WindowWidthStates">
+                <VisualState x:Name="CompactLayout">
+                    <VisualState.StateTriggers><AdaptiveTrigger MinWindowWidth="0"/></VisualState.StateTriggers>
+                    <VisualState.Setters>
+                        <Setter Target="NavigationColumn.Width" Value="64"/>
+                        <Setter Target="PageHeader.Margin" Value="20,16,20,0"/>
+                        <Setter Target="MainContentHost.Margin" Value="20,16,20,14"/>
+                        <Setter Target="Footer.Margin" Value="20,0,20,12"/>
+                        <Setter Target="LaunchContentColumn.Width" Value="*"/>
+                        <Setter Target="LaunchArtColumn.Width" Value="0"/>
+                        <Setter Target="LaunchContent.HorizontalAlignment" Value="Center"/>
+                        <Setter Target="LaunchContent.MaxWidth" Value="680"/>
+                        <Setter Target="LaunchContent.Margin" Value="0,8"/>
+                        <Setter Target="LaunchHeadline.FontSize" Value="38"/>
+                        <Setter Target="LaunchArtwork.Visibility" Value="Collapsed"/>
+                        <Setter Target="ModulesListColumn.Width" Value="*"/>
+                        <Setter Target="ModulesInspectorColumn.Width" Value="0"/>
+                        <Setter Target="ModuleInspector.(Grid.Column)" Value="0"/>
+                        <Setter Target="ModuleInspector.(Grid.Row)" Value="1"/>
+                        <Setter Target="ModuleInspector.Margin" Value="0,18,0,0"/>
+                        <Setter Target="ModuleFilterPanel.(Grid.Row)" Value="1"/>
+                        <Setter Target="ModuleFilterPanel.HorizontalAlignment" Value="Stretch"/>
+                        <Setter Target="ModuleFilterPanel.Margin" Value="0,16,0,0"/>
+                        <Setter Target="ModuleFilterPanel.Orientation" Value="Vertical"/>
+                        <Setter Target="ModuleSearchBox.Width" Value="Auto"/>
+                        <Setter Target="ModuleCategoryComboBox.Width" Value="Auto"/>
+                        <Setter Target="ModuleHeading.FontSize" Value="27"/>
+                        <Setter Target="SettingsContent.Padding" Value="24"/>
+                    </VisualState.Setters>
+                </VisualState>
+                <VisualState x:Name="WideLayout">
+                    <VisualState.StateTriggers><AdaptiveTrigger MinWindowWidth="960"/></VisualState.StateTriggers>
+                    <VisualState.Setters>
+                        <Setter Target="NavigationColumn.Width" Value="78"/>
+                        <Setter Target="PageHeader.Margin" Value="34,22,34,0"/>
+                        <Setter Target="MainContentHost.Margin" Value="34,22,34,20"/>
+                        <Setter Target="Footer.Margin" Value="34,0,34,18"/>
+                        <Setter Target="LaunchContentColumn.Width" Value="1.08*"/>
+                        <Setter Target="LaunchArtColumn.Width" Value="0.92*"/>
+                        <Setter Target="LaunchContent.HorizontalAlignment" Value="Stretch"/>
+                        <Setter Target="LaunchContent.MaxWidth" Value="Infinity"/>
+                        <Setter Target="LaunchContent.Margin" Value="12,10,48,10"/>
+                        <Setter Target="LaunchHeadline.FontSize" Value="46"/>
+                        <Setter Target="LaunchArtwork.Visibility" Value="Visible"/>
+                        <Setter Target="ModulesListColumn.Width" Value="2*"/>
+                        <Setter Target="ModulesInspectorColumn.Width" Value="330"/>
+                        <Setter Target="ModuleInspector.(Grid.Column)" Value="1"/>
+                        <Setter Target="ModuleInspector.(Grid.Row)" Value="0"/>
+                        <Setter Target="ModuleInspector.Margin" Value="0"/>
+                        <Setter Target="ModuleFilterPanel.(Grid.Row)" Value="0"/>
+                        <Setter Target="ModuleFilterPanel.HorizontalAlignment" Value="Right"/>
+                        <Setter Target="ModuleFilterPanel.Margin" Value="0"/>
+                        <Setter Target="ModuleFilterPanel.Orientation" Value="Horizontal"/>
+                        <Setter Target="ModuleSearchBox.Width" Value="210"/>
+                        <Setter Target="ModuleCategoryComboBox.Width" Value="175"/>
+                        <Setter Target="ModuleHeading.FontSize" Value="30"/>
+                        <Setter Target="SettingsContent.Padding" Value="36"/>
+                    </VisualState.Setters>
+                </VisualState>
+            </VisualStateGroup>
+        </VisualStateManager.VisualStateGroups>
+        <Grid.ColumnDefinitions><ColumnDefinition x:Name="NavigationColumn" Width="78"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+        <Border Background="#FF100F13" BorderBrush="#FF211F25" BorderThickness="0,0,1,0">
+            <Grid Margin="0,22,0,20">
+                <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+                <Border Width="44" Height="44" HorizontalAlignment="Center" Background="#FFF7A0C1" CornerRadius="13"><Image Width="33" Height="33" Source="Assets/OinksterLogo.png" Stretch="Uniform"/></Border>
+                <StackPanel Grid.Row="1" HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="12">
+                    <Button x:Name="HomeButton" Style="{StaticResource RailButtonStyle}" Click="HomeButton_Click" Background="#FF29232A" Foreground="#FFFFB1CD" ToolTipService.ToolTip="Play"><FontIcon FontSize="17" Glyph="&#xE768;"/></Button>
+                    <Button x:Name="ModulesButton" Style="{StaticResource RailButtonStyle}" Click="ModulesButton_Click" ToolTipService.ToolTip="Modules"><FontIcon FontSize="17" Glyph="&#xE8F1;"/></Button>
+                    <Button x:Name="SettingsButton" Style="{StaticResource RailButtonStyle}" Click="SettingsButton_Click" ToolTipService.ToolTip="Settings"><FontIcon FontSize="17" Glyph="&#xE713;"/></Button>
+                </StackPanel>
+                <Button Grid.Row="2" Style="{StaticResource RailButtonStyle}" ToolTipService.ToolTip="Guest profile"><Grid><Ellipse Width="34" Height="34" Fill="#FF2A252C"/><TextBlock HorizontalAlignment="Center" VerticalAlignment="Center" Foreground="#FFFFA5C6" FontSize="13" FontWeight="Bold" Text="G"/><Ellipse Width="9" Height="9" Margin="0,0,1,1" HorizontalAlignment="Right" VerticalAlignment="Bottom" Fill="#FF75D69A" Stroke="#FF100F13" StrokeThickness="2"/></Grid></Button>
+            </Grid>
+        </Border>
+        <Grid Grid.Column="1">
+            <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+            <Grid x:Name="PageHeader" Margin="34,22,34,0">
+                <StackPanel><TextBlock Foreground="#FFF7F2F5" FontFamily="Segoe UI Variable Display" FontSize="19" FontWeight="SemiBold" Text="Oinkster"/><TextBlock Foreground="#FF716B73" FontSize="11" Text="Bedrock client"/></StackPanel>
+                <StackPanel HorizontalAlignment="Right" VerticalAlignment="Center" Orientation="Horizontal" Spacing="9">
+                    <Border Padding="11,7" Background="#FF151419" BorderBrush="#FF29262D" BorderThickness="1" CornerRadius="9"><StackPanel Orientation="Horizontal" Spacing="8"><Ellipse x:Name="ServiceStatusDot" Width="7" Height="7" VerticalAlignment="Center" Fill="#FF777179"/><TextBlock x:Name="ServiceStatusText" VerticalAlignment="Center" Foreground="#FFB7B0B7" FontSize="12" Text="Checking Bedrock…"/></StackPanel></Border>
+                    <Button Width="36" Height="36" Padding="0" Background="#FF151419" Foreground="#FFA9A2A9" BorderBrush="#FF29262D" BorderThickness="1" CornerRadius="9" Click="PreviewAction_Click" ToolTipService.ToolTip="Notifications"><FontIcon FontSize="14" Glyph="&#xEA8F;"/></Button>
+                </StackPanel>
+            </Grid>
+            <Grid x:Name="MainContentHost" Grid.Row="1" Margin="34,22,34,20">
+                <Grid x:Name="LaunchPanel">
+                <Grid>
+                    <Grid.ColumnDefinitions><ColumnDefinition x:Name="LaunchContentColumn" Width="1.08*"/><ColumnDefinition x:Name="LaunchArtColumn" Width="0.92*"/></Grid.ColumnDefinitions>
+                    <Grid x:Name="LaunchContent" Margin="12,10,48,10">
+                        <Grid.RowDefinitions><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+                        <ScrollViewer HorizontalScrollBarVisibility="Disabled" VerticalScrollBarVisibility="Auto" VerticalScrollMode="Auto" VerticalContentAlignment="Center">
+                        <StackPanel Spacing="16">
+                        <StackPanel Spacing="8">
+                            <Border Width="98" Padding="10,6" HorizontalAlignment="Left" Background="#FF211A21" BorderBrush="#FF40313B" BorderThickness="1" CornerRadius="16"><TextBlock HorizontalAlignment="Center" Foreground="#FFFFA6C7" FontSize="11" FontWeight="SemiBold" Text="RELEASE 0.2"/></Border>
+                            <TextBlock x:Name="LaunchHeadline" Foreground="#FFF8F4F7" FontFamily="Segoe UI Variable Display" FontSize="46" FontWeight="SemiBold" CharacterSpacing="-35" Text="Your world,&#x0a;your rules."/>
+                            <TextBlock MaxWidth="450" HorizontalAlignment="Left" Foreground="#FF9B949C" FontSize="14" LineHeight="20" Text="A focused Bedrock launcher for the Oinkster client. Your selected modules are ready and your game is up to date." TextWrapping="Wrap"/>
+                        </StackPanel>
+                        <Border Padding="14,11" Background="#FF131216" BorderBrush="#FF29262D" BorderThickness="1" CornerRadius="12"><Grid><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions><StackPanel Orientation="Horizontal" Spacing="12"><Border Width="36" Height="36" Background="#FF29232A" CornerRadius="9"><FontIcon HorizontalAlignment="Center" VerticalAlignment="Center" Foreground="#FFFFA5C6" FontSize="15" Glyph="&#xE8B7;"/></Border><StackPanel VerticalAlignment="Center" Spacing="2"><TextBlock Foreground="#FFF0EBEF" FontSize="14" FontWeight="SemiBold" Text="Vanilla+"/><TextBlock x:Name="EnabledModulesText" Style="{StaticResource MetaLabelStyle}" Text="No modules enabled"/></StackPanel></StackPanel><StackPanel Grid.Column="1" HorizontalAlignment="Right" VerticalAlignment="Center" Spacing="2"><TextBlock x:Name="BedrockVersionText" HorizontalAlignment="Right" Foreground="#FFCEC7CD" FontSize="12" Text="Checking…"/><TextBlock x:Name="BedrockReadyText" HorizontalAlignment="Right" Foreground="#FF777179" FontSize="11" Text="Detecting"/></StackPanel></Grid></Border>
+                        </StackPanel>
+                        </ScrollViewer>
+                        <Grid Grid.Row="1" Margin="0,16,0,0" ColumnSpacing="10"><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions><Button x:Name="PlayButton" Height="52" HorizontalAlignment="Stretch" Background="#FFF49ABC" Foreground="#FF29141D" BorderThickness="0" CornerRadius="12" FontSize="15" FontWeight="SemiBold" Click="PlayButton_Click" IsEnabled="False"><StackPanel Orientation="Horizontal" Spacing="9"><FontIcon FontSize="14" Glyph="&#xE768;"/><TextBlock x:Name="PlayButtonText" Text="Checking Bedrock"/></StackPanel></Button><Button Grid.Column="1" Width="52" Height="52" Padding="0" Background="#FF17151A" Foreground="#FFB7B0B7" BorderBrush="#FF2D2931" BorderThickness="1" CornerRadius="12" Click="PreviewAction_Click" ToolTipService.ToolTip="Launch options"><FontIcon FontSize="14" Glyph="&#xE70D;"/></Button></Grid>
+                    </Grid>
+                    <Border x:Name="LaunchArtwork" Grid.Column="1" MinWidth="330" Margin="0,8" Background="#FF20141B" CornerRadius="22">
+                        <Grid><Rectangle RadiusX="22" RadiusY="22"><Rectangle.Fill><LinearGradientBrush StartPoint="0,0" EndPoint="1,1"><GradientStop Offset="0" Color="#FF3A2530"/><GradientStop Offset="0.58" Color="#FF8B405F"/><GradientStop Offset="1" Color="#FF27161E"/></LinearGradientBrush></Rectangle.Fill></Rectangle><Ellipse Width="430" Height="430" Margin="0,-250,-220,0" HorizontalAlignment="Right" VerticalAlignment="Top" Fill="#20FFFFFF"/><Rectangle Width="270" Height="270" HorizontalAlignment="Center" VerticalAlignment="Center" Fill="#12FFFFFF" RadiusX="34" RadiusY="34" RenderTransformOrigin="0.5,0.5"><Rectangle.RenderTransform><RotateTransform Angle="45"/></Rectangle.RenderTransform></Rectangle><Image Margin="34,50,34,100" Source="Assets/OinksterLogo.png" Stretch="Uniform"/><Border Margin="22" Padding="14,12" HorizontalAlignment="Stretch" VerticalAlignment="Bottom" Background="#C0181016" CornerRadius="12"><Grid><StackPanel Spacing="2"><TextBlock Foreground="White" FontSize="13" FontWeight="SemiBold" Text="Oinkster Core"/><TextBlock x:Name="ClientBuildText" Foreground="#BFFFFFFF" FontSize="11" Text="Checking client build…"/></StackPanel><FontIcon HorizontalAlignment="Right" VerticalAlignment="Center" Foreground="#FFFFB0CC" FontSize="16" Glyph="&#xE73E;"/></Grid></Border></Grid>
+                    </Border>
+                </Grid>
+                </Grid>
+                <ScrollViewer x:Name="ModulesPanel" Visibility="Collapsed" HorizontalScrollBarVisibility="Disabled" VerticalScrollBarVisibility="Auto" VerticalScrollMode="Auto">
+                <Grid ColumnSpacing="18" RowSpacing="18">
+                    <Grid.ColumnDefinitions><ColumnDefinition x:Name="ModulesListColumn" Width="2*"/><ColumnDefinition x:Name="ModulesInspectorColumn" Width="330"/></Grid.ColumnDefinitions>
+                    <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+                    <Grid RowSpacing="14">
+                        <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+                        <Grid>
+                            <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+                            <StackPanel Spacing="4"><TextBlock x:Name="ModuleHeading" Foreground="#FFF7F2F5" FontFamily="Segoe UI Variable Display" FontSize="30" FontWeight="SemiBold" Text="Module workbench"/><TextBlock x:Name="ModuleSummaryText" Foreground="#FF858087" FontSize="13" Text="Loading modules…" TextWrapping="Wrap"/></StackPanel>
+                            <StackPanel x:Name="ModuleFilterPanel" HorizontalAlignment="Right" VerticalAlignment="Bottom" Orientation="Horizontal" Spacing="8"><TextBox x:Name="ModuleSearchBox" Width="210" Height="44" PlaceholderText="Search modules" TextChanged="ModuleFilter_Changed"/><ComboBox x:Name="ModuleCategoryComboBox" Width="175" Style="{StaticResource OinkComboBoxStyle}" SelectionChanged="ModuleFilter_Changed"><ComboBoxItem Content="All categories"/><ComboBoxItem Content="Performance"/><ComboBoxItem Content="Input"/><ComboBoxItem Content="Status"/><ComboBoxItem Content="Visual"/><ComboBoxItem Content="Telemetry"/><ComboBoxItem Content="PvP feedback"/><ComboBoxItem Content="Accessibility"/></ComboBox></StackPanel>
+                        </Grid>
+                        <StackPanel Grid.Row="1" Spacing="16"><StackPanel Spacing="8"><TextBlock Foreground="#FFFFA6C7" FontSize="14" FontWeight="SemiBold" Text="Ready"/><StackPanel x:Name="ReadyModulesPanel" Spacing="7"/></StackPanel><StackPanel Spacing="8"><TextBlock Foreground="#FF8D878F" FontSize="14" FontWeight="SemiBold" Text="Roadmap"/><StackPanel x:Name="RoadmapModulesPanel" Spacing="7"/></StackPanel></StackPanel>
+                    </Grid>
+                    <Border x:Name="ModuleInspector" Grid.Column="1" Padding="22" Background="#FF151419" BorderBrush="#FF2A272E" BorderThickness="1" CornerRadius="16">
+                        <StackPanel Spacing="18">
+                            <StackPanel Spacing="5"><TextBlock x:Name="InspectorCategoryText" Foreground="#FFFFA6C7" FontSize="12" Text="Select a module"/><TextBlock x:Name="InspectorNameText" Foreground="#FFF7F2F5" FontSize="22" FontWeight="SemiBold" Text="Module settings"/><TextBlock x:Name="InspectorDescriptionText" Foreground="#FF8D878F" FontSize="13" TextWrapping="Wrap" Text="Choose a module to configure it."/></StackPanel>
+                            <ToggleSwitch x:Name="ModuleEnabledToggle" Header="Enabled" Toggled="ModuleSetting_Changed" IsEnabled="False"/>
+                            <StackPanel x:Name="ModuleControlsPanel" Spacing="12" Visibility="Collapsed">
+                                <Button x:Name="ModuleKeybindButton" HorizontalAlignment="Stretch" Content="Set keybind" Click="ModuleKeybindButton_Click"/>
+                                <!-- HUD-only: modules that draw no HUD panel (e.g. the crosshair) hide this. -->
+                                <StackPanel x:Name="HudAppearancePanel" Spacing="12">
+                                    <TextBlock Style="{StaticResource SettingTitleStyle}" Text="HUD appearance"/>
+                                    <TextBlock Style="{StaticResource MetaLabelStyle}" Text="Scale"/><Slider x:Name="ModuleScaleSlider" Minimum="0.65" Maximum="2" StepFrequency="0.05" ValueChanged="ModuleSetting_Changed"/>
+                                    <ToggleSwitch x:Name="ModuleBackgroundToggle" Header="Draw background" Toggled="ModuleSetting_Changed"/>
+                                    <TextBlock Style="{StaticResource MetaLabelStyle}" Text="Background opacity"/><Slider x:Name="ModuleOpacitySlider" Minimum="0" Maximum="1" StepFrequency="0.05" ValueChanged="ModuleSetting_Changed"/>
+                                    <TextBox x:Name="ModuleBackgroundColorBox" Header="Background color" PlaceholderText="#FF111417" LostFocus="ModuleSetting_Changed"/>
+                                    <TextBox x:Name="ModuleTextColorBox" Header="Text color" PlaceholderText="#FFE8ECEF" LostFocus="ModuleSetting_Changed"/>
+                                    <TextBox x:Name="ModuleAccentColorBox" Header="Accent color" PlaceholderText="#FFF28FB5" LostFocus="ModuleSetting_Changed"/>
+                                </StackPanel>
+                                <StackPanel x:Name="CrosshairControlsPanel" Spacing="8" Visibility="Collapsed">
+                                    <TextBlock Style="{StaticResource SettingTitleStyle}" Text="Crosshair"/>
+                                    <TextBlock Style="{StaticResource MetaLabelStyle}" Text="Crosshair source"/>
+                                    <ComboBox x:Name="CrosshairSourceComboBox" HorizontalAlignment="Stretch" Style="{StaticResource OinkComboBoxStyle}" SelectionChanged="ModuleSetting_Changed">
+                                        <ComboBoxItem Content="Custom" Tag="custom"/>
+                                        <ComboBoxItem Content="Drawn (draw it in game)" Tag="drawn"/>
+                                        <ComboBoxItem Content="Game default" Tag="game"/>
+                                    </ComboBox>
+                                    <TextBlock x:Name="CrosshairSourceHelpText" Style="{StaticResource MetaLabelStyle}" TextWrapping="Wrap"/>
+                                    <StackPanel x:Name="CrosshairGamePanel" Spacing="8">
+                                        <ToggleSwitch x:Name="CrosshairThirdPersonToggle" Header="Show in 3rd person" Toggled="ModuleSetting_Changed"/>
+                                        <TextBlock Style="{StaticResource MetaLabelStyle}" Text="Size"/><Slider x:Name="CrosshairGameScaleSlider" Minimum="1" Maximum="8" StepFrequency="0.5" ValueChanged="ModuleSetting_Changed"/>
+                                    </StackPanel>
+                                    <StackPanel x:Name="CrosshairOwnPanel" Spacing="8">
+                                        <TextBlock Style="{StaticResource MetaLabelStyle}" Text="Show custom crosshair"/>
+                                        <ComboBox x:Name="CrosshairPerspectiveComboBox" HorizontalAlignment="Stretch" Style="{StaticResource OinkComboBoxStyle}" SelectionChanged="ModuleSetting_Changed">
+                                            <ComboBoxItem Content="First person only" Tag="first-person"/>
+                                            <ComboBoxItem Content="All perspectives" Tag="all"/>
+                                        </ComboBox>
+                                        <StackPanel x:Name="CrosshairDrawnPanel" Spacing="8">
+                                            <TextBlock Style="{StaticResource MetaLabelStyle}" Text="Pixel size"/><Slider x:Name="CrosshairPixelScaleSlider" Minimum="1" Maximum="8" StepFrequency="0.5" ValueChanged="ModuleSetting_Changed"/>
+                                        </StackPanel>
+                                        <StackPanel x:Name="CrosshairLinePanel" Spacing="8">
+                                            <TextBlock Style="{StaticResource MetaLabelStyle}" Text="Arm length"/><Slider x:Name="CrosshairSizeSlider" Minimum="0" Maximum="24" ValueChanged="ModuleSetting_Changed"/>
+                                            <TextBlock Style="{StaticResource MetaLabelStyle}" Text="Gap"/><Slider x:Name="CrosshairGapSlider" Minimum="0" Maximum="16" ValueChanged="ModuleSetting_Changed"/>
+                                            <TextBlock Style="{StaticResource MetaLabelStyle}" Text="Thickness"/><Slider x:Name="CrosshairThicknessSlider" Minimum="1" Maximum="6" StepFrequency="0.5" ValueChanged="ModuleSetting_Changed"/>
+                                        </StackPanel>
+                                        <TextBox x:Name="CrosshairColorBox" Header="Color" PlaceholderText="#FFFFFFFF" LostFocus="ModuleSetting_Changed"/>
+                                        <TextBlock Style="{StaticResource MetaLabelStyle}" Text="Opacity"/><Slider x:Name="CrosshairOpacitySlider" Minimum="0.1" Maximum="1" StepFrequency="0.05" ValueChanged="ModuleSetting_Changed"/>
+                                        <ToggleSwitch x:Name="CrosshairOutlineToggle" Header="Outline" Toggled="ModuleSetting_Changed"/>
+                                        <TextBlock Style="{StaticResource MetaLabelStyle}" Text="Outline thickness"/><Slider x:Name="CrosshairOutlineThicknessSlider" Minimum="0.5" Maximum="3" StepFrequency="0.5" ValueChanged="ModuleSetting_Changed"/>
+                                        <StackPanel x:Name="CrosshairDotPanel" Spacing="8">
+                                            <ToggleSwitch x:Name="CrosshairCenterDotToggle" Header="Center dot" Toggled="ModuleSetting_Changed"/>
+                                            <TextBlock Style="{StaticResource MetaLabelStyle}" Text="Dot radius"/><Slider x:Name="CrosshairDotSizeSlider" Minimum="0.5" Maximum="6" StepFrequency="0.5" ValueChanged="ModuleSetting_Changed"/>
+                                        </StackPanel>
+                                    </StackPanel>
+                                </StackPanel>
+                            </StackPanel>
+                            <TextBlock x:Name="InspectorRoadmapText" Foreground="#FF9B949C" FontSize="13" TextWrapping="Wrap" Visibility="Collapsed"/>
+                        </StackPanel>
+                    </Border>
+                </Grid>
+                </ScrollViewer>
+                <Border x:Name="SettingsPanel" MaxWidth="820" MaxHeight="600" HorizontalAlignment="Stretch" VerticalAlignment="Center" Visibility="Collapsed" Background="#FF121115" BorderBrush="#FF2A272E" BorderThickness="1" CornerRadius="20">
+                    <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+                    <StackPanel x:Name="SettingsContent" Padding="36" Spacing="26">
+                        <Grid><StackPanel Spacing="6"><TextBlock Foreground="#FFF7F2F5" FontFamily="Segoe UI Variable Display" FontSize="30" FontWeight="SemiBold" Text="Launcher settings"/><TextBlock Foreground="#FF858087" FontSize="13" Text="Tune how Oinkster starts and stays up to date."/></StackPanel><Button HorizontalAlignment="Right" VerticalAlignment="Top" Padding="13,8" Background="#FF1B191E" Foreground="#FFC6BFC5" BorderBrush="#FF302D34" BorderThickness="1" CornerRadius="9" Click="BackButton_Click"><StackPanel Orientation="Horizontal" Spacing="7"><FontIcon FontSize="11" Glyph="&#xE72B;"/><TextBlock Text="Done"/></StackPanel></Button></Grid>
+                        <Border Padding="20" Background="#FF18171B" CornerRadius="13"><StackPanel Spacing="18"><Grid><StackPanel MaxWidth="430" HorizontalAlignment="Left" Spacing="4"><TextBlock Style="{StaticResource SettingTitleStyle}" Text="Update channel"/><TextBlock Style="{StaticResource MetaLabelStyle}" Text="Choose which Oinkster builds you receive." TextWrapping="Wrap"/></StackPanel><ComboBox x:Name="UpdateChannelComboBox" HorizontalAlignment="Right" Width="154" Style="{StaticResource OinkComboBoxStyle}" SelectionChanged="Setting_Changed"><ComboBoxItem Content="Release"/><ComboBoxItem Content="Beta"/><ComboBoxItem Content="Nightly"/></ComboBox></Grid><Rectangle Height="1" Fill="#FF29272D"/><Grid><StackPanel MaxWidth="430" HorizontalAlignment="Left" Spacing="4"><TextBlock Style="{StaticResource SettingTitleStyle}" Text="Check on startup"/><TextBlock Style="{StaticResource MetaLabelStyle}" Text="Look for a compatible signed client build when Oinkster opens." TextWrapping="Wrap"/></StackPanel><ToggleSwitch x:Name="CheckForUpdatesToggle" HorizontalAlignment="Right" Toggled="Setting_Changed"/></Grid><Rectangle Height="1" Fill="#FF29272D"/><Grid><StackPanel MaxWidth="430" HorizontalAlignment="Left" Spacing="4"><TextBlock Style="{StaticResource SettingTitleStyle}" Text="Close after launch"/><TextBlock Style="{StaticResource MetaLabelStyle}" Text="Exit the launcher after Bedrock starts successfully." TextWrapping="Wrap"/></StackPanel><ToggleSwitch x:Name="CloseAfterLaunchToggle" HorizontalAlignment="Right" Toggled="Setting_Changed"/></Grid></StackPanel></Border>
+                        <Border Padding="20" Background="#FF18171B" CornerRadius="13"><Grid ColumnSpacing="10"><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions><StackPanel Spacing="4"><TextBlock Style="{StaticResource SettingTitleStyle}" Text="In-game controls"/><TextBlock Style="{StaticResource MetaLabelStyle}" Text="Rebind the workbench and clean-unload keys."/></StackPanel><Button x:Name="MenuKeyButton" Grid.Column="1" Padding="14,8" Click="MenuKeyButton_Click"/><Button x:Name="UnloadKeyButton" Grid.Column="2" Padding="14,8" Click="UnloadKeyButton_Click"/></Grid></Border>
+                        <Border Padding="20" Background="#FF18171B" CornerRadius="13"><Grid ColumnSpacing="10"><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions><StackPanel Spacing="4"><TextBlock Style="{StaticResource SettingTitleStyle}" Text="Oinkster client"/><TextBlock Style="{StaticResource MetaLabelStyle}" Text="Check releases or open downloaded client data." TextWrapping="Wrap"/></StackPanel><Button Grid.Column="1" Padding="14,8" Background="#FF242127" Foreground="#FFE8E2E7" BorderBrush="#FF39353D" BorderThickness="1" CornerRadius="9" Content="Check now" Click="CheckForUpdatesButton_Click"/><Button Grid.Column="2" Padding="14,8" Background="#FF242127" Foreground="#FFE8E2E7" BorderBrush="#FF39353D" BorderThickness="1" CornerRadius="9" Content="Open folder" Click="OpenFolderButton_Click"/></Grid></Border>
+                    </StackPanel>
+                    </ScrollViewer>
+                </Border>
+                <InfoBar x:Name="ActionInfo" Margin="20" MaxWidth="520" HorizontalAlignment="Center" VerticalAlignment="Bottom" IsClosable="True" IsOpen="False" Severity="Informational" Title="Preview only" Message="This action will be connected in a later milestone."/>
+            </Grid>
+            <Grid x:Name="Footer" Grid.Row="2" Margin="34,0,34,18"><StackPanel Orientation="Horizontal" Spacing="8"><Ellipse x:Name="FooterStatusDot" Width="6" Height="6" VerticalAlignment="Center" Fill="#FF777179"/><TextBlock x:Name="FooterStatusText" Foreground="#FF777179" FontSize="11" Text="Detecting Bedrock"/></StackPanel><TextBlock x:Name="AppVersionText" HorizontalAlignment="Right" Foreground="#FF5F5961" FontSize="11" Text="Oinkster 1.0.0 Beta"/></Grid>
+        </Grid>
+    </Grid>
+</Page>

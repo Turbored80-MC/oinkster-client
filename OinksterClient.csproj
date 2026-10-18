@@ -1,0 +1,148 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows10.0.26100.0</TargetFramework>
+    <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
+    <RootNamespace>OinksterClient</RootNamespace>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <Version>1.0.0</Version>
+    <InformationalVersion>1.0.0-beta</InformationalVersion>
+    <ApplicationIcon Condition="Exists('Assets\OinksterAppIcon.ico')">Assets\OinksterAppIcon.ico</ApplicationIcon>
+    <Platforms>x86;x64;ARM64</Platforms>
+    <RuntimeIdentifier Condition="'$(RuntimeIdentifier)' == ''">win-$([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture.ToString().ToLowerInvariant())</RuntimeIdentifier>
+    <PublishProfile Condition="Exists('Properties\PublishProfiles\win-$(Platform).pubxml')">win-$(Platform).pubxml</PublishProfile>
+    <UseWinUI>true</UseWinUI>
+    <WinUISDKReferences>false</WinUISDKReferences>
+    <EnableMsixTooling>true</EnableMsixTooling>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <!-- The native side enforces its zero-warning rule with /W4 /WX; this is
+         the C# equivalent, so the documented convention is actually checked
+         rather than relying on reviewers noticing.
+
+         Debug only, deliberately. Release trims the app, and the trim analyzer
+         reports warnings this project cannot act on: IL2026/IL3050 on every
+         reflection-based System.Text.Json call site (fixable only by moving to
+         source-generated JsonSerializerContexts), plus IL2104 from WinUI's own
+         Microsoft.Windows.SDK.NET and WinRT.Runtime assemblies. Promoting
+         those to errors would just make Release unbuildable. Debug is the
+         configuration the documented build command uses, so this is where the
+         rule earns its keep. -->
+    <TreatWarningsAsErrors Condition="'$(Configuration)' == 'Debug'">true</TreatWarningsAsErrors>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Content Include="Assets\OinksterAppIcon.ico" />
+    <Content Include="Assets\OinksterAppIcon.scale-*.png" />
+    <Content Include="Assets\OinksterAppIcon.targetsize-*_altform-unplated.png" />
+    <Content Include="Assets\OinksterSplashScreen.png" />
+    <Content Include="Assets\OinksterSquare150x150Logo.png" />
+    <Content Include="Assets\OinksterStoreLogo.png" />
+    <Content Include="Assets\OinksterWide310x150Logo.png" />
+    <Content Include="Assets\OinksterLogo.png" />
+    <Content Include="Assets\OinksterReleasePublicKey.pem" Condition="Exists('Assets\OinksterReleasePublicKey.pem')" />
+    <Content Include="Assets\module-catalog.json" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="Native\out\build\x64\$(Configuration)\oinkster-client-x64.dll"
+             Link="Native-v3\oinkster-client-x64.dll"
+             CopyToOutputDirectory="Always"
+             CopyToPublishDirectory="Always"
+             Condition="'$(Configuration)' == 'Debug' and Exists('Native\out\build\x64\$(Configuration)\oinkster-client-x64.dll')" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Manifest Include="$(ApplicationManifest)" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Remove="OinksterClient.Tests\**\*.cs" />
+    <Compile Remove="Tools\**\*.cs" />
+    <Compile Remove="Native\out\**\*.cs" />
+    <None Remove="OinksterClient.Tests\**\*" />
+    <None Remove="Tools\ReleaseTool\**\*" />
+  </ItemGroup>
+
+  <!--
+    Defining the "Msix" ProjectCapability here allows the Single-project MSIX Packaging
+    Tools extension to be activated for this project even if the Windows App SDK Nuget
+    package has not yet been restored.
+  -->
+  <ItemGroup Condition="'$(DisableMsixProjectCapabilityAddedByProject)'!='true' and '$(EnableMsixTooling)'=='true'">
+    <ProjectCapability Include="Msix"/>
+  </ItemGroup>
+
+  <!--
+    Microsoft.Windows.SDK.BuildTools.WinApp adds first-class support for
+    `dotnet run` on packaged WinUI apps: it hooks the .NET CLI Run target to
+    register a debug identity via the winapp CLI and launch the app with
+    package identity (AUMID).
+    Set <EnableWinAppRunSupport>false</EnableWinAppRunSupport> in a
+    <PropertyGroup> above to opt out.
+  -->
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="*" />
+    <PackageReference Include="Microsoft.WindowsAppSDK" Version="*" />
+    <PackageReference Include="Microsoft.Windows.SDK.BuildTools.WinApp" Version="*" />
+  </ItemGroup>
+
+  <!--
+    Defining the "HasPackageAndPublishMenuAddedByProject" property here allows the Solution
+    Explorer "Package and Publish" context menu entry to be enabled for this project even if
+    the Windows App SDK Nuget package has not yet been restored.
+  -->
+  <PropertyGroup Condition="'$(DisableHasPackageAndPublishMenuAddedByProject)'!='true' and '$(EnableMsixTooling)'=='true'">
+    <HasPackageAndPublishMenu>true</HasPackageAndPublishMenu>
+  </PropertyGroup>
+
+  <!-- `dotnet run` registers the loose AppX layout below. The WinApp tooling
+       does not always refresh an already-created layout during an incremental
+       build, which can leave Windows launching old XAML and managed code even
+       though the normal output directory contains the latest build. Keep the
+       launcher payload in that registered layout synchronized on every Debug
+       build, just as the native client payload is synchronized below. -->
+  <Target Name="RefreshDebugLauncherInAppxLayout"
+          AfterTargets="Build"
+          Condition="'$(Configuration)' == 'Debug' and Exists('$(OutDir)AppX')">
+    <ItemGroup>
+      <DebugLauncherAppxPayload Include="$(OutDir)OinksterClient.exe" Condition="Exists('$(OutDir)OinksterClient.exe')" />
+      <DebugLauncherAppxPayload Include="$(OutDir)OinksterClient.dll" Condition="Exists('$(OutDir)OinksterClient.dll')" />
+      <DebugLauncherAppxPayload Include="$(OutDir)OinksterClient.deps.json" Condition="Exists('$(OutDir)OinksterClient.deps.json')" />
+      <DebugLauncherAppxPayload Include="$(OutDir)OinksterClient.runtimeconfig.json" Condition="Exists('$(OutDir)OinksterClient.runtimeconfig.json')" />
+      <DebugLauncherAppxPayload Include="$(OutDir)App.xbf" Condition="Exists('$(OutDir)App.xbf')" />
+      <DebugLauncherAppxPayload Include="$(OutDir)MainPage.xbf" Condition="Exists('$(OutDir)MainPage.xbf')" />
+      <DebugLauncherAppxPayload Include="$(OutDir)MainWindow.xbf" Condition="Exists('$(OutDir)MainWindow.xbf')" />
+      <DebugLauncherAppxPayload Include="$(OutDir)resources.pri" Condition="Exists('$(OutDir)resources.pri')" />
+      <DebugLauncherAppxPayload Include="$(OutDir)AppxManifest.xml" Condition="Exists('$(OutDir)AppxManifest.xml')" />
+      <DebugLauncherIconPayload Include="Assets\OinksterAppIcon.ico" />
+      <DebugLauncherIconPayload Include="Assets\OinksterAppIcon.scale-*.png" />
+      <DebugLauncherIconPayload Include="Assets\OinksterAppIcon.targetsize-*_altform-unplated.png" />
+      <DebugLauncherIconPayload Include="Assets\OinksterSplashScreen.png" />
+      <DebugLauncherIconPayload Include="Assets\OinksterSquare150x150Logo.png" />
+      <DebugLauncherIconPayload Include="Assets\OinksterStoreLogo.png" />
+      <DebugLauncherIconPayload Include="Assets\OinksterWide310x150Logo.png" />
+    </ItemGroup>
+    <MakeDir Directories="$(OutDir)AppX\Assets" />
+    <Copy SourceFiles="@(DebugLauncherAppxPayload)"
+          DestinationFiles="@(DebugLauncherAppxPayload->'$(OutDir)AppX\%(Filename)%(Extension)')"
+          SkipUnchangedFiles="false" />
+    <Copy SourceFiles="@(DebugLauncherIconPayload)"
+          DestinationFolder="$(OutDir)AppX\Assets"
+          SkipUnchangedFiles="false" />
+  </Target>
+
+  <Target Name="RefreshDebugNativeClientInAppxLayout"
+          AfterTargets="Build"
+          Condition="'$(Configuration)' == 'Debug' and Exists('Native\out\build\x64\$(Configuration)\oinkster-client-x64.dll') and Exists('$(OutDir)AppX')">
+    <MakeDir Directories="$(OutDir)AppX\Native-v3" />
+    <Copy SourceFiles="Native\out\build\x64\$(Configuration)\oinkster-client-x64.dll"
+          DestinationFiles="$(OutDir)AppX\Native-v3\oinkster-client-x64.dll"
+          SkipUnchangedFiles="false" />
+  </Target>
+
+  <!-- Publish Properties -->
+  <PropertyGroup>
+    <PublishReadyToRun Condition="'$(Configuration)' == 'Debug'">False</PublishReadyToRun>
+    <PublishReadyToRun Condition="'$(Configuration)' != 'Debug'">True</PublishReadyToRun>
+    <PublishTrimmed Condition="'$(Configuration)' == 'Debug'">False</PublishTrimmed>
+    <PublishTrimmed Condition="'$(Configuration)' != 'Debug'">True</PublishTrimmed>
+  </PropertyGroup>
+</Project>

@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Application
+    x:Class="OinksterClient.App"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:local="using:OinksterClient">
+    <Application.Resources>
+        <ResourceDictionary>
+            <ResourceDictionary.MergedDictionaries>
+                <XamlControlsResources xmlns="using:Microsoft.UI.Xaml.Controls" />
+                <!-- Other merged dictionaries here -->
+            </ResourceDictionary.MergedDictionaries>
+            <SolidColorBrush x:Key="BlushCanvasBrush" Color="#FFF9FB" />
+            <SolidColorBrush x:Key="BlushSurfaceBrush" Color="#FFF0F5" />
+            <SolidColorBrush x:Key="PetalBrush" Color="#FFD9E8" />
+            <SolidColorBrush x:Key="OinkPinkBrush" Color="#F58CB5" />
+            <SolidColorBrush x:Key="OinkPinkDarkBrush" Color="#D95F91" />
+            <SolidColorBrush x:Key="InkBrush" Color="#382E35" />
+            <SolidColorBrush x:Key="MutedInkBrush" Color="#796B73" />
+        </ResourceDictionary>
+    </Application.Resources>
+</Application>
