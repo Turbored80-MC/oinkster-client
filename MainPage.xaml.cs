@@ -37,12 +37,18 @@ public sealed partial class MainPage : Page
     private bool moduleUiLoading;
     private bool moduleRefreshInFlight;
     private readonly DispatcherTimer moduleRefreshTimer = new() { Interval = TimeSpan.FromMilliseconds(500) };
+    private static readonly TimeSpan StaleUpdateCheck = TimeSpan.FromMinutes(10);
+    private readonly DispatcherTimer updateCheckTimer = new() { Interval = TimeSpan.FromMinutes(30) };
+    private DateTimeOffset lastUpdateCheck;
+    // A download, update prompt or game launch is running.
+    private bool busy;
 
     public MainPage()
     {
         InitializeComponent();
         AppVersionText.Text = $"Oinkster {AppVersion.Display}";
         moduleRefreshTimer.Tick += ModuleRefreshTimer_Tick;
+        updateCheckTimer.Tick += UpdateCheckTimer_Tick;
         // Deliberately NOT started here: the tick handler reads moduleCatalog
         // and moduleSettings, which Page_Loaded is what initialises. Starting
         // in the constructor let ticks run against an empty workspace.
@@ -56,6 +62,8 @@ public sealed partial class MainPage : Page
         // a continuation could touch torn-down XAML.
         moduleRefreshTimer.Stop();
         moduleRefreshTimer.Tick -= ModuleRefreshTimer_Tick;
+        updateCheckTimer.Stop();
+        updateCheckTimer.Tick -= UpdateCheckTimer_Tick;
         updateCheckCancellation?.Cancel();
     }
 
@@ -104,6 +112,7 @@ public sealed partial class MainPage : Page
             // No Bedrock means no client status to show, but the launcher
             // itself can still be out of date.
             var result = await updateService.CheckAsync(SelectedChannel(), null);
+            lastUpdateCheck = DateTimeOffset.UtcNow;
             await TryUpdateLauncherAsync(result.Launcher);
         }
         else if (bedrockInstallation.IsInstalled)
@@ -115,6 +124,7 @@ public sealed partial class MainPage : Page
 
         // Safe to start polling only now that the workspace is populated.
         moduleRefreshTimer.Start();
+        updateCheckTimer.Start();
     });
 
     private void LoadSettings()
@@ -215,6 +225,7 @@ public sealed partial class MainPage : Page
         updateCheckCancellation = null;
         cancellation.Dispose();
         clientUpdate = result;
+        lastUpdateCheck = DateTimeOffset.UtcNow;
         ShowClientStatus();
     }
 
@@ -877,6 +888,18 @@ public sealed partial class MainPage : Page
             return;
         }
 
+        // Launch the newest client, not whatever was current when the
+        // launcher opened. A check that installs a client update leaves the
+        // status Ready, so the launch below carries on with it.
+        if (CheckForUpdatesToggle.IsOn && DateTimeOffset.UtcNow - lastUpdateCheck > StaleUpdateCheck)
+        {
+            await CheckAndApplyUpdatesAsync();
+            if (launcherUpdateStarted)
+            {
+                return;
+            }
+        }
+
         if (clientUpdate?.Status is UpdateStatus.NotInstalled or UpdateStatus.UpdateAvailable)
         {
             await ConfirmAndInstallUpdateAsync(clientUpdate.Release!);
@@ -890,6 +913,7 @@ public sealed partial class MainPage : Page
         }
 
         PlayButton.IsEnabled = false;
+        busy = true;
         // From here on the button is disabled, so restoring it has to happen in
         // a finally: an exception escaping this stretch used to leave Play
         // permanently dead for the rest of the session.
@@ -900,6 +924,7 @@ public sealed partial class MainPage : Page
         }
         finally
         {
+            busy = false;
             // Skipped when the window is closing - touching XAML then is
             // pointless and the controls may already be torn down.
             if (!closingAfterLaunch)
@@ -1093,7 +1118,20 @@ public sealed partial class MainPage : Page
             DefaultButton = ContentDialogButton.Primary
         };
 
-        if (await dialog.ShowAsync() != ContentDialogResult.Primary)
+        // Busy while the prompt is up too, so a timed check can't install the
+        // same update underneath it.
+        busy = true;
+        ContentDialogResult choice;
+        try
+        {
+            choice = await dialog.ShowAsync();
+        }
+        finally
+        {
+            busy = false;
+        }
+
+        if (choice != ContentDialogResult.Primary)
         {
             return;
         }
@@ -1104,6 +1142,7 @@ public sealed partial class MainPage : Page
     private async Task InstallClientAsync(ClientRelease release)
     {
         PlayButton.IsEnabled = false;
+        busy = true;
         var progress = new Progress<DownloadProgress>(value =>
         {
             PlayButtonText.Text = $"Downloading {value.Percentage:F0}%";
@@ -1139,6 +1178,10 @@ public sealed partial class MainPage : Page
             ActionInfo.IsOpen = true;
             await RefreshClientStatusAsync();
         }
+        finally
+        {
+            busy = false;
+        }
     }
 
     private void Setting_Changed(object sender, object e)
@@ -1159,13 +1202,27 @@ public sealed partial class MainPage : Page
         }
     }
 
-    private void CheckForUpdatesButton_Click(object sender, RoutedEventArgs e) => RunGuarded(async () =>
+    private void CheckForUpdatesButton_Click(object sender, RoutedEventArgs e) => RunGuarded(CheckAndApplyUpdatesAsync);
+
+    // The launcher usually stays open while people play, so checking only at
+    // startup would miss a release for days - including the one that follows
+    // a Minecraft update. Skipped while a download, prompt or launch is
+    // running so it never lands in the middle of one.
+    private void UpdateCheckTimer_Tick(object? sender, object e)
     {
-        if (!bedrockInstallation.IsInstalled)
+        if (busy || launcherUpdateStarted || !CheckForUpdatesToggle.IsOn)
         {
-            await RefreshBedrockStatusAsync();
+            return;
         }
 
+        RunGuarded(CheckAndApplyUpdatesAsync);
+    }
+
+    private async Task CheckAndApplyUpdatesAsync()
+    {
+        // Re-detected each time: Minecraft may have updated since the last
+        // check, and compatibility is judged against its current version.
+        await RefreshBedrockStatusAsync();
         if (bedrockInstallation.IsInstalled)
         {
             await RefreshClientStatusAsync();
@@ -1174,9 +1231,10 @@ public sealed partial class MainPage : Page
         else
         {
             var result = await updateService.CheckAsync(SelectedChannel(), null);
+            lastUpdateCheck = DateTimeOffset.UtcNow;
             await TryUpdateLauncherAsync(result.Launcher);
         }
-    });
+    }
 
     private void OpenFolderButton_Click(object sender, RoutedEventArgs e) => RunGuarded(async () =>
     {
