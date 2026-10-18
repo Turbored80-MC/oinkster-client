@@ -117,7 +117,36 @@ public sealed class GitHubClientUpdateServiceTests
         }
     }
 
-    private static string CreateManifest() => JsonSerializer.Serialize(new
+    [Fact]
+    public async Task InstallAsync_VerifiedDownload_InstallsClient()
+    {
+        using var signingKey = ECDsa.Create(ECCurve.NamedCurves.nistP256);
+        var dll = "abc"u8.ToArray();
+        var manifestBytes = Encoding.UTF8.GetBytes(CreateManifest(Convert.ToHexString(SHA256.HashData(dll))));
+        var signature = signingKey.SignData(manifestBytes, HashAlgorithmName.SHA256);
+        var directory = CreateTemporaryDirectory();
+
+        try
+        {
+            var service = new GitHubClientUpdateService(
+                new HttpClient(new ReleaseHandler(manifestBytes, signature, dll)),
+                new ReleaseTrustOptions("Turbored80-MC", "oinkster-client", signingKey.ExportSubjectPublicKeyInfoPem()),
+                directory);
+            var result = await service.CheckAsync("Release", "1.21.50.0");
+
+            var installed = await service.InstallAsync(result.Release!);
+
+            Assert.Equal(dll, File.ReadAllBytes(installed.DllPath));
+            Assert.False(File.Exists(installed.DllPath + ".partial"));
+            Assert.Equal(UpdateStatus.Ready, (await service.CheckAsync("Release", "1.21.50.0")).Status);
+        }
+        finally
+        {
+            Directory.Delete(directory, true);
+        }
+    }
+
+    private static string CreateManifest(string? dllSha256 = null) => JsonSerializer.Serialize(new
     {
         schemaVersion = 2,
         channel = "Release",
@@ -125,7 +154,7 @@ public sealed class GitHubClientUpdateServiceTests
         publishedAt = "2026-10-01T12:00:00Z",
         architecture = "x64",
         nativeInterfaceVersion = 2,
-        dll = new { fileName = "oinkster-client-x64.dll", size = 3, sha256 = new string('A', 64) },
+        dll = new { fileName = "oinkster-client-x64.dll", size = 3, sha256 = dllSha256 ?? new string('A', 64) },
         bedrock = new { exactVersion = "1.21.50.0" }
     });
 
@@ -136,7 +165,7 @@ public sealed class GitHubClientUpdateServiceTests
         return path;
     }
 
-    private sealed class ReleaseHandler(byte[] manifest, byte[] signature) : HttpMessageHandler
+    private sealed class ReleaseHandler(byte[] manifest, byte[] signature, byte[]? dll = null) : HttpMessageHandler
     {
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
         {
@@ -151,6 +180,11 @@ public sealed class GitHubClientUpdateServiceTests
                     ]}]
                     """;
                 return Task.FromResult(Response(Encoding.UTF8.GetBytes(json), "application/json"));
+            }
+
+            if (url.EndsWith("client", StringComparison.Ordinal) && dll is not null)
+            {
+                return Task.FromResult(Response(dll, "application/octet-stream"));
             }
 
             return Task.FromResult(url.EndsWith("manifest", StringComparison.Ordinal)

@@ -176,26 +176,31 @@ public sealed class GitHubClientUpdateService : IClientUpdateService
                 throw new InvalidDataException("The client DLL exceeds the maximum allowed size.");
             }
 
-            await using var source = await response.Content.ReadAsStreamAsync(downloadToken);
-            await using var destination = new FileStream(partialPath, FileMode.Create, FileAccess.Write, FileShare.None, 81920, true);
             using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
-            var buffer = new byte[81920];
             long received = 0;
-            int read;
-            while ((read = await source.ReadAsync(buffer, downloadToken)) > 0)
+            // Scoped so the partial file is closed before it is moved into
+            // place below; moving it while still open fails on Windows.
+            await using (var source = await response.Content.ReadAsStreamAsync(downloadToken))
+            await using (var destination = new FileStream(partialPath, FileMode.Create, FileAccess.Write, FileShare.None, 81920, true))
             {
-                received += read;
-                if (received > MaximumDllSize || received > release.Manifest.Dll.Size)
+                var buffer = new byte[81920];
+                int read;
+                while ((read = await source.ReadAsync(buffer, downloadToken)) > 0)
                 {
-                    throw new InvalidDataException("The downloaded DLL has an unexpected size.");
+                    received += read;
+                    if (received > MaximumDllSize || received > release.Manifest.Dll.Size)
+                    {
+                        throw new InvalidDataException("The downloaded DLL has an unexpected size.");
+                    }
+
+                    await destination.WriteAsync(buffer.AsMemory(0, read), downloadToken);
+                    hash.AppendData(buffer, 0, read);
+                    progress?.Report(new DownloadProgress(received, release.Manifest.Dll.Size));
                 }
 
-                await destination.WriteAsync(buffer.AsMemory(0, read), downloadToken);
-                hash.AppendData(buffer, 0, read);
-                progress?.Report(new DownloadProgress(received, release.Manifest.Dll.Size));
+                await destination.FlushAsync(downloadToken);
             }
 
-            await destination.FlushAsync(downloadToken);
             var actualHash = Convert.ToHexString(hash.GetHashAndReset());
             if (received != release.Manifest.Dll.Size || !actualHash.Equals(release.Manifest.Dll.Sha256, StringComparison.OrdinalIgnoreCase))
             {
