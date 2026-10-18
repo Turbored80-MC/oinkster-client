@@ -21,11 +21,17 @@ public sealed record ClientRelease(
     ClientReleaseManifest Manifest,
     Uri DllUri);
 
+// A signed launcher installer newer than the running launcher.
+public sealed record LauncherUpdate(
+    LauncherInstallerAsset Installer,
+    Uri InstallerUri);
+
 public sealed record ClientUpdateResult(
     UpdateStatus Status,
     ClientRelease? Release,
     InstalledClientBuild? InstalledBuild,
-    string Message);
+    string Message,
+    LauncherUpdate? Launcher = null);
 
 public sealed record DownloadProgress(long BytesReceived, long TotalBytes)
 {

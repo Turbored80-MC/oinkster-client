@@ -2,10 +2,10 @@
 
 A free, open-source client for Minecraft Bedrock on Windows. Press **K** in-game to open the menu and turn on the mods you want: FPS and CPS counters, keystrokes, zoom, freelook, a custom crosshair, armor and potion HUDs, and around fifty more.
 
-**Current version:** 1.0.1 Beta, for Minecraft Bedrock 1.26.5203 (Windows, x64).
+**Current version:** 1.0.2 Beta, for Minecraft Bedrock 1.26.5203 (Windows, x64).
 
 Website: https://oinksterclient.vercel.app
-Found a bug? [Report it on the website](https://oinksterclient.vercel.app/bugs) or [open an issue](https://github.com/Turbored80-MC/oinkster-client/issues).
+Found a bug? [Report it on the website](https://oinksterclient.vercel.app/bugs) or [open an issue](https://github.com/Turbored80-MC/oinkster-client/issues). Got an idea? [Suggest it](https://oinksterclient.vercel.app/suggestions).
 
 ## How it works
 
@@ -21,6 +21,8 @@ Before loading anything, the launcher checks that:
 3. Minecraft is the 64-bit Windows build the DLL was made for.
 
 If any check fails, nothing is loaded. After a Minecraft update, the launcher waits for a matching Oinkster release.
+
+The launcher checks for updates each time it opens. A new client DLL downloads by itself (only the DLL, a few MB). A new launcher comes as a signed installer, checked the same way, which installs quietly and reopens the launcher. Releases that only change the client never make you download the launcher again.
 
 The client never installs global keyboard or mouse hooks, and it doesn't collect anything about you. The only network request the launcher makes is to GitHub, to check for updates.
 

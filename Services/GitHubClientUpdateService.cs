@@ -12,6 +12,8 @@ public sealed class GitHubClientUpdateService : IClientUpdateService
     private const int ManifestSchemaVersion = 2;
     private const int NativeInterfaceVersion = 2;
     private const long MaximumDllSize = 100 * 1024 * 1024;
+    private const long MaximumInstallerSize = 400 * 1024 * 1024;
+    private const string InstallerNamePrefix = "OinksterClient-Setup-";
     private const string ManifestAssetName = "oinkster-manifest.json";
     private const string SignatureAssetName = "oinkster-manifest.sig";
     private const string DllAssetName = "oinkster-client-x64.dll";
@@ -26,14 +28,23 @@ public sealed class GitHubClientUpdateService : IClientUpdateService
     private readonly HttpClient httpClient;
     private readonly ReleaseTrustOptions trustOptions;
     private readonly string clientDirectory;
+    private readonly string launcherDownloadDirectory;
+    private readonly Version launcherVersion;
     private readonly JsonSerializerOptions jsonOptions = new(JsonSerializerDefaults.Web);
 
-    public GitHubClientUpdateService(HttpClient httpClient, ReleaseTrustOptions trustOptions, string? clientDirectory = null)
+    public GitHubClientUpdateService(
+        HttpClient httpClient,
+        ReleaseTrustOptions trustOptions,
+        string? clientDirectory = null,
+        Version? launcherVersion = null,
+        string? launcherDownloadDirectory = null)
     {
         this.httpClient = httpClient;
         this.trustOptions = trustOptions;
-        this.clientDirectory = clientDirectory ?? Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Oinkster", "Releases");
+        var oinksterData = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Oinkster");
+        this.clientDirectory = clientDirectory ?? Path.Combine(oinksterData, "Releases");
+        this.launcherDownloadDirectory = launcherDownloadDirectory ?? Path.Combine(oinksterData, "LauncherUpdates");
+        this.launcherVersion = Normalize(launcherVersion ?? AppVersion.Number);
 
         if (!this.httpClient.DefaultRequestHeaders.UserAgent.Any())
         {
@@ -105,15 +116,18 @@ public sealed class GitHubClientUpdateService : IClientUpdateService
             }
 
             var clientRelease = new ClientRelease(manifest!, new Uri(dllAsset.BrowserDownloadUrl));
+            // Found before the compatibility check: a new launcher matters most
+            // exactly when this one cannot run the client.
+            var launcher = FindLauncherUpdate(release, manifest!);
             var compatible = IsCompatible(manifest!.Bedrock, bedrockVersion);
             if (!compatible)
             {
-                return new ClientUpdateResult(UpdateStatus.Incompatible, clientRelease, installed, "Waiting for an Oinkster update for this Bedrock version.");
+                return new ClientUpdateResult(UpdateStatus.Incompatible, clientRelease, installed, "Waiting for an Oinkster update for this Bedrock version.", launcher);
             }
 
             if (installed is null)
             {
-                return new ClientUpdateResult(UpdateStatus.NotInstalled, clientRelease, null, "Oinkster is ready to download.");
+                return new ClientUpdateResult(UpdateStatus.NotInstalled, clientRelease, null, "Oinkster is ready to download.", launcher);
             }
 
             var updateAvailable = Version.TryParse(manifest.Version, out var availableVersion)
@@ -123,7 +137,8 @@ public sealed class GitHubClientUpdateService : IClientUpdateService
                 updateAvailable ? UpdateStatus.UpdateAvailable : UpdateStatus.Ready,
                 clientRelease,
                 installed,
-                updateAvailable ? "An Oinkster update is available." : "Oinkster is ready.");
+                updateAvailable ? "An Oinkster update is available." : "Oinkster is ready.",
+                launcher);
         }
         catch (HttpRequestException)
         {
@@ -144,12 +159,7 @@ public sealed class GitHubClientUpdateService : IClientUpdateService
 
     public async Task<InstalledClientBuild> InstallAsync(ClientRelease release, IProgress<DownloadProgress>? progress = null, CancellationToken cancellationToken = default)
     {
-        if (release.DllUri.Scheme != Uri.UriSchemeHttps
-            || !release.DllUri.Host.Equals("github.com", StringComparison.OrdinalIgnoreCase))
-        {
-            throw new InvalidDataException("The client DLL must be downloaded from a GitHub release asset.");
-        }
-
+        RequireGitHubAsset(release.DllUri, "client DLL");
         Directory.CreateDirectory(clientDirectory);
         var partialPath = Path.Combine(clientDirectory, DllAssetName + ".partial");
         var activePath = Path.Combine(clientDirectory, DllAssetName);
@@ -175,44 +185,8 @@ public sealed class GitHubClientUpdateService : IClientUpdateService
 
         try
         {
-            using var request = new HttpRequestMessage(HttpMethod.Get, release.DllUri);
-            using var response = await httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, downloadToken);
-            response.EnsureSuccessStatusCode();
-            if (response.Content.Headers.ContentLength is > MaximumDllSize)
-            {
-                throw new InvalidDataException("The client DLL exceeds the maximum allowed size.");
-            }
-
-            using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
-            long received = 0;
-            // Scoped so the partial file is closed before it is moved into
-            // place below; moving it while still open fails on Windows.
-            await using (var source = await response.Content.ReadAsStreamAsync(downloadToken))
-            await using (var destination = new FileStream(partialPath, FileMode.Create, FileAccess.Write, FileShare.None, 81920, true))
-            {
-                var buffer = new byte[81920];
-                int read;
-                while ((read = await source.ReadAsync(buffer, downloadToken)) > 0)
-                {
-                    received += read;
-                    if (received > MaximumDllSize || received > release.Manifest.Dll.Size)
-                    {
-                        throw new InvalidDataException("The downloaded DLL has an unexpected size.");
-                    }
-
-                    await destination.WriteAsync(buffer.AsMemory(0, read), downloadToken);
-                    hash.AppendData(buffer, 0, read);
-                    progress?.Report(new DownloadProgress(received, release.Manifest.Dll.Size));
-                }
-
-                await destination.FlushAsync(downloadToken);
-            }
-
-            var actualHash = Convert.ToHexString(hash.GetHashAndReset());
-            if (received != release.Manifest.Dll.Size || !actualHash.Equals(release.Manifest.Dll.Sha256, StringComparison.OrdinalIgnoreCase))
-            {
-                throw new InvalidDataException("The downloaded DLL failed integrity verification.");
-            }
+            var actualHash = await DownloadVerifiedAsync(release.DllUri, partialPath, release.Manifest.Dll.Size,
+                release.Manifest.Dll.Sha256, MaximumDllSize, "client DLL", progress, downloadToken);
 
             var installed = new InstalledClientBuild(release.Manifest.Version, activePath, actualHash, release.Manifest.Bedrock);
             await File.WriteAllTextAsync(metadataPartialPath, JsonSerializer.Serialize(installed, jsonOptions), downloadToken);
@@ -253,6 +227,128 @@ public sealed class GitHubClientUpdateService : IClientUpdateService
             }
         }
     }
+
+    public async Task<string> DownloadLauncherAsync(LauncherUpdate update, IProgress<DownloadProgress>? progress = null, CancellationToken cancellationToken = default)
+    {
+        RequireGitHubAsset(update.InstallerUri, "launcher installer");
+        Directory.CreateDirectory(launcherDownloadDirectory);
+        // Installers from earlier updates have already run; clear them out.
+        foreach (var stale in Directory.EnumerateFiles(launcherDownloadDirectory))
+        {
+            try
+            {
+                File.Delete(stale);
+            }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+            {
+            }
+        }
+
+        var installerPath = Path.Combine(launcherDownloadDirectory, update.Installer.FileName);
+        var partialPath = installerPath + ".partial";
+        using var downloadTimeout = new CancellationTokenSource(DownloadTimeout);
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, downloadTimeout.Token);
+        try
+        {
+            await DownloadVerifiedAsync(update.InstallerUri, partialPath, update.Installer.Size, update.Installer.Sha256,
+                MaximumInstallerSize, "launcher installer", progress, linked.Token);
+            File.Move(partialPath, installerPath, true);
+            return installerPath;
+        }
+        finally
+        {
+            if (File.Exists(partialPath))
+            {
+                File.Delete(partialPath);
+            }
+        }
+    }
+
+    // Streams a release asset to `path`, enforcing the signed size and SHA-256.
+    // Returns the hash. The file is closed on return, so the caller can move it.
+    private async Task<string> DownloadVerifiedAsync(Uri uri, string path, long expectedSize, string expectedSha256,
+        long maximumSize, string label, IProgress<DownloadProgress>? progress, CancellationToken cancellationToken)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Get, uri);
+        using var response = await httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+        response.EnsureSuccessStatusCode();
+        if (response.Content.Headers.ContentLength is { } length && length > maximumSize)
+        {
+            throw new InvalidDataException($"The {label} exceeds the maximum allowed size.");
+        }
+
+        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        long received = 0;
+        // Scoped so the file is closed before the caller moves it into place;
+        // moving it while still open fails on Windows.
+        await using (var source = await response.Content.ReadAsStreamAsync(cancellationToken))
+        await using (var destination = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None, 81920, true))
+        {
+            var buffer = new byte[81920];
+            int read;
+            while ((read = await source.ReadAsync(buffer, cancellationToken)) > 0)
+            {
+                received += read;
+                if (received > maximumSize || received > expectedSize)
+                {
+                    throw new InvalidDataException($"The downloaded {label} has an unexpected size.");
+                }
+
+                await destination.WriteAsync(buffer.AsMemory(0, read), cancellationToken);
+                hash.AppendData(buffer, 0, read);
+                progress?.Report(new DownloadProgress(received, expectedSize));
+            }
+
+            await destination.FlushAsync(cancellationToken);
+        }
+
+        var actualHash = Convert.ToHexString(hash.GetHashAndReset());
+        if (received != expectedSize || !actualHash.Equals(expectedSha256, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidDataException($"The downloaded {label} failed integrity verification.");
+        }
+
+        return actualHash;
+    }
+
+    private static void RequireGitHubAsset(Uri uri, string label)
+    {
+        if (uri.Scheme != Uri.UriSchemeHttps || !uri.Host.Equals("github.com", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidDataException($"The {label} must be downloaded from a GitHub release asset.");
+        }
+    }
+
+    // The installer is only offered when the signed manifest names it, the
+    // release actually carries it at the signed size, and it is newer than
+    // the running launcher.
+    private LauncherUpdate? FindLauncherUpdate(GitHubRelease release, ClientReleaseManifest manifest)
+    {
+        var installer = manifest.Launcher;
+        if (installer is null
+            || !Version.TryParse(installer.Version, out var available)
+            || Normalize(available) <= launcherVersion
+            || !installer.FileName.StartsWith(InstallerNamePrefix, StringComparison.Ordinal)
+            || !installer.FileName.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)
+            || installer.FileName != Path.GetFileName(installer.FileName)
+            || installer.FileName.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0
+            || installer.Size <= 0
+            || installer.Size > MaximumInstallerSize
+            || installer.Sha256.Length != 64
+            || !installer.Sha256.All(Uri.IsHexDigit))
+        {
+            return null;
+        }
+
+        var asset = FindAsset(release, installer.FileName);
+        return asset is null || asset.Size != installer.Size
+            ? null
+            : new LauncherUpdate(installer, new Uri(asset.BrowserDownloadUrl));
+    }
+
+    // 1.0.1 and 1.0.1.0 must compare equal; Version treats missing parts as -1.
+    private static Version Normalize(Version version) =>
+        new(version.Major, version.Minor, Math.Max(version.Build, 0), Math.Max(version.Revision, 0));
 
     // Best effort: a copy the game still has loaded stays until a later run.
     private void DeleteParkedCopies()

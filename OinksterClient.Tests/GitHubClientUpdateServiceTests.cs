@@ -181,7 +181,95 @@ public sealed class GitHubClientUpdateServiceTests
         }
     }
 
-    private static string CreateManifest(string? dllSha256 = null) => JsonSerializer.Serialize(new
+    [Fact]
+    public async Task CheckAsync_NewerLauncherInManifest_ReturnsLauncherUpdate()
+    {
+        var installer = "setup"u8.ToArray();
+        var result = await CheckWithLauncherAsync(installer, "1.0.2", new Version(1, 0, 1));
+
+        Assert.NotNull(result.Launcher);
+        Assert.Equal("1.0.2", result.Launcher!.Installer.Version);
+        Assert.Equal("https://github.com/installer", result.Launcher.InstallerUri.AbsoluteUri);
+    }
+
+    [Fact]
+    public async Task CheckAsync_LauncherNotNewer_ReturnsNoLauncherUpdate()
+    {
+        var installer = "setup"u8.ToArray();
+        var result = await CheckWithLauncherAsync(installer, "1.0.1", new Version(1, 0, 1));
+
+        Assert.Null(result.Launcher);
+    }
+
+    [Fact]
+    public async Task CheckAsync_IncompatibleBedrock_StillReturnsLauncherUpdate()
+    {
+        var installer = "setup"u8.ToArray();
+        var result = await CheckWithLauncherAsync(installer, "1.0.2", new Version(1, 0, 1), "1.22.0.0");
+
+        Assert.Equal(UpdateStatus.Incompatible, result.Status);
+        Assert.NotNull(result.Launcher);
+    }
+
+    [Fact]
+    public async Task DownloadLauncherAsync_VerifiedInstaller_ReturnsLocalCopy()
+    {
+        using var signingKey = ECDsa.Create(ECCurve.NamedCurves.nistP256);
+        var installer = "setup"u8.ToArray();
+        var manifestBytes = Encoding.UTF8.GetBytes(CreateManifest(launcher: Launcher(installer, "1.0.2")));
+        var signature = signingKey.SignData(manifestBytes, HashAlgorithmName.SHA256);
+        var directory = CreateTemporaryDirectory();
+
+        try
+        {
+            var service = new GitHubClientUpdateService(
+                new HttpClient(new ReleaseHandler(manifestBytes, signature, installer: installer)),
+                new ReleaseTrustOptions("Turbored80-MC", "oinkster-client", signingKey.ExportSubjectPublicKeyInfoPem()),
+                directory, new Version(1, 0, 1), Path.Combine(directory, "launcher"));
+            var result = await service.CheckAsync("Release", "1.21.50.0");
+
+            var path = await service.DownloadLauncherAsync(result.Launcher!);
+
+            Assert.Equal("OinksterClient-Setup-1.0.2.exe", Path.GetFileName(path));
+            Assert.Equal(installer, File.ReadAllBytes(path));
+        }
+        finally
+        {
+            Directory.Delete(directory, true);
+        }
+    }
+
+    private static async Task<ClientUpdateResult> CheckWithLauncherAsync(
+        byte[] installer, string launcherVersion, Version runningLauncher, string bedrock = "1.21.50.0")
+    {
+        using var signingKey = ECDsa.Create(ECCurve.NamedCurves.nistP256);
+        var manifestBytes = Encoding.UTF8.GetBytes(CreateManifest(launcher: Launcher(installer, launcherVersion)));
+        var signature = signingKey.SignData(manifestBytes, HashAlgorithmName.SHA256);
+        var directory = CreateTemporaryDirectory();
+
+        try
+        {
+            var service = new GitHubClientUpdateService(
+                new HttpClient(new ReleaseHandler(manifestBytes, signature, installer: installer)),
+                new ReleaseTrustOptions("Turbored80-MC", "oinkster-client", signingKey.ExportSubjectPublicKeyInfoPem()),
+                directory, runningLauncher, Path.Combine(directory, "launcher"));
+            return await service.CheckAsync("Release", bedrock);
+        }
+        finally
+        {
+            Directory.Delete(directory, true);
+        }
+    }
+
+    private static object Launcher(byte[] installer, string version) => new
+    {
+        version,
+        fileName = $"OinksterClient-Setup-{version}.exe",
+        size = installer.Length,
+        sha256 = Convert.ToHexString(SHA256.HashData(installer))
+    };
+
+    private static string CreateManifest(string? dllSha256 = null, object? launcher = null) => JsonSerializer.Serialize(new
     {
         schemaVersion = 2,
         channel = "Release",
@@ -190,7 +278,8 @@ public sealed class GitHubClientUpdateServiceTests
         architecture = "x64",
         nativeInterfaceVersion = 2,
         dll = new { fileName = "oinkster-client-x64.dll", size = 3, sha256 = dllSha256 ?? new string('A', 64) },
-        bedrock = new { exactVersion = "1.21.50.0" }
+        bedrock = new { exactVersion = "1.21.50.0" },
+        launcher
     });
 
     private static string CreateTemporaryDirectory()
@@ -200,21 +289,30 @@ public sealed class GitHubClientUpdateServiceTests
         return path;
     }
 
-    private sealed class ReleaseHandler(byte[] manifest, byte[] signature, byte[]? dll = null) : HttpMessageHandler
+    private sealed class ReleaseHandler(byte[] manifest, byte[] signature, byte[]? dll = null, byte[]? installer = null) : HttpMessageHandler
     {
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
         {
             var url = request.RequestUri!.AbsoluteUri;
             if (url.Contains("api.github.com", StringComparison.Ordinal))
             {
-                var json = """
+                // Every installer version the tests sign is listed; only the one
+                // the manifest names is ever looked up.
+                var installerAssets = installer is null ? "" : string.Concat(new[] { "1.0.1", "1.0.2" }.Select(version =>
+                    $$""",{"name":"OinksterClient-Setup-{{version}}.exe","size":{{installer.Length}},"browser_download_url":"https://github.com/installer"}"""));
+                var json = $$"""
                     [{"tag_name":"release-v1.0.0","assets":[
                       {"name":"oinkster-manifest.json","size":1,"browser_download_url":"https://github.com/manifest"},
                       {"name":"oinkster-manifest.sig","size":1,"browser_download_url":"https://github.com/signature"},
-                      {"name":"oinkster-client-x64.dll","size":3,"browser_download_url":"https://github.com/client"}
+                      {"name":"oinkster-client-x64.dll","size":3,"browser_download_url":"https://github.com/client"}{{installerAssets}}
                     ]}]
                     """;
                 return Task.FromResult(Response(Encoding.UTF8.GetBytes(json), "application/json"));
+            }
+
+            if (url.EndsWith("installer", StringComparison.Ordinal) && installer is not null)
+            {
+                return Task.FromResult(Response(installer, "application/octet-stream"));
             }
 
             if (url.EndsWith("client", StringComparison.Ordinal) && dll is not null)

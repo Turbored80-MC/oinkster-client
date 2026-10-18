@@ -72,3 +72,6 @@ Name: "{userdesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; Tasks: desktopico
 
 [Run]
 Filename: "{app}\{#AppExe}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall skipifsilent
+; The launcher updates itself by running this installer with /VERYSILENT,
+; then exits; reopen it once the new files are in place.
+Filename: "{app}\{#AppExe}"; Flags: nowait; Check: WizardSilent

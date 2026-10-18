@@ -1,3 +1,5 @@
+using System.ComponentModel;
+using System.Diagnostics;
 using Microsoft.UI;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
@@ -26,6 +28,7 @@ public sealed partial class MainPage : Page
     private BedrockInstallation bedrockInstallation = BedrockInstallation.NotInstalled;
     private ClientUpdateResult? clientUpdate;
     private bool settingsLoaded;
+    private bool launcherUpdateStarted;
     private CancellationTokenSource? updateCheckCancellation;
     private IReadOnlyList<ModuleDefinition> moduleCatalog = [];
     private ModuleSettingsDocument moduleSettings = new();
@@ -94,6 +97,14 @@ public sealed partial class MainPage : Page
         if (bedrockInstallation.IsInstalled && CheckForUpdatesToggle.IsOn)
         {
             await RefreshClientStatusAsync();
+            await ApplyUpdatesAsync();
+        }
+        else if (CheckForUpdatesToggle.IsOn)
+        {
+            // No Bedrock means no client status to show, but the launcher
+            // itself can still be out of date.
+            var result = await updateService.CheckAsync(SelectedChannel(), null);
+            await TryUpdateLauncherAsync(result.Launcher);
         }
         else if (bedrockInstallation.IsInstalled)
         {
@@ -175,7 +186,7 @@ public sealed partial class MainPage : Page
         var cancellation = new CancellationTokenSource();
         updateCheckCancellation = cancellation;
         var cancellationToken = cancellation.Token;
-        var channel = (UpdateChannelComboBox.SelectedItem as ComboBoxItem)?.Content?.ToString() ?? "Release";
+        var channel = SelectedChannel();
         ClientBuildText.Text = $"Checking {channel.ToLowerInvariant()} channel…";
 
         ClientUpdateResult result;
@@ -204,6 +215,15 @@ public sealed partial class MainPage : Page
         updateCheckCancellation = null;
         cancellation.Dispose();
         clientUpdate = result;
+        ShowClientStatus();
+    }
+
+    private void ShowClientStatus()
+    {
+        if (clientUpdate is null)
+        {
+            return;
+        }
 
         switch (clientUpdate.Status)
         {
@@ -978,6 +998,88 @@ public sealed partial class MainPage : Page
         return null;
     }
 
+    private string SelectedChannel() =>
+        (UpdateChannelComboBox.SelectedItem as ComboBoxItem)?.Content?.ToString() ?? "Release";
+
+    // Installed copies of the launcher come from the Inno Setup installer,
+    // which leaves its uninstaller beside the exe. Development builds never
+    // replace themselves.
+    private static bool CanUpdateLauncher =>
+#if DEBUG
+        false;
+#else
+        File.Exists(Path.Combine(AppContext.BaseDirectory, "unins000.exe"));
+#endif
+
+    // Runs after each update check. A newer launcher installs itself and
+    // restarts the app (it then picks up any client update on its own first
+    // check); otherwise a client DLL update downloads without asking.
+    private async Task ApplyUpdatesAsync()
+    {
+        if (clientUpdate is null || await TryUpdateLauncherAsync(clientUpdate.Launcher))
+        {
+            return;
+        }
+
+        if (clientUpdate.Status is UpdateStatus.NotInstalled or UpdateStatus.UpdateAvailable && clientUpdate.Release is not null)
+        {
+            await InstallClientAsync(clientUpdate.Release);
+        }
+    }
+
+    private async Task<bool> TryUpdateLauncherAsync(LauncherUpdate? update)
+    {
+        if (update is null || launcherUpdateStarted || !CanUpdateLauncher)
+        {
+            return false;
+        }
+
+        launcherUpdateStarted = true;
+        PlayButton.IsEnabled = false;
+        ActionInfo.Title = "Updating Oinkster";
+        ActionInfo.Message = $"Downloading launcher {update.Installer.Version}. Oinkster restarts by itself when it's done.";
+        ActionInfo.Severity = InfoBarSeverity.Informational;
+        ActionInfo.IsOpen = true;
+        var progress = new Progress<DownloadProgress>(value =>
+        {
+            PlayButtonText.Text = $"Updating {value.Percentage:F0}%";
+        });
+
+        try
+        {
+            PlayButtonText.Text = "Updating 0%";
+            var installerPath = await updateService.DownloadLauncherAsync(update, progress);
+            // The installer closes this process if it is still running, swaps
+            // the files and starts the new launcher (its silent-mode [Run]).
+            Process.Start(new ProcessStartInfo(installerPath, "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART")
+            {
+                UseShellExecute = true
+            });
+            App.Window.Close();
+            return true;
+        }
+        catch (Exception exception) when (exception is HttpRequestException or IOException
+            or UnauthorizedAccessException or InvalidDataException or TaskCanceledException or Win32Exception)
+        {
+            App.Log("launcher_update_failed", exception.ToString());
+            launcherUpdateStarted = false;
+            ShowError("Launcher update failed", exception is TaskCanceledException
+                ? "The download timed out. Oinkster will try again next time it opens."
+                : $"{exception.Message} Oinkster will try again next time it opens.");
+            if (clientUpdate is null)
+            {
+                PlayButton.IsEnabled = bedrockInstallation.IsInstalled;
+                PlayButtonText.Text = bedrockInstallation.IsInstalled ? "Launch Oinkster" : "Bedrock required";
+            }
+            else
+            {
+                ShowClientStatus();
+            }
+
+            return false;
+        }
+    }
+
     private async Task ConfirmAndInstallUpdateAsync(ClientRelease release)
     {
         var sizeInMegabytes = release.Manifest.Dll.Size / 1024d / 1024d;
@@ -996,6 +1098,11 @@ public sealed partial class MainPage : Page
             return;
         }
 
+        await InstallClientAsync(release);
+    }
+
+    private async Task InstallClientAsync(ClientRelease release)
+    {
         PlayButton.IsEnabled = false;
         var progress = new Progress<DownloadProgress>(value =>
         {
@@ -1062,6 +1169,12 @@ public sealed partial class MainPage : Page
         if (bedrockInstallation.IsInstalled)
         {
             await RefreshClientStatusAsync();
+            await ApplyUpdatesAsync();
+        }
+        else
+        {
+            var result = await updateService.CheckAsync(SelectedChannel(), null);
+            await TryUpdateLauncherAsync(result.Launcher);
         }
     });
 
