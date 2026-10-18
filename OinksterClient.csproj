@@ -31,6 +31,15 @@
     <TreatWarningsAsErrors Condition="'$(Configuration)' == 'Debug'">true</TreatWarningsAsErrors>
   </PropertyGroup>
 
+  <!-- The public download is a plain zip: unpackaged, with the Windows App
+       SDK runtime bundled, so people can unzip and run it without installing
+       an MSIX or trusting a signing certificate. Debug stays packaged for
+       `dotnet run`. -->
+  <PropertyGroup Condition="'$(Configuration)' == 'Release'">
+    <WindowsPackageType>None</WindowsPackageType>
+    <WindowsAppSDKSelfContained>true</WindowsAppSDKSelfContained>
+  </PropertyGroup>
+
   <ItemGroup>
     <Content Include="Assets\OinksterAppIcon.ico" />
     <Content Include="Assets\OinksterAppIcon.scale-*.png" />
@@ -47,6 +56,12 @@
              CopyToOutputDirectory="Always"
              CopyToPublishDirectory="Always"
              Condition="'$(Configuration)' == 'Debug' and Exists('Native\out\build\x64\$(Configuration)\oinkster-client-x64.dll')" />
+  </ItemGroup>
+
+  <!-- Unpackaged builds have no MSIX layout to carry content, so the assets
+       (including the release public key) must be copied next to the exe. -->
+  <ItemGroup Condition="'$(WindowsPackageType)' == 'None'">
+    <Content Update="Assets\**" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
 
   <ItemGroup>

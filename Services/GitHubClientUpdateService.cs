@@ -4,7 +4,6 @@ using System.Security.Cryptography;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using OinksterClient.Models;
-using Windows.Storage;
 
 namespace OinksterClient.Services;
 
@@ -33,7 +32,8 @@ public sealed class GitHubClientUpdateService : IClientUpdateService
     {
         this.httpClient = httpClient;
         this.trustOptions = trustOptions;
-        this.clientDirectory = clientDirectory ?? Path.Combine(ApplicationData.Current.LocalFolder.Path, "Client");
+        this.clientDirectory = clientDirectory ?? Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Oinkster", "Releases");
 
         if (!this.httpClient.DefaultRequestHeaders.UserAgent.Any())
         {
