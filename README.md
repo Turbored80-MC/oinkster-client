@@ -1,8 +1,8 @@
 # Oinkster Client
 
-A free, open-source client for Minecraft Bedrock on Windows. Press **K** in-game to open the menu and turn on the mods you want: FPS and CPS counters, keystrokes, zoom, freelook, a custom crosshair, armor and potion HUDs, and around fifty more.
+A free, open-source client for Minecraft Bedrock on Windows. Press **K** in-game to open the menu and turn on the mods you want: FPS and CPS counters, keystrokes, zoom, freelook, screenshots, waypoints, a movable scoreboard, and dozens more.
 
-**Current version:** 1.0.3 Beta, for Minecraft Bedrock 1.26.5203 (Windows, x64).
+**Current version:** 1.1.0 Beta, for Minecraft Bedrock 1.26.6301 (Windows, x64).
 
 Website: https://oinksterclient.vercel.app
 Found a bug? [Report it on the website](https://oinksterclient.vercel.app/bugs) or [open an issue](https://github.com/Turbored80-MC/oinkster-client/issues). Got an idea? [Suggest it](https://oinksterclient.vercel.app/suggestions).
