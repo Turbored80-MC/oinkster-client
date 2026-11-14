@@ -19,8 +19,10 @@ public sealed partial class MainPage : Page
 
     private readonly BedrockService bedrockService = new();
     private readonly LauncherSettingsService settingsService = new();
+    private readonly BedrockVsyncPreflightService vsyncPreflightService = new();
     private readonly IClientInjector clientInjector = new ReviewedClientInjector();
     private readonly NativeClientStatusService nativeStatusService = new();
+    private readonly MediaBrokerService mediaBrokerService = new();
     private readonly ModuleSettingsService moduleSettingsService = new();
     private readonly IClientUpdateService updateService = new GitHubClientUpdateService(
         new HttpClient { Timeout = TimeSpan.FromSeconds(15) },
@@ -177,17 +179,7 @@ public sealed partial class MainPage : Page
 
     private async Task RefreshClientStatusAsync()
     {
-#if DEBUG
-        var developmentBuild = DevelopmentClientBuildService.TryLoad();
-        if (developmentBuild is not null)
-        {
-            clientUpdate = new ClientUpdateResult(UpdateStatus.Ready, null, developmentBuild, "Local reviewed Debug build.");
-            ClientBuildText.Text = $"Development build {developmentBuild.Version}";
-            PlayButtonText.Text = "Launch Oinkster";
-            PlayButton.IsEnabled = true;
-            return;
-        }
-#endif
+        var bundledBuild = DevelopmentClientBuildService.TryLoad();
         // Cancel the previous check but do NOT dispose it here: a still-running
         // CheckAsync holds its token, and disposing the source out from under
         // it can throw ObjectDisposedException. The superseded call disposes
@@ -224,9 +216,43 @@ public sealed partial class MainPage : Page
 
         updateCheckCancellation = null;
         cancellation.Dispose();
-        clientUpdate = result;
+        clientUpdate = UseBundledClientWhenCompatible(result, bundledBuild, bedrockInstallation.Version);
         lastUpdateCheck = DateTimeOffset.UtcNow;
         ShowClientStatus();
+    }
+
+    private static ClientUpdateResult UseBundledClientWhenCompatible(
+        ClientUpdateResult result,
+        InstalledClientBuild? bundledBuild,
+        string? installedBedrockVersion)
+    {
+        if (bundledBuild is null
+            || !Version.TryParse(bundledBuild.Bedrock.ExactVersion, out var supported)
+            || !Version.TryParse(installedBedrockVersion, out var installed)
+            || supported != installed)
+        {
+            return result;
+        }
+
+        // A published release for an older Bedrock build must not disable the
+        // reviewed client shipped with this launcher. Preserve a genuinely
+        // newer compatible release as an update; otherwise launch the bundle.
+        if (result.Release is { } release
+            && Version.TryParse(release.Manifest.Version, out var availableVersion)
+            && Version.TryParse(bundledBuild.Version, out var bundledVersion)
+            && Version.TryParse(release.Manifest.Bedrock.ExactVersion, out var releaseBedrock)
+            && releaseBedrock == installed
+            && availableVersion > bundledVersion)
+        {
+            return result with { Status = UpdateStatus.UpdateAvailable, InstalledBuild = bundledBuild };
+        }
+
+        return new ClientUpdateResult(
+            UpdateStatus.Ready,
+            null,
+            bundledBuild,
+            "Using the reviewed client bundled with this launcher.",
+            result.Launcher);
     }
 
     private void ShowClientStatus()
@@ -941,6 +967,12 @@ public sealed partial class MainPage : Page
     {
         var processId = bedrockService.TryGetRunningProcessId();
         var launched = processId is not null;
+        // Starting every launcher-created game with VSync forced off left the
+        // live session uncapped when native activation failed, even though the
+        // options file was restored afterward. Only alter startup presentation
+        // when the player explicitly enabled Oinkster's Disable VSync option.
+        var disableVsyncRequested = BedrockVsyncPreflightService.IsRequested(moduleSettings.ModuleSettings);
+        using var vsyncPreflight = processId is null && disableVsyncRequested ? vsyncPreflightService.Prepare() : null;
         if (!launched)
         {
             PlayButtonText.Text = "Starting Bedrock…";
@@ -958,6 +990,10 @@ public sealed partial class MainPage : Page
 
         PlayButtonText.Text = "Activating Oinkster…";
         processId ??= await bedrockService.WaitForProcessAsync(TimeSpan.FromSeconds(45));
+        if (processId is not null)
+        {
+            mediaBrokerService.TryStart(processId.Value);
+        }
         var existingStatus = await nativeStatusService.QueryAsync();
         var injection = existingStatus?.State == "ready" && existingStatus.HooksInstalled == true
             ? new InjectionResult(InjectionStatus.Success, $"Oinkster is already active. Press {FormatKey(moduleSettings.MenuKey)} in-game to open it.")
@@ -972,7 +1008,9 @@ public sealed partial class MainPage : Page
             {
                 injection = new InjectionResult(
                     InjectionStatus.SecurityValidationFailed,
-                    "The DLL loaded, but its graphics adapter did not report ready.");
+                    nativeStatus?.StartupError is { Length: > 0 } startupError
+                        ? startupError
+                        : "The DLL loaded, but its graphics adapter did not report ready. Update the graphics driver and close other overlays, then restart Minecraft.");
             }
         }
         // The native client reports the Bedrock build it was compiled against.
@@ -1012,7 +1050,9 @@ public sealed partial class MainPage : Page
         for (var attempt = 0; attempt < 48; attempt++)
         {
             var status = await nativeStatusService.QueryAsync();
-            if (status is not null && string.Equals(status.State, "ready", StringComparison.OrdinalIgnoreCase))
+            if (status is not null && (string.Equals(status.State, "ready", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(status.State, "error", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(status.State, "review-required", StringComparison.OrdinalIgnoreCase)))
             {
                 return status;
             }

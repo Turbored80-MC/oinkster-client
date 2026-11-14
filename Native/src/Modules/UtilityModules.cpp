@@ -1,4 +1,5 @@
 #include "Oinkster/Modules/Factories.hpp"
+#include "Oinkster/ScreenTelemetry.hpp"
 #include "Oinkster/Modules/HudFormat.hpp"
 #include "Oinkster/Modules/InputLogic.hpp"
 #include "Oinkster/Modules/TelemetryLogic.hpp"
@@ -7,7 +8,11 @@
 #include <Windows.h>
 #include <algorithm>
 #include <cmath>
+#include <filesystem>
 #include <format>
+#include <fstream>
+#include <limits>
+#include <sstream>
 
 // Modules matching features other Bedrock clients ship (Blueberry, Flarial)
 // that build only on integration points Oinkster already has: the mouse
@@ -246,6 +251,227 @@ public:
 
 private:
     PostProcessSettings settings_{};
+};
+
+class MenuBlurModule final : public PlainModule<IPostProcessModule> {
+public:
+    MenuBlurModule(ModuleMetadata metadata, HudLayout, SharedServices&)
+        : PlainModule(std::move(metadata), {
+            FloatSetting("strength", "Blur strength", 0.55, 0.05, 1.0, "%.2f"),
+            FloatSetting("dim", "Background dimming", 0.12, 0.0, 0.4, "%.2f")}) {}
+    void OnSettingsChanged(const SettingsReader& settings) override {
+        std::scoped_lock lock(mutex_);
+        strength_ = settings.Float("strength");
+        dim_ = settings.Float("dim");
+    }
+    void OnRender(const RenderEvent& event) override {
+        // Unknown is deliberately false: a newly changed build must not blur
+        // arbitrary screens until screen telemetry identifies the state.
+        const bool active = !event.menuVisible && !event.gameplayVisible
+            && ScreenTelemetry::Known() && !ScreenTelemetry::OnTitleScreen()
+            && !ScreenTelemetry::OnDisconnectedScreen();
+        std::scoped_lock lock(mutex_);
+        active_ = active;
+    }
+    [[nodiscard]] PostProcessSettings PostProcess() const override {
+        std::scoped_lock lock(mutex_);
+        PostProcessSettings settings;
+        if (active_) {
+            settings.blur = strength_;
+            settings.brightness = -dim_;
+        }
+        return settings;
+    }
+
+private:
+    float strength_{0.55F};
+    float dim_{0.12F};
+    bool active_{};
+};
+
+struct SavedWaypoint {
+    std::string scope;
+    int dimension{};
+    Vec3 position{};
+    std::string name;
+    std::uint32_t color{0xFFF28FB5U};
+};
+
+std::filesystem::path WaypointFile() {
+    std::array<wchar_t, 32768> value{};
+    const DWORD length = GetEnvironmentVariableW(L"LOCALAPPDATA", value.data(), static_cast<DWORD>(value.size()));
+    const auto root = length > 0 && length < value.size()
+        ? std::filesystem::path(std::wstring_view(value.data(), length))
+        : std::filesystem::temp_directory_path();
+    return root / L"Oinkster" / L"Client" / L"waypoints.tsv";
+}
+
+std::string CleanWaypointField(std::string value) {
+    value.erase(std::remove_if(value.begin(), value.end(), [](char c) { return c == '\t' || c == '\r' || c == '\n'; }), value.end());
+    if (value.size() > 64) value.resize(64);
+    return value;
+}
+
+std::vector<SavedWaypoint> LoadWaypoints() {
+    std::vector<SavedWaypoint> points;
+    std::ifstream stream(WaypointFile());
+    std::string line;
+    while (points.size() < 128 && std::getline(stream, line)) {
+        std::istringstream row(line);
+        SavedWaypoint point;
+        std::string dimension, x, y, z, color;
+        if (!std::getline(row, point.scope, '\t') || !std::getline(row, dimension, '\t')
+            || !std::getline(row, x, '\t') || !std::getline(row, y, '\t') || !std::getline(row, z, '\t')
+            || !std::getline(row, color, '\t') || !std::getline(row, point.name)) continue;
+        try {
+            point.dimension = std::stoi(dimension);
+            point.position = {std::stod(x), std::stod(y), std::stod(z)};
+            point.color = static_cast<std::uint32_t>(std::stoul(color, nullptr, 16));
+            if (std::isfinite(point.position.x) && std::isfinite(point.position.y) && std::isfinite(point.position.z)) points.push_back(std::move(point));
+        } catch (...) {}
+    }
+    return points;
+}
+
+bool SaveWaypoints(const std::vector<SavedWaypoint>& points) {
+    try {
+        const auto file = WaypointFile();
+        std::filesystem::create_directories(file.parent_path());
+        auto temporary = file;
+        temporary += L".tmp";
+        {
+            std::ofstream stream(temporary, std::ios::trunc);
+            for (const auto& point : points) {
+                stream << CleanWaypointField(point.scope) << '\t' << point.dimension << '\t'
+                    << point.position.x << '\t' << point.position.y << '\t' << point.position.z << '\t'
+                    << std::hex << point.color << std::dec << '\t' << CleanWaypointField(point.name) << '\n';
+            }
+            if (!stream) return false;
+        }
+        return MoveFileExW(temporary.c_str(), file.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != FALSE;
+    } catch (...) { return false; }
+}
+
+class WaypointsModule final : public HudModuleBase<IOverlayModule, IPresentationModule> {
+public:
+    WaypointsModule(ModuleMetadata metadata, HudLayout layout, SharedServices&)
+        : HudModuleBase(std::move(metadata), {
+            TextSetting("new-name", "New waypoint name", "Waypoint"),
+            ColorSetting("new-color", "New waypoint color", 0xFFF28FB5U),
+            IntSetting("max-distance", "Maximum distance", 2000, 16, 10000, "%d m"),
+            IntSetting("hud-count", "HUD waypoint count", 3, 1, 8),
+            BoolSetting("edge-markers", "Edge-of-screen markers", true)}, layout), points_(LoadWaypoints()) {}
+
+    void OnSettingsChanged(const SettingsReader& settings) override {
+        std::scoped_lock lock(mutex_);
+        newName_ = CleanWaypointField(settings.Text("new-name"));
+        newColor_ = settings.Color("new-color");
+        maxDistance_ = settings.Int("max-distance");
+        hudCount_ = settings.Int("hud-count");
+        edgeMarkers_ = settings.Bool("edge-markers");
+    }
+    void OnPlayerTransform(const PlayerTransform& transform) override { std::scoped_lock lock(mutex_); player_ = transform; }
+    void OnCameraPose(const CameraPoseEvent& pose) override { std::scoped_lock lock(mutex_); pose_ = pose; }
+    void Contribute(PresentationProfile& profile) const override {
+        if (!profile.cameraPose) profile.cameraPose = CameraPoseRequest{};
+    }
+    void OnServerState(const ServerState& state) override {
+        std::scoped_lock lock(mutex_);
+        scope_ = CleanWaypointField(std::format("{}:{}", static_cast<int>(state.kind), ToUtf8(state.displayName)));
+    }
+    void OnRender(const RenderEvent& event) override { std::scoped_lock lock(mutex_); NoteRender(event); }
+    [[nodiscard]] std::vector<ModuleAction> Actions() const override {
+        return {{"add", "Add waypoint here"}, {"remove-nearest", "Remove nearest waypoint"}, {"clear", "Clear this world"}};
+    }
+    bool InvokeAction(std::string_view action, SteadyTime) override {
+        std::scoped_lock lock(mutex_);
+        if (action == "add") {
+            if (!player_ || !player_->dimension || points_.size() >= 128) return false;
+            std::size_t number = 1;
+            for (const auto& point : points_) if (point.scope == scope_ && point.name.starts_with(newName_)) ++number;
+            const std::string name = number == 1 ? newName_ : std::format("{} {}", newName_, number);
+            points_.push_back({scope_, *player_->dimension, player_->position, name, newColor_});
+            return SaveWaypoints(points_);
+        }
+        const auto matches = [&](const SavedWaypoint& point) {
+            return player_ && player_->dimension && point.scope == scope_ && point.dimension == *player_->dimension;
+        };
+        if (action == "clear") {
+            std::erase_if(points_, matches);
+            return SaveWaypoints(points_);
+        }
+        if (action == "remove-nearest" && player_) {
+            auto found = points_.end();
+            double best = std::numeric_limits<double>::infinity();
+            for (auto at = points_.begin(); at != points_.end(); ++at) {
+                if (!matches(*at)) continue;
+                const double dx = at->position.x - player_->position.x;
+                const double dy = at->position.y - player_->position.y;
+                const double dz = at->position.z - player_->position.z;
+                const double distance = dx * dx + dy * dy + dz * dz;
+                if (distance < best) { best = distance; found = at; }
+            }
+            if (found == points_.end()) return false;
+            points_.erase(found);
+            return SaveWaypoints(points_);
+        }
+        return false;
+    }
+    [[nodiscard]] HudContent Content() const override {
+        std::scoped_lock lock(mutex_);
+        HudContent content;
+        if (!player_ || !player_->dimension) return {{{"Waypoints  --", HudTone::Muted}}, {}, {}};
+        std::vector<std::pair<double, const SavedWaypoint*>> visible;
+        for (const auto& point : points_) {
+            if (point.scope != scope_ || point.dimension != *player_->dimension) continue;
+            const double dx = point.position.x - player_->position.x;
+            const double dy = point.position.y - player_->position.y;
+            const double dz = point.position.z - player_->position.z;
+            const double distance = std::sqrt(dx * dx + dy * dy + dz * dz);
+            if (distance <= maxDistance_) visible.emplace_back(distance, &point);
+        }
+        std::ranges::sort(visible, {}, &std::pair<double, const SavedWaypoint*>::first);
+        if (visible.empty()) return {{{"Waypoints  none", HudTone::Muted}}, {}, {}};
+        for (std::size_t index = 0; index < visible.size() && index < static_cast<std::size_t>(hudCount_); ++index) {
+            content.lines.push_back({std::format("{}  {:.0f} m", visible[index].second->name, visible[index].first),
+                index == 0 ? HudTone::Accent : HudTone::Normal});
+        }
+        return content;
+    }
+    [[nodiscard]] OverlayPrimitives Primitives(float width, float height) const override {
+        std::scoped_lock lock(mutex_);
+        OverlayPrimitives primitives;
+        if (!player_ || !player_->dimension || SteadyClock::now() - pose_.capturedAt > milliseconds(250)) return primitives;
+        const auto view = ViewOf(pose_);
+        constexpr float margin = 16.0F;
+        for (const auto& point : points_) {
+            if (point.scope != scope_ || point.dimension != *player_->dimension) continue;
+            const double dx = point.position.x - player_->position.x;
+            const double dy = point.position.y - player_->position.y;
+            const double dz = point.position.z - player_->position.z;
+            if (std::sqrt(dx * dx + dy * dy + dz * dz) > maxDistance_) continue;
+            const auto projected = ProjectPoint(view, {static_cast<float>(point.position.x), static_cast<float>(point.position.y + 1.0),
+                static_cast<float>(point.position.z)}, width, height);
+            if (!projected) continue;
+            const bool outside = projected->x < margin || projected->x > width - margin || projected->y < margin || projected->y > height - margin;
+            if (outside && !edgeMarkers_) continue;
+            const float x = std::clamp(projected->x, margin, width - margin);
+            const float y = std::clamp(projected->y, margin, height - margin);
+            primitives.circles.push_back({x, y, outside ? 6.0F : 5.0F, point.color, false, 2.0F});
+        }
+        return primitives;
+    }
+
+private:
+    std::vector<SavedWaypoint> points_;
+    std::optional<PlayerTransform> player_;
+    CameraPoseEvent pose_{};
+    std::string scope_{"0:local"};
+    std::string newName_{"Waypoint"};
+    std::uint32_t newColor_{0xFFF28FB5U};
+    int maxDistance_{2000};
+    int hudCount_{3};
+    bool edgeMarkers_{true};
 };
 
 // --- Telemetry ------------------------------------------------------------
@@ -487,6 +713,8 @@ std::unique_ptr<IModule> MakeModernKeyboardHandling(ModuleMetadata m, HudLayout 
 std::unique_ptr<IModule> MakeSnapLook(ModuleMetadata m, HudLayout l, SharedServices& s) { return std::make_unique<SnapLookModule>(std::move(m), l, s); }
 std::unique_ptr<IModule> MakeChunkBorders(ModuleMetadata m, HudLayout l, SharedServices& s) { return std::make_unique<ChunkBordersModule>(std::move(m), l, s); }
 std::unique_ptr<IModule> MakePostProcessing(ModuleMetadata m, HudLayout l, SharedServices& s) { return std::make_unique<PostProcessingModule>(std::move(m), l, s); }
+std::unique_ptr<IModule> MakeMenuBlur(ModuleMetadata m, HudLayout l, SharedServices& s) { return std::make_unique<MenuBlurModule>(std::move(m), l, s); }
+std::unique_ptr<IModule> MakeWaypoints(ModuleMetadata m, HudLayout l, SharedServices& s) { return std::make_unique<WaypointsModule>(std::move(m), l, s); }
 std::unique_ptr<IModule> MakeDebugMenu(ModuleMetadata m, HudLayout l, SharedServices& s) { return std::make_unique<DebugMenuModule>(std::move(m), l, s); }
 
 }

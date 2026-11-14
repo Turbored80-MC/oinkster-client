@@ -13,12 +13,13 @@
 #include "Oinkster/ReplayInjector.hpp"
 #include "Oinkster/ReplayWorld.hpp"
 #include "Oinkster/ScreenTelemetry.hpp"
+#include "Oinkster/ScreenshotCapture.hpp"
 #include "Oinkster/WorldTelemetry.hpp"
 #include "Oinkster/Modules/AccessibilityLogic.hpp"
 #include <Windows.h>
 #include <windowsx.h>
 #include <d3d12.h>
-#include <dxgi1_4.h>
+#include <dxgi1_6.h>
 #include <MinHook.h>
 #include <imgui.h>
 #include <imgui_impl_dx12.h>
@@ -51,6 +52,10 @@ using PresentFunction = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT)
 using ResizeFunction = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT, UINT, DXGI_FORMAT, UINT);
 using Resize1Function = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain3*, UINT, UINT, UINT, DXGI_FORMAT, UINT,
     const UINT*, IUnknown* const*);
+using CreateSwapChainForHwndFunction = HRESULT(STDMETHODCALLTYPE*)(IDXGIFactory2*, IUnknown*, HWND,
+    const DXGI_SWAP_CHAIN_DESC1*, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC*, IDXGIOutput*, IDXGISwapChain1**);
+using CreateSwapChainForCoreWindowFunction = HRESULT(STDMETHODCALLTYPE*)(IDXGIFactory2*, IUnknown*, IUnknown*,
+    const DXGI_SWAP_CHAIN_DESC1*, IDXGIOutput*, IDXGISwapChain1**);
 using ExecuteFunction = void(STDMETHODCALLTYPE*)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*);
 using ClipCursorFunction = BOOL(WINAPI*)(const RECT*);
 using GetRawInputDataFunction = UINT(WINAPI*)(HRAWINPUT, UINT, LPVOID, PUINT, UINT);
@@ -66,6 +71,8 @@ struct FrameContext {
 PresentFunction originalPresent{};
 ResizeFunction originalResize{};
 Resize1Function originalResize1{};
+CreateSwapChainForHwndFunction originalCreateSwapChainForHwnd{};
+CreateSwapChainForCoreWindowFunction originalCreateSwapChainForCoreWindow{};
 ExecuteFunction originalExecute{};
 ClipCursorFunction originalClipCursor{};
 GetRawInputDataFunction originalGetRawInputData{};
@@ -102,6 +109,7 @@ PostProcessSettings framePostProcess;
 std::atomic_bool gameplayCaptured{};
 bool lastGameplayCaptured{};
 VideoRecorder::GpuCapture videoCapture;
+ScreenshotCapture::GpuCapture screenshotCapture;
 constexpr UINT FontDescriptorCount = 1;
 constexpr UINT SrvDescriptorCount = FontDescriptorCount + FrameBlendResources::HistoryCount;
 ModuleManager* moduleManager{};
@@ -538,6 +546,100 @@ void ApplyKeyHoldAssists(bool gameFocused, bool cursorVisible) noexcept {
     heldAssistKeys = std::move(wanted);
 }
 
+// Settings page "Rendering" toggles, stored as click-gui.* settings. Only the
+// Present arguments and the swapchain's frame latency change; the swapchain
+// is never recreated and its creation flags are never touched (a flag
+// mismatch on ResizeBuffers makes Minecraft abort).
+constexpr std::string_view DisableVsyncSetting = "click-gui.disable-vsync";
+constexpr std::string_view LowLatencySetting = "click-gui.low-latency";
+std::atomic_bool tearingSupported{};
+std::atomic_bool systemTearingSupported{};
+std::atomic_bool tearingCreationHooksReady{};
+std::atomic<VsyncState> vsyncState{VsyncState::Enabled};
+std::atomic_bool lowLatencySupported{};
+// Identity only, never dereferenced: which swapchain the flags above describe.
+// Cleared on resize so a fullscreen change is re-inspected.
+std::atomic<IDXGISwapChain*> inspectedSwapChain{};
+bool swapChainFullscreen{};
+std::atomic_bool vsyncDisabled{};
+bool lowLatencyWanted{};
+std::chrono::steady_clock::time_point renderSettingsReadAt{};
+// Held only while low latency is applied, so it can be undone.
+ComPtr<IDXGISwapChain2> latencySwapChain;
+UINT originalFrameLatency{};
+
+void RestoreFrameLatency() noexcept {
+    if (!latencySwapChain) return;
+    (void)latencySwapChain->SetMaximumFrameLatency(originalFrameLatency);
+    latencySwapChain.Reset();
+}
+
+void InspectSwapChain(IDXGISwapChain* swapChain) noexcept {
+    if (inspectedSwapChain.load(std::memory_order_acquire) == swapChain) return;
+    inspectedSwapChain.store(swapChain, std::memory_order_release);
+    DXGI_SWAP_CHAIN_DESC desc{};
+    const bool described = SUCCEEDED(swapChain->GetDesc(&desc));
+    BOOL fullscreen = FALSE;
+    swapChainFullscreen = SUCCEEDED(swapChain->GetFullscreenState(&fullscreen, nullptr)) && fullscreen != FALSE;
+    const bool tearing = described && (desc.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0;
+    const bool waitable = described && (desc.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT) != 0;
+    tearingSupported.store(tearing, std::memory_order_release);
+    lowLatencySupported.store(waitable, std::memory_order_release);
+    Diagnostics::LogLine("info", "swapchain_present_caps", std::format(
+        "flags=0x{:X} allowTearing={} latencyWaitable={} fullscreen={}",
+        described ? desc.Flags : 0U, tearing ? 1 : 0, waitable ? 1 : 0, swapChainFullscreen ? 1 : 0));
+}
+
+void ReportVsyncState(const VsyncState state) noexcept {
+    const auto prior = vsyncState.exchange(state, std::memory_order_acq_rel);
+    if (prior == state) return;
+    const char* text = "enabled";
+    if (state == VsyncState::Disabled) text = "disabled";
+    else if (state == VsyncState::RestartRequired) text = "restart-required";
+    else if (state == VsyncState::Unsupported) text = "unsupported";
+    Diagnostics::LogLine("info", "vsync_transition", text);
+}
+
+// The arguments the real Present() receives, after the Rendering toggles.
+void ApplyRenderOptions(IDXGISwapChain* swapChain, UINT& interval, UINT& flags) noexcept {
+    if (!moduleManager) return;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - renderSettingsReadAt >= std::chrono::milliseconds(250)) {
+        renderSettingsReadAt = now;
+        try {
+            vsyncDisabled.store(moduleManager->ModuleSetting(DisableVsyncSetting, "0") == "1", std::memory_order_release);
+            lowLatencyWanted = moduleManager->ModuleSetting(LowLatencySetting, "0") == "1";
+        } catch (...) {
+            return;
+        }
+    }
+    InspectSwapChain(swapChain);
+    if (lowLatencyWanted && lowLatencySupported.load(std::memory_order_acquire)) {
+        if (!latencySwapChain || latencySwapChain.Get() != swapChain) {
+            RestoreFrameLatency();
+            ComPtr<IDXGISwapChain2> swapChain2;
+            UINT previous = 0;
+            if (SUCCEEDED(swapChain->QueryInterface(IID_PPV_ARGS(&swapChain2)))
+                && SUCCEEDED(swapChain2->GetMaximumFrameLatency(&previous))
+                && SUCCEEDED(swapChain2->SetMaximumFrameLatency(1))) {
+                originalFrameLatency = previous;
+                latencySwapChain = std::move(swapChain2);
+                Diagnostics::LogLine("info", "low_latency", std::format("maximum frame latency {} -> 1", previous));
+            }
+        }
+    } else {
+        RestoreFrameLatency();
+    }
+    const bool chainAllows = tearingSupported.load(std::memory_order_acquire);
+    const bool systemAllows = systemTearingSupported.load(std::memory_order_acquire)
+        && (chainAllows || tearingCreationHooksReady.load(std::memory_order_acquire));
+    const auto decision = DecideVsyncPresent({vsyncDisabled.load(std::memory_order_acquire), systemAllows, chainAllows, swapChainFullscreen,
+        (flags & DXGI_PRESENT_TEST) != 0, interval, flags}, DXGI_PRESENT_ALLOW_TEARING);
+    interval = decision.interval;
+    flags = decision.flags;
+    ReportVsyncState(decision.state);
+}
+
 // Dynamic FPS: while the game is in the background, an enabled
 // IFramePacingModule caps the presentation rate by waiting before handing
 // the frame to the real Present(). The wait is bounded (MaxPacingDelay) and
@@ -562,6 +664,19 @@ void ApplyFramePacing(bool gameFocused) noexcept {
     if (pacingWakeEvent) (void)WaitForSingleObject(pacingWakeEvent, milliseconds);
 }
 
+// ImGui's Win32 backend calls SetCursor on its own, both when its cursor shape
+// changes and on WM_SETCURSOR. Outside the menu that fought the game: a stale
+// "ImGui draws the cursor" state hid the pointer over pause, inventory and
+// chat. Only while ImGui draws its own cursor may it touch the OS cursor.
+// Caller holds imguiInputMutex.
+void SetImGuiOwnsCursor(bool owns) noexcept {
+    if (!imguiReady) return;
+    auto& io = ImGui::GetIO();
+    io.MouseDrawCursor = owns;
+    if (owns) io.ConfigFlags &= ~ImGuiConfigFlags_NoMouseCursorChange;
+    else io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
+}
+
 void ClearImGuiInput() noexcept {
     std::scoped_lock lock(imguiInputMutex);
     if (!imguiReady) return;
@@ -569,6 +684,9 @@ void ClearImGuiInput() noexcept {
     io.ClearInputKeys();
     io.ClearInputMouse();
     io.InputQueueCharacters.resize(0);
+    // Every menu close comes through here. The next ImGui frame may be far
+    // off (nothing else on screen) and WM_SETCURSOR reaches the backend first.
+    SetImGuiOwnsCursor(false);
 }
 
 // Literal port of Flarial dll-oss's CursorHandler::grabCursor (called when
@@ -755,6 +873,7 @@ void ReleaseRenderState() noexcept {
     frameBlend.Release();
     postProcess.Release();
     videoCapture.Release();
+    screenshotCapture.Release();
     std::scoped_lock imguiLock(imguiInputMutex);
     if (imguiReady) {
         ImGui_ImplDX12_Shutdown();
@@ -1282,7 +1401,14 @@ HRESULT STDMETHODCALLTYPE HookPresent(IDXGISwapChain* baseSwapChain, UINT interv
     // Only gameplay (cursor hidden) or the pause screen may open the menu: a
     // visible cursor otherwise means a game screen such as chat is up, and K
     // typed into chat must not toggle the overlay.
-    const bool menuKeyAllowed = menuVisible || (inWorld && (!cursorVisible || minecraftPauseVisible));
+    // While a text field in the menu (module search, setting text, replay or
+    // profile names) has focus, K is a letter being typed, not the toggle.
+    bool typingInMenu = false;
+    if (menuVisible) {
+        std::scoped_lock imguiLock(imguiInputMutex);
+        typingInMenu = imguiReady && ImGui::GetIO().WantTextInput;
+    }
+    const bool menuKeyAllowed = menuVisible ? !typingInMenu : (inWorld && (!cursorVisible || minecraftPauseVisible));
     if (menuDown && !menuKeyDown && menuKeyAllowed) {
         SetMenuVisible(!menuVisible, replayRunning ? MenuKind::ReplayEditor : MenuKind::ClickGui);
     }
@@ -1322,6 +1448,7 @@ HRESULT STDMETHODCALLTYPE HookPresent(IDXGISwapChain* baseSwapChain, UINT interv
         Diagnostics::LogLine("info", "replay_editor", "replay world joined; opening the editor");
         SetMenuVisible(true, MenuKind::ReplayEditor);
     }
+    ApplyRenderOptions(baseSwapChain, interval, flags);
     ApplyKeyHoldAssists(gameFocused, cursorVisible);
     ApplyGameplayInput(gameFocused, cursorVisible);
     ApplyFramePacing(gameFocused);
@@ -1332,6 +1459,7 @@ HRESULT STDMETHODCALLTYPE HookPresent(IDXGISwapChain* baseSwapChain, UINT interv
         : std::chrono::duration<float>(presentedAt - lastPresentAt).count();
     lastPresentAt = presentedAt;
     ++frameCounter;
+#ifndef NDEBUG
     if (menuVisible) {
         const auto now = std::chrono::steady_clock::now();
         if (lastDiagnosticLog == std::chrono::steady_clock::time_point{}) lastDiagnosticLog = now;
@@ -1351,6 +1479,7 @@ HRESULT STDMETHODCALLTYPE HookPresent(IDXGISwapChain* baseSwapChain, UINT interv
                 cursor.x, cursor.y));
         }
     }
+#endif
     // moduleManager must be non-null for the draw path below (OverlayUi::Draw
     // dereferences it); the transient-UI case used to fall through without it,
     // which a Present landing after Remove() cleared it could reach while a
@@ -1393,7 +1522,8 @@ HRESULT STDMETHODCALLTYPE HookPresent(IDXGISwapChain* baseSwapChain, UINT interv
         controlsBlockingMouse = false;
         MouseInputBlocker::SetActive(false);
     }
-    if (!menuVisible && !showReplayPanel && !showReplaysButton && !moduleManager->HasEnabledOverlayModules() && !OverlayUi::HasTransientUi()) {
+    if (!menuVisible && !showReplayPanel && !showReplaysButton && !moduleManager->HasEnabledOverlayModules()
+        && !OverlayUi::HasTransientUi() && !ScreenshotCapture::NeedsPresentWork()) {
         frameBlend.Invalidate();
         return originalPresent(baseSwapChain, interval, flags);
     }
@@ -1409,11 +1539,13 @@ HRESULT STDMETHODCALLTYPE HookPresent(IDXGISwapChain* baseSwapChain, UINT interv
             if (imguiReady && queue && !frames.empty()) {
                 const UINT index = swapChain->GetCurrentBackBufferIndex();
                 auto& frame = frames.at(index);
-                bool framePresentable = true;
-                if (frame.fenceValue != 0 && renderFence->GetCompletedValue() < frame.fenceValue) {
-                    framePresentable = SUCCEEDED(renderFence->SetEventOnCompletion(frame.fenceValue, fenceEvent))
-                        && WaitForSingleObject(fenceEvent, 250) == WAIT_OBJECT_0;
-                }
+                // Present is Minecraft's render thread. Waiting here for an
+                // overlay allocator can stall the entire game for up to 250
+                // ms, which was especially visible while the ClickGUI drew
+                // every frame. If the GPU still owns this back-buffer slot,
+                // skip one overlay frame and let Minecraft present normally.
+                const bool framePresentable = frame.fenceValue == 0
+                    || renderFence->GetCompletedValue() >= frame.fenceValue;
                 if (framePresentable
                     && SUCCEEDED(frame.allocator->Reset())
                     && SUCCEEDED(commandList->Reset(frame.allocator.Get(), nullptr))) {
@@ -1434,7 +1566,20 @@ HRESULT STDMETHODCALLTYPE HookPresent(IDXGISwapChain* baseSwapChain, UINT interv
                     if (!menuVisible) {
                         const auto graders = moduleManager->EnabledModulesOf<IPostProcessModule>();
                         if (!graders.empty()) {
-                            framePostProcess = graders.front()->PostProcess();
+                            framePostProcess = {};
+                            for (const auto* grader : graders) {
+                                const auto settings = grader->PostProcess();
+                                framePostProcess.saturation *= settings.saturation;
+                                framePostProcess.contrast *= settings.contrast;
+                                framePostProcess.brightness = std::clamp(framePostProcess.brightness + settings.brightness, -0.5F, 0.5F);
+                                framePostProcess.vignette = std::max(framePostProcess.vignette, settings.vignette);
+                                framePostProcess.sharpen = std::max(framePostProcess.sharpen, settings.sharpen);
+                                framePostProcess.blur = std::max(framePostProcess.blur, settings.blur);
+                                if (settings.tintStrength > framePostProcess.tintStrength) {
+                                    framePostProcess.tint = settings.tint;
+                                    framePostProcess.tintStrength = settings.tintStrength;
+                                }
+                            }
                             postActive = !framePostProcess.Identity();
                         }
                     }
@@ -1454,17 +1599,18 @@ HRESULT STDMETHODCALLTYPE HookPresent(IDXGISwapChain* baseSwapChain, UINT interv
                             currentFrame = frameBlend.CurrentFrame();
                         }
                     }
+                    const bool replayTheater = menuVisible && menuIsReplayTheater.load(std::memory_order_acquire);
                     ImGui_ImplDX12_NewFrame();
                     {
                         std::scoped_lock imguiLock(imguiInputMutex);
+                        // The theater opens over Minecraft's own menus, whose
+                        // system cursor is already showing. Set before the
+                        // backend's NewFrame, which applies it to the OS cursor.
+                        SetImGuiOwnsCursor(menuVisible && !replayTheater);
                         ImGui_ImplWin32_NewFrame();
                         UpdateImGuiMouseFromSystem();
                         ImGui::NewFrame();
                     }
-                    const bool replayTheater = menuVisible && menuIsReplayTheater.load(std::memory_order_acquire);
-                    // The theater opens over Minecraft's own menus, whose
-                    // system cursor is already showing.
-                    ImGui::GetIO().MouseDrawCursor = menuVisible && !replayTheater;
                     if (currentFrame && postActive) {
                         auto* background = ImGui::GetBackgroundDrawList();
                         background->AddCallback(&PostProcessCallback, nullptr);
@@ -1514,7 +1660,9 @@ HRESULT STDMETHODCALLTYPE HookPresent(IDXGISwapChain* baseSwapChain, UINT interv
                     // A video recording copies the raw game frame as well
                     // (before any overlay); the back buffer stays in PRESENT.
                     videoCapture.Collect(renderFence->GetCompletedValue());
+                    screenshotCapture.Collect(renderFence->GetCompletedValue());
                     videoCapture.Record(device.Get(), commandList.Get(), frame.backBuffer.Get(), presentedAt);
+                    screenshotCapture.Record(device.Get(), commandList.Get(), frame.backBuffer.Get(), false);
                     D3D12_RESOURCE_BARRIER barrier{};
                     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
                     barrier.Transition.pResource = frame.backBuffer.Get();
@@ -1535,6 +1683,9 @@ HRESULT STDMETHODCALLTYPE HookPresent(IDXGISwapChain* baseSwapChain, UINT interv
                     ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), commandList.Get());
                     std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
                     commandList->ResourceBarrier(1, &barrier);
+                    // At this point the backbuffer contains the complete ImGui
+                    // composition and is back in PRESENT state.
+                    screenshotCapture.Record(device.Get(), commandList.Get(), frame.backBuffer.Get(), true);
                     if (SUCCEEDED(commandList->Close())) {
                         ID3D12CommandList* lists[]{ commandList.Get() };
                         queue->ExecuteCommandLists(1, lists);
@@ -1542,6 +1693,7 @@ HRESULT STDMETHODCALLTYPE HookPresent(IDXGISwapChain* baseSwapChain, UINT interv
                         if (SUCCEEDED(queue->Signal(renderFence.Get(), signalValue))) {
                             frame.fenceValue = signalValue;
                             videoCapture.Submitted(signalValue);
+                            screenshotCapture.Submitted(signalValue);
                         }
                     }
                 }
@@ -1570,6 +1722,7 @@ bool PrepareForResize(UINT count, DXGI_FORMAT format) noexcept {
     WaitForOverlayGpuIdle();
     frameBlend.Release();
     videoCapture.Release();
+    screenshotCapture.Release();
     for (auto& frame : frames) {
         frame.backBuffer.Reset();
         frame.fenceValue = 0;
@@ -1592,7 +1745,13 @@ void RebindBackBuffers(IDXGISwapChain* swapChain) noexcept {
 
 HRESULT STDMETHODCALLTYPE HookResize(IDXGISwapChain* swapChain, UINT count, UINT width, UINT height, DXGI_FORMAT format, UINT flags) {
     const CallbackGuard callback;
+    ScreenshotCapture::Shutdown();
     std::scoped_lock lock(stateMutex);
+    DXGI_SWAP_CHAIN_DESC current{};
+    if (SUCCEEDED(swapChain->GetDesc(&current)) && (current.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0) {
+        flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+    }
+    inspectedSwapChain.store(nullptr, std::memory_order_release);
     const bool rebind = PrepareForResize(count, format);
     const HRESULT result = originalResize(swapChain, count, width, height, format, flags);
     if (rebind) {
@@ -1606,6 +1765,11 @@ HRESULT STDMETHODCALLTYPE HookResize1(IDXGISwapChain3* swapChain, UINT count, UI
     DXGI_FORMAT format, UINT flags, const UINT* nodeMasks, IUnknown* const* presentQueues) {
     const CallbackGuard callback;
     std::scoped_lock lock(stateMutex);
+    DXGI_SWAP_CHAIN_DESC current{};
+    if (SUCCEEDED(swapChain->GetDesc(&current)) && (current.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0) {
+        flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+    }
+    inspectedSwapChain.store(nullptr, std::memory_order_release);
     const bool rebind = PrepareForResize(count, format);
     const HRESULT result = originalResize1(swapChain, count, width, height, format, flags, nodeMasks, presentQueues);
     if (rebind) {
@@ -1613,6 +1777,29 @@ HRESULT STDMETHODCALLTYPE HookResize1(IDXGISwapChain3* swapChain, UINT count, UI
         else ReleaseRenderState();
     }
     return result;
+}
+
+HRESULT STDMETHODCALLTYPE HookCreateSwapChainForHwnd(IDXGIFactory2* factory, IUnknown* deviceOrQueue, HWND window,
+    const DXGI_SWAP_CHAIN_DESC1* description, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fullscreen,
+    IDXGIOutput* output, IDXGISwapChain1** swapChain) {
+    const CallbackGuard callback;
+    if (!description || !systemTearingSupported.load(std::memory_order_acquire)) {
+        return originalCreateSwapChainForHwnd(factory, deviceOrQueue, window, description, fullscreen, output, swapChain);
+    }
+    auto tearingDescription = *description;
+    tearingDescription.Flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+    return originalCreateSwapChainForHwnd(factory, deviceOrQueue, window, &tearingDescription, fullscreen, output, swapChain);
+}
+
+HRESULT STDMETHODCALLTYPE HookCreateSwapChainForCoreWindow(IDXGIFactory2* factory, IUnknown* deviceOrQueue,
+    IUnknown* window, const DXGI_SWAP_CHAIN_DESC1* description, IDXGIOutput* output, IDXGISwapChain1** swapChain) {
+    const CallbackGuard callback;
+    if (!description || !systemTearingSupported.load(std::memory_order_acquire)) {
+        return originalCreateSwapChainForCoreWindow(factory, deviceOrQueue, window, description, output, swapChain);
+    }
+    auto tearingDescription = *description;
+    tearingDescription.Flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+    return originalCreateSwapChainForCoreWindow(factory, deviceOrQueue, window, &tearingDescription, output, swapChain);
 }
 
 LRESULT CALLBACK DummyWindowProcedure(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
@@ -1623,6 +1810,8 @@ LRESULT CALLBACK DummyWindowProcedure(HWND window, UINT message, WPARAM wParam, 
 bool Install(ModuleManager& modules, std::wstring& error) noexcept {
     if (installed.exchange(true)) return true;
     moduleManager = &modules;
+    try { vsyncDisabled.store(modules.ModuleSetting(DisableVsyncSetting, "0") == "1", std::memory_order_release); }
+    catch (...) { vsyncDisabled.store(false, std::memory_order_release); }
     if (!pacingWakeEvent) pacingWakeEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     if (pacingWakeEvent) ResetEvent(pacingWakeEvent);
     WNDCLASSW windowClass{};
@@ -1636,11 +1825,106 @@ bool Install(ModuleManager& modules, std::wstring& error) noexcept {
     ComPtr<IDXGIFactory4> factory;
     ComPtr<IDXGISwapChain1> probeSwapChain;
     bool success = false;
-    if (window && SUCCEEDED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&probeDevice)))) {
+    std::wstring adapterLabel = L"unknown adapter";
+    const auto setHresultError = [&error, &adapterLabel](std::wstring_view stage, HRESULT result) {
+        error = std::format(L"Direct3D 12 {} failed on {} (HRESULT 0x{:08X}). Update the graphics driver and restart Minecraft.",
+            stage, adapterLabel, static_cast<std::uint32_t>(result));
+    };
+    const auto describeAdapter = [](IDXGIAdapter1* adapter, bool warp) {
+        DXGI_ADAPTER_DESC1 description{};
+        if (!adapter || FAILED(adapter->GetDesc1(&description))) return std::wstring(warp ? L"WARP software adapter" : L"unknown adapter");
+        return std::format(L"{}{} (vendor 0x{:04X}, device 0x{:04X})",
+            description.Description, warp ? L" [WARP probe]" : L"", description.VendorId, description.DeviceId);
+    };
+
+    if (!window) {
+        error = L"Direct3D 12 probe-window creation failed. Restart Minecraft and close other overlays before trying again.";
+    }
+
+    HRESULT result = window ? CreateDXGIFactory1(IID_PPV_ARGS(&factory)) : E_FAIL;
+    if (window && FAILED(result)) setHresultError(L"factory creation", result);
+
+    // The probe exists only to discover the process-local D3D12/DXGI method
+    // addresses. Prefer the system default, then every high-performance and
+    // enumerated hardware adapter, and finally WARP. This is vendor-neutral
+    // and also covers hybrid laptops where the default adapter is not the GPU
+    // Minecraft actually uses.
+    if (window && factory) {
+        result = D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&probeDevice));
+        ComPtr<IDXGIAdapter1> selectedAdapter;
+        bool usedWarp = false;
+        if (SUCCEEDED(result)) {
+            (void)factory->EnumAdapterByLuid(probeDevice->GetAdapterLuid(), IID_PPV_ARGS(&selectedAdapter));
+        } else {
+            const auto tryAdapter = [&](IDXGIAdapter1* candidate) {
+                if (!candidate) return false;
+                DXGI_ADAPTER_DESC1 description{};
+                if (FAILED(candidate->GetDesc1(&description)) || (description.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) return false;
+                probeDevice.Reset();
+                result = D3D12CreateDevice(candidate, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&probeDevice));
+                if (FAILED(result)) return false;
+                selectedAdapter = candidate;
+                return true;
+            };
+
+            ComPtr<IDXGIFactory6> factory6;
+            if (SUCCEEDED(factory.As(&factory6))) {
+                for (UINT index = 0; !probeDevice; ++index) {
+                    ComPtr<IDXGIAdapter1> candidate;
+                    const auto enumeration = factory6->EnumAdapterByGpuPreference(index,
+                        DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IID_PPV_ARGS(&candidate));
+                    if (enumeration == DXGI_ERROR_NOT_FOUND) break;
+                    if (SUCCEEDED(enumeration)) (void)tryAdapter(candidate.Get());
+                }
+            }
+            for (UINT index = 0; !probeDevice; ++index) {
+                ComPtr<IDXGIAdapter1> candidate;
+                const auto enumeration = factory->EnumAdapters1(index, &candidate);
+                if (enumeration == DXGI_ERROR_NOT_FOUND) break;
+                if (SUCCEEDED(enumeration)) (void)tryAdapter(candidate.Get());
+            }
+            if (!probeDevice) {
+                ComPtr<IDXGIAdapter> warpAdapter;
+                ComPtr<IDXGIAdapter1> warpAdapter1;
+                const auto warpResult = factory->EnumWarpAdapter(IID_PPV_ARGS(&warpAdapter));
+                if (SUCCEEDED(warpResult) && SUCCEEDED(warpAdapter.As(&warpAdapter1))) {
+                    result = D3D12CreateDevice(warpAdapter1.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&probeDevice));
+                    if (SUCCEEDED(result)) {
+                        selectedAdapter = warpAdapter1;
+                        usedWarp = true;
+                    }
+                } else {
+                    result = warpResult;
+                }
+            }
+        }
+
+        if (probeDevice) {
+            adapterLabel = describeAdapter(selectedAdapter.Get(), usedWarp);
+            std::string adapterLog;
+            adapterLog.reserve(adapterLabel.size());
+            for (const wchar_t character : adapterLabel) {
+                adapterLog.push_back(character >= 0 && character <= 0x7f ? static_cast<char>(character) : '?');
+            }
+            Diagnostics::LogLine("info", "dx12_probe", adapterLog);
+        } else {
+            setHresultError(L"device creation", result);
+        }
+    }
+
+    if (window && probeDevice && factory) {
         D3D12_COMMAND_QUEUE_DESC queueDescription{};
         queueDescription.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-        if (SUCCEEDED(probeDevice->CreateCommandQueue(&queueDescription, IID_PPV_ARGS(&probeQueue)))
-            && SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) {
+        result = probeDevice->CreateCommandQueue(&queueDescription, IID_PPV_ARGS(&probeQueue));
+        if (FAILED(result)) {
+            setHresultError(L"command-queue creation", result);
+        } else {
+            ComPtr<IDXGIFactory5> factory5;
+            BOOL allowTearing = FALSE;
+            const bool systemAllowsTearing = SUCCEEDED(factory.As(&factory5))
+                && SUCCEEDED(factory5->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING,
+                    &allowTearing, sizeof(allowTearing))) && allowTearing != FALSE;
+            systemTearingSupported.store(systemAllowsTearing, std::memory_order_release);
             DXGI_SWAP_CHAIN_DESC1 swapDescription{};
             swapDescription.Width = 8;
             swapDescription.Height = 8;
@@ -1649,20 +1933,41 @@ bool Install(ModuleManager& modules, std::wstring& error) noexcept {
             swapDescription.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
             swapDescription.BufferCount = 2;
             swapDescription.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-            if (SUCCEEDED(factory->CreateSwapChainForHwnd(probeQueue.Get(), window, &swapDescription, nullptr, nullptr, &probeSwapChain))) {
+            result = factory->CreateSwapChainForHwnd(probeQueue.Get(), window, &swapDescription, nullptr, nullptr, &probeSwapChain);
+            if (FAILED(result)) {
+                setHresultError(L"probe swap-chain creation", result);
+            } else {
                 void** swapTable = *reinterpret_cast<void***>(probeSwapChain.Get());
                 void** queueTable = *reinterpret_cast<void***>(probeQueue.Get());
                 const auto status = MH_Initialize();
                 if (status == MH_OK || status == MH_ERROR_ALREADY_INITIALIZED) {
+                    void** factoryTable = *reinterpret_cast<void***>(factory.Get());
                     void* executeTarget = queueTable[10];
                     void* presentTarget = swapTable[8];
                     void* resizeTarget = swapTable[13];
-                    success = HookManager::Create(executeTarget, reinterpret_cast<void*>(HookExecute),
-                                  reinterpret_cast<void**>(&originalExecute))
-                        && HookManager::Create(presentTarget, reinterpret_cast<void*>(HookPresent),
-                            reinterpret_cast<void**>(&originalPresent))
-                        && HookManager::Create(resizeTarget, reinterpret_cast<void*>(HookResize),
-                            reinterpret_cast<void**>(&originalResize));
+                    const auto requiredHook = [&error, &adapterLabel](void* target, void* detour, void** original,
+                        std::wstring_view name) {
+                        std::string hookError;
+                        if (HookManager::Create(target, detour, original, &hookError)) return true;
+                        error = std::format(L"Direct3D 12 {} hook failed on {} ({}). Close Discord, GPU, recording, monitoring, ReShade, and other overlays; then restart Minecraft.",
+                            name, adapterLabel, std::wstring(hookError.begin(), hookError.end()));
+                        return false;
+                    };
+                    success = requiredHook(executeTarget, reinterpret_cast<void*>(HookExecute),
+                                  reinterpret_cast<void**>(&originalExecute), L"command submission")
+                        && requiredHook(presentTarget, reinterpret_cast<void*>(HookPresent),
+                            reinterpret_cast<void**>(&originalPresent), L"Present")
+                        && requiredHook(resizeTarget, reinterpret_cast<void*>(HookResize),
+                            reinterpret_cast<void**>(&originalResize), L"resize");
+                    const bool createHooks = success && HookManager::Create(factoryTable[15],
+                            reinterpret_cast<void*>(HookCreateSwapChainForHwnd),
+                            reinterpret_cast<void**>(&originalCreateSwapChainForHwnd))
+                        && HookManager::Create(factoryTable[16],
+                            reinterpret_cast<void*>(HookCreateSwapChainForCoreWindow),
+                            reinterpret_cast<void**>(&originalCreateSwapChainForCoreWindow));
+                    tearingCreationHooksReady.store(createHooks, std::memory_order_release);
+                    Diagnostics::LogLine(createHooks ? "info" : "warning", "vsync_creation_hooks",
+                        std::format("systemTearing={} factoryHooks={}", systemAllowsTearing ? 1 : 0, createHooks ? 1 : 0));
                     // IDXGISwapChain3::ResizeBuffers1 (slot 39) is a separate
                     // entry point. Without this hook a game resizing through
                     // it would find our back-buffer references still alive.
@@ -1678,6 +1983,11 @@ bool Install(ModuleManager& modules, std::wstring& error) noexcept {
                                 "IDXGISwapChain3::ResizeBuffers1 hook failed to install");
                         }
                     }
+                } else {
+                    const char* detail = MH_StatusToString(status);
+                    const std::string hookStatus = detail ? detail : "unknown MinHook error";
+                    error = std::format(L"Direct3D 12 hook engine initialization failed on {} ({}). Restart Minecraft and close other overlays before trying again.",
+                        adapterLabel, std::wstring(hookStatus.begin(), hookStatus.end()));
                 }
             }
         }
@@ -1685,7 +1995,7 @@ bool Install(ModuleManager& modules, std::wstring& error) noexcept {
     if (window) DestroyWindow(window);
     UnregisterClassW(windowClass.lpszClassName, windowClass.hInstance);
     if (!success) {
-        error = L"Direct3D 12 hook validation failed; no overlay was installed.";
+        if (error.empty()) error = L"Direct3D 12 hook validation failed; no overlay was installed.";
         Remove();
     } else {
         if (!HookManager::Create(reinterpret_cast<void*>(&ClipCursor), reinterpret_cast<void*>(HookClipCursor),
@@ -1770,6 +2080,21 @@ void ConfigureControlKeys(std::uint32_t menuKey, std::uint32_t unloadKey) noexce
 
 std::uint32_t MenuKey() noexcept { return configuredMenuKey.load(); }
 std::uint32_t UnloadKey() noexcept { return configuredUnloadKey.load(); }
+bool TearingSupported() noexcept { return tearingSupported.load(std::memory_order_acquire); }
+VsyncState CurrentVsyncState() noexcept { return vsyncState.load(std::memory_order_acquire); }
+bool VsyncDisabledRequested() noexcept { return vsyncDisabled.load(std::memory_order_acquire); }
+
+void SetVsyncDisabled(const bool disabled) noexcept {
+    try {
+        if (!moduleManager) return;
+        moduleManager->SetModuleSetting(std::string(DisableVsyncSetting), disabled ? "1" : "0");
+        vsyncDisabled.store(disabled, std::memory_order_release);
+        renderSettingsReadAt = {};
+        settingsDirty.store(true, std::memory_order_release);
+        if (!disabled) ReportVsyncState(VsyncState::Enabled);
+    } catch (...) {}
+}
+bool LowLatencySupported() noexcept { return lowLatencySupported.load(std::memory_order_acquire); }
 
 void QueueReplayHotbarScroll(int notches) noexcept { replayHotbarScroll.fetch_add(notches, std::memory_order_acq_rel); }
 
@@ -1824,10 +2149,20 @@ void Remove() noexcept {
     }
     std::scoped_lock lock(stateMutex);
     ReleaseRenderState();
+    RestoreFrameLatency();
+    inspectedSwapChain.store(nullptr, std::memory_order_release);
+    tearingSupported.store(false, std::memory_order_release);
+    systemTearingSupported.store(false, std::memory_order_release);
+    tearingCreationHooksReady.store(false, std::memory_order_release);
+    vsyncState.store(VsyncState::Enabled, std::memory_order_release);
+    vsyncDisabled.store(false, std::memory_order_release);
+    renderSettingsReadAt = {};
     if (auto* queue = commandQueue.exchange(nullptr, std::memory_order_acq_rel)) queue->Release();
     originalPresent = nullptr;
     originalResize = nullptr;
     originalResize1 = nullptr;
+    originalCreateSwapChainForHwnd = nullptr;
+    originalCreateSwapChainForCoreWindow = nullptr;
     originalExecute = nullptr;
     originalClipCursor = nullptr;
     originalGetRawInputData = nullptr;

@@ -17,7 +17,8 @@ constexpr std::array<CapabilityInfo, CapabilityCount> Infos{{
     {"input-filtering", L"reviewed mouse input filtering", true},
     {"dc-prevent-policy", L"DC Prevent server policy", true},
     {"cps-cap-policy", L"CPS Cap server policy", true},
-    // Reviewed WorldTelemetry implementation for 1.26.5203. It remains
+    // WorldTelemetry is signature-gated and fails closed when a new build
+    // changes the reviewed entry point.
     // Pending until its unique signature validates in the live process.
     {"local-player-position", L"local player position", true},
     // PlayerStateTelemetry reads these from the same validated hook's Actor
@@ -32,6 +33,9 @@ constexpr std::array<CapabilityInfo, CapabilityCount> Infos{{
     {"server-state", L"server state", true},
     // ResourcePackTelemetry: the ILevel ResourcePackManager stacks.
     {"resource-packs", L"resource packs", true},
+    // The reader is supported, but the native Settings-screen reload entry
+    // point has not yet been uniquely validated for this exact build.
+    {"resource-pack-reload", L"resource-pack reload", false},
     // CombatTelemetry: MobHurtTimeComponent of the _renderLevelPrep Actor
     // and the entity a click was aimed at; Pending until the first read.
     {"combat-events", L"combat events", true},
@@ -56,6 +60,8 @@ constexpr std::array<CapabilityInfo, CapabilityCount> Infos{{
     {"packet-capture", L"incoming packet capture", true},
     {"perspective-presentation", L"camera perspective presentation", true},
     {"packet-send", L"client packet sending", true},
+    // Low Fire: the first-person fire overlay renderer is not located yet.
+    {"fire-overlay-presentation", L"fire overlay presentation", false},
 }};
 
 const CapabilityInfo& Info(Capability capability) noexcept {
@@ -121,6 +127,9 @@ CapabilityStatus DefaultCapabilityStatus(Capability capability) {
         return {CapabilityState::Pending, L"Waiting for the first validated LevelData read in Minecraft " + Build() + L"."};
     case Capability::ResourcePacks:
         return {CapabilityState::Pending, L"Waiting for the first validated resource-pack stack read in Minecraft " + Build() + L"."};
+    case Capability::ResourcePackReload:
+        return {CapabilityState::Unavailable,
+            L"No uniquely validated Global Resources reload entry point is available for Minecraft " + Build() + L"."};
     case Capability::CombatEvents:
         return {CapabilityState::Pending,
             L"Waiting for the first validated MobHurtTimeComponent read in Minecraft " + Build() + L"."};
@@ -156,6 +165,8 @@ CapabilityStatus DefaultCapabilityStatus(Capability capability) {
         return {CapabilityState::Pending, L"Waiting for the camera perspective hook to validate in Minecraft " + Build() + L"."};
     case Capability::PacketSend:
         return {CapabilityState::Pending, L"Waiting for a server connection in Minecraft " + Build() + L"."};
+    case Capability::FireOverlayPresentation:
+        return {CapabilityState::Unavailable, L"The first-person fire overlay hook has not been found for Minecraft " + Build() + L" yet."};
     case Capability::Count:
         break;
     }

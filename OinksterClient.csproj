@@ -5,8 +5,8 @@
     <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
     <RootNamespace>OinksterClient</RootNamespace>
     <ApplicationManifest>app.manifest</ApplicationManifest>
-    <Version>1.0.3</Version>
-    <InformationalVersion>1.0.3-beta</InformationalVersion>
+    <Version>1.1.0</Version>
+    <InformationalVersion>1.1.0-beta</InformationalVersion>
     <ApplicationIcon Condition="Exists('Assets\OinksterAppIcon.ico')">Assets\OinksterAppIcon.ico</ApplicationIcon>
     <Platforms>x86;x64;ARM64</Platforms>
     <RuntimeIdentifier Condition="'$(RuntimeIdentifier)' == ''">win-$([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture.ToString().ToLowerInvariant())</RuntimeIdentifier>
@@ -51,7 +51,7 @@
              Link="Native-v3\oinkster-client-x64.dll"
              CopyToOutputDirectory="Always"
              CopyToPublishDirectory="Always"
-             Condition="'$(Configuration)' == 'Debug' and Exists('Native\out\build\x64\$(Configuration)\oinkster-client-x64.dll')" />
+             Condition="Exists('Native\out\build\x64\$(Configuration)\oinkster-client-x64.dll')" />
   </ItemGroup>
 
   <!-- Unpackaged builds have no MSIX layout to carry content, so the assets
@@ -66,9 +66,11 @@
 
   <ItemGroup>
     <Compile Remove="OinksterClient.Tests\**\*.cs" />
+    <Compile Remove="Oinkster.MediaBroker\**\*.cs" />
     <Compile Remove="Tools\**\*.cs" />
     <Compile Remove="Native\out\**\*.cs" />
     <None Remove="OinksterClient.Tests\**\*" />
+    <None Remove="Oinkster.MediaBroker\**\*" />
     <None Remove="Tools\ReleaseTool\**\*" />
   </ItemGroup>
 
@@ -90,10 +92,30 @@
     <PropertyGroup> above to opt out.
   -->
   <ItemGroup>
-    <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="*" />
-    <PackageReference Include="Microsoft.WindowsAppSDK" Version="*" />
-    <PackageReference Include="Microsoft.Windows.SDK.BuildTools.WinApp" Version="*" />
+    <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.28000.2957" />
+    <PackageReference Include="Microsoft.WindowsAppSDK" Version="2.6.5" />
+    <PackageReference Include="Microsoft.Windows.SDK.BuildTools.WinApp" Version="0.8.0" PrivateAssets="all" />
   </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="Oinkster.MediaBroker\Oinkster.MediaBroker.csproj"
+                      ReferenceOutputAssembly="false" />
+  </ItemGroup>
+
+  <Target Name="CopyMediaBroker" AfterTargets="Build">
+    <PropertyGroup>
+      <MediaBrokerOutputRoot Condition="Exists('Oinkster.MediaBroker\bin\$(Platform)\$(Configuration)\net10.0-windows10.0.26100.0\win-x64')">Oinkster.MediaBroker\bin\$(Platform)\$(Configuration)\net10.0-windows10.0.26100.0\win-x64</MediaBrokerOutputRoot>
+      <MediaBrokerOutputRoot Condition="'$(MediaBrokerOutputRoot)' == ''">Oinkster.MediaBroker\bin\$(Configuration)\net10.0-windows10.0.26100.0\win-x64</MediaBrokerOutputRoot>
+    </PropertyGroup>
+    <ItemGroup>
+      <MediaBrokerPayload Include="$(MediaBrokerOutputRoot)\Oinkster.MediaBroker.exe" />
+      <MediaBrokerPayload Include="$(MediaBrokerOutputRoot)\Oinkster.MediaBroker.dll" />
+      <MediaBrokerPayload Include="$(MediaBrokerOutputRoot)\Oinkster.MediaBroker.deps.json" />
+      <MediaBrokerPayload Include="$(MediaBrokerOutputRoot)\Oinkster.MediaBroker.runtimeconfig.json" />
+    </ItemGroup>
+    <Copy SourceFiles="@(MediaBrokerPayload)" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true"
+          Condition="Exists('%(MediaBrokerPayload.Identity)')" />
+  </Target>
 
   <!--
     Defining the "HasPackageAndPublishMenuAddedByProject" property here allows the Solution
@@ -111,7 +133,7 @@
        launcher payload in that registered layout synchronized on every Debug
        build, just as the native client payload is synchronized below. -->
   <Target Name="RefreshDebugLauncherInAppxLayout"
-          AfterTargets="Build"
+          AfterTargets="CopyMediaBroker"
           Condition="'$(Configuration)' == 'Debug' and Exists('$(OutDir)AppX')">
     <ItemGroup>
       <DebugLauncherAppxPayload Include="$(OutDir)OinksterClient.exe" Condition="Exists('$(OutDir)OinksterClient.exe')" />
@@ -120,6 +142,10 @@
       <DebugLauncherAppxPayload Include="$(OutDir)OinksterClient.runtimeconfig.json" Condition="Exists('$(OutDir)OinksterClient.runtimeconfig.json')" />
       <DebugLauncherAppxPayload Include="$(OutDir)App.xbf" Condition="Exists('$(OutDir)App.xbf')" />
       <DebugLauncherAppxPayload Include="$(OutDir)MainPage.xbf" Condition="Exists('$(OutDir)MainPage.xbf')" />
+      <DebugLauncherAppxPayload Include="$(OutDir)Oinkster.MediaBroker.exe" Condition="Exists('$(OutDir)Oinkster.MediaBroker.exe')" />
+      <DebugLauncherAppxPayload Include="$(OutDir)Oinkster.MediaBroker.dll" Condition="Exists('$(OutDir)Oinkster.MediaBroker.dll')" />
+      <DebugLauncherAppxPayload Include="$(OutDir)Oinkster.MediaBroker.deps.json" Condition="Exists('$(OutDir)Oinkster.MediaBroker.deps.json')" />
+      <DebugLauncherAppxPayload Include="$(OutDir)Oinkster.MediaBroker.runtimeconfig.json" Condition="Exists('$(OutDir)Oinkster.MediaBroker.runtimeconfig.json')" />
       <DebugLauncherAppxPayload Include="$(OutDir)MainWindow.xbf" Condition="Exists('$(OutDir)MainWindow.xbf')" />
       <DebugLauncherAppxPayload Include="$(OutDir)resources.pri" Condition="Exists('$(OutDir)resources.pri')" />
       <DebugLauncherAppxPayload Include="$(OutDir)AppxManifest.xml" Condition="Exists('$(OutDir)AppxManifest.xml')" />

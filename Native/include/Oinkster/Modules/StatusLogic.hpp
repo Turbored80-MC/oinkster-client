@@ -103,5 +103,8 @@ struct ItemRecord {
 
 [[nodiscard]] std::string_view ArmorSlotName(ArmorSlot slot) noexcept;
 [[nodiscard]] std::string_view SessionKindName(SessionKind kind) noexcept;
+// Which of `count` items a slideshow shows `elapsed` into its run, advancing
+// every `interval`; 0 for an empty list or a non-positive interval.
+[[nodiscard]] std::size_t RotationIndex(std::size_t count, SteadyClock::duration elapsed, SteadyClock::duration interval) noexcept;
 
 }

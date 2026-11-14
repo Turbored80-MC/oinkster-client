@@ -1,5 +1,7 @@
 #pragma once
 
+#include <string>
+
 namespace Oinkster::HookManager {
 
 // Creates and enables a MinHook hook for `target`, writing the original
@@ -8,7 +10,7 @@ namespace Oinkster::HookManager {
 // created through it down together, in the same order they were created -
 // mirroring the centralized hook registry in Flarial dll-oss's
 // src/Client/Hook/Manager.cpp.
-[[nodiscard]] bool Create(void* target, void* detour, void** original) noexcept;
+[[nodiscard]] bool Create(void* target, void* detour, void** original, std::string* error = nullptr) noexcept;
 
 // Disables one registered hook without affecting unrelated subsystems. The
 // target remains registered until Remove(target) so in-flight callbacks can

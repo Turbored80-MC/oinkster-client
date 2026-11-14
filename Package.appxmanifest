@@ -4,14 +4,15 @@
   xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
   xmlns:mp="http://schemas.microsoft.com/appx/2014/phone/manifest"
   xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:uap7="http://schemas.microsoft.com/appx/manifest/uap/windows10/7"
   xmlns:uap10="http://schemas.microsoft.com/appx/manifest/uap/windows10/10"
   xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
-  IgnorableNamespaces="uap uap10 rescap">
+  IgnorableNamespaces="uap uap7 uap10 rescap">
 
   <Identity
     Name="A2841650-401E-407E-AF67-B8BFAB909B4A"
     Publisher="CN=AppPublisher"
-    Version="1.0.3.0" />
+    Version="1.1.0.0" />
 
   <mp:PhoneIdentity PhoneProductId="A2841650-401E-407E-AF67-B8BFAB909B4A" PhonePublisherId="00000000-0000-0000-0000-000000000000"/>
 
@@ -25,8 +26,8 @@
   </Properties>
 
   <Dependencies>
-    <TargetDeviceFamily Name="Windows.Universal" MinVersion="10.0.17763.0" MaxVersionTested="10.0.26226.0" />
-    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.17763.0" MaxVersionTested="10.0.26226.0" />
+    <TargetDeviceFamily Name="Windows.Universal" MinVersion="10.0.17763.0" MaxVersionTested="10.0.28000.0" />
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.17763.0" MaxVersionTested="10.0.28000.0" />
   </Dependencies>
 
   <Resources>
@@ -39,7 +40,7 @@
       EntryPoint="$targetentrypoint$">
       <uap:VisualElements
         DisplayName="Oinkster Client"
-        Description="Oinkster Client 1.0.0 Beta"
+        Description="Oinkster Client 1.1.0 Beta"
         BackgroundColor="transparent"
         Square150x150Logo="Assets\OinksterSquare150x150Logo.png"
         Square44x44Logo="Assets\OinksterAppIcon.png">
@@ -50,6 +51,7 @@
   </Applications>
 
   <Capabilities>
+    <uap7:Capability Name="globalMediaControl" />
     <rescap:Capability Name="runFullTrust" />
   </Capabilities>
 </Package>

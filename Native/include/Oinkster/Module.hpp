@@ -5,6 +5,7 @@
 #include "ModuleSettings.hpp"
 #include <chrono>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -53,6 +54,8 @@ enum class HudTone : std::uint8_t { Normal, Accent, Muted, Warning, Good };
 struct HudLine {
     std::string text;  // UTF-8
     HudTone tone{HudTone::Normal};
+    // Multiplies the line's text (and backdrop) opacity, e.g. fading chat.
+    float alpha{1.0F};
 };
 
 struct HudGraph {
@@ -79,6 +82,18 @@ struct HudContent {
     std::vector<std::vector<HudKey>> keyRows;
     // Draw without the HUD window's background panel (key grids supply their own tiles).
     bool bare{};
+    // Drawn to the left of the lines, about two lines tall.
+    std::shared_ptr<const ArgbImage> icon;
+    // Java-chat style: the layout's Y is the widget's bottom edge, so new
+    // lines push older ones upward.
+    bool anchorBottom{};
+    // Lines wrap at this width (unscaled pixels) and, with lineBackdrops,
+    // each gets its own backdrop of that width instead of one shared panel.
+    float wrapWidth{};
+    bool lineBackdrops{};
+    // Still drawn while a game screen (chat, inventory) owns the cursor,
+    // where the HUD is otherwise hidden.
+    bool overGameScreens{};
 };
 
 // Java-style debug information is anchored to both screen edges instead of
@@ -111,6 +126,11 @@ public:
     // these and calls OnSettingsChanged with a fresh reader on every change
     // (and once, with defaults, at registration).
     [[nodiscard]] virtual std::span<const SettingDescriptor> Settings() const noexcept { return {}; }
+    // Whether a settings UI should list `key` right now, for settings that
+    // only matter in some runtime state (e.g. one toggle per resource pack,
+    // shown only while that pack is loaded). The value still applies and
+    // persists while unlisted.
+    [[nodiscard]] virtual bool IsSettingRelevant(std::string_view) const { return true; }
     virtual void OnSettingsChanged(const SettingsReader&) {}
 
     // One-shot commands surfaced as buttons in the ClickGUI (e.g. stopwatch
@@ -181,6 +201,15 @@ class IDebugOverlayModule {
 public:
     virtual ~IDebugOverlayModule() = default;
     [[nodiscard]] virtual DebugOverlayContent DebugOverlay() const = 0;
+};
+
+// Takes over the game's own chat display: while an enabled module reports
+// true, Text packets that would reach chat are held back from the game
+// (ReplayPacketBridge); popups and tips still pass.
+class IChatReplacementModule {
+public:
+    virtual ~IChatReplacementModule() = default;
+    [[nodiscard]] virtual bool ReplacesVanillaChat() const = 0;
 };
 
 // Throttles presentation while the game is in the background.
@@ -354,11 +383,12 @@ struct PostProcessSettings {
     float brightness{};        // -0.5 .. 0.5 added to every channel
     float vignette{};          // 0 .. 1 corner darkening
     float sharpen{};           // 0 .. 1 unsharp mask
+    float blur{};              // 0 .. 1 screen-space blur radius
     std::uint32_t tint{0xFFFFFFFFU};
     float tintStrength{};      // 0 .. 1
     [[nodiscard]] bool Identity() const noexcept {
         return saturation == 1.0F && contrast == 1.0F && brightness == 0.0F && vignette == 0.0F
-            && sharpen == 0.0F && tintStrength == 0.0F;
+            && sharpen == 0.0F && blur == 0.0F && tintStrength == 0.0F;
     }
 };
 

@@ -17,4 +17,7 @@ public sealed record NativeClientStatus(
     [property: JsonPropertyName("capabilities")] IReadOnlyDictionary<string, string>? Capabilities = null,
     // Optional, additive diagnostics for unavailable/pending capabilities.
     // Older native builds omit this member.
-    [property: JsonPropertyName("capabilityReasons")] IReadOnlyDictionary<string, string>? CapabilityReasons = null);
+    [property: JsonPropertyName("capabilityReasons")] IReadOnlyDictionary<string, string>? CapabilityReasons = null,
+    // Present when native startup reached a terminal failure before the
+    // graphics hooks became ready. Older native builds omit this member.
+    [property: JsonPropertyName("startupError")] string? StartupError = null);

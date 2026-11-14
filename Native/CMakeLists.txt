@@ -58,6 +58,7 @@ add_library(OinksterCore STATIC
   src/GameItems.cpp
   src/HookManager.cpp
   src/Json.cpp
+  src/MediaControlService.cpp
   src/Module.cpp
   src/ModuleManager.cpp
   src/ModuleCatalog.cpp
@@ -81,11 +82,13 @@ add_library(OinksterCore STATIC
   src/ReplayWorld.cpp
   src/ReplayTimeline.cpp
   src/ResourcePackTelemetry.cpp
+  src/ResourcePackReloadAdapter.cpp
   src/CameraTelemetry.cpp
   src/CrosshairTexture.cpp
   src/Runtime.cpp
   src/SessionTelemetry.cpp
   src/ScreenTelemetry.cpp
+  src/ScreenshotCapture.cpp
   src/ServerPolicy.cpp
   src/SettingsStore.cpp
   src/SignatureScan.cpp
@@ -96,6 +99,7 @@ add_library(OinksterCore STATIC
   src/PacketSender.cpp
   src/StatusPipe.cpp
   src/UnloadGuard.cpp
+  src/UserResourcePacks.cpp
   src/WorldTelemetry.cpp
   src/Modules/AccessibilityModules.cpp
   src/Modules/FrameStatistics.cpp
@@ -113,7 +117,7 @@ add_library(OinksterCore STATIC
 target_include_directories(OinksterCore PUBLIC include)
 target_compile_definitions(OinksterCore PUBLIC UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_compile_options(OinksterCore PRIVATE /W4 /WX /permissive- /EHsc /utf-8)
-target_link_libraries(OinksterCore PUBLIC d2d1 dwrite d3d12 dxgi mfplat mfreadwrite mfuuid advapi32 psapi runtimeobject windowscodecs ole32 shell32 ws2_32 minhook libhat OinksterImGui)
+target_link_libraries(OinksterCore PUBLIC d2d1 dwrite d3d12 dxgi mfplat mfreadwrite mfuuid advapi32 psapi winmm runtimeobject windowscodecs ole32 shell32 ws2_32 minhook libhat OinksterImGui)
 
 add_library(OinksterClient SHARED src/DllMain.cpp resources/OinksterNative.rc)
 set_target_properties(OinksterClient PROPERTIES OUTPUT_NAME "oinkster-client-x64")

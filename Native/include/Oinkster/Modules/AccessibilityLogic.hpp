@@ -81,6 +81,29 @@ struct ChatPresentation {
 // One presented chat line. Pure: the local time is passed in.
 [[nodiscard]] std::wstring PresentChatLine(const ChatEvent& event, const ChatPresentation& options, int hour, int minute);
 
+// ---------------------------------------------------------------- Moveable chat
+
+// Java chat fade: a line stays fully opaque for the first 90% of
+// visibleSeconds and fades out (eased) over the rest; 0 once expired.
+[[nodiscard]] float ChatLineAlpha(SteadyClock::duration age, float visibleSeconds) noexcept;
+
+// Whether the game's chat screen is open, inferred from input: the chat
+// screen gives Minecraft the cursor, which hides the gameplay HUD. Opening is
+// only believed when the chat key went down just before the HUD hid, so the
+// inventory or pause screen never count as chat.
+class ChatScreenTracker {
+public:
+    static constexpr std::chrono::milliseconds OpenWindow{600};
+    void OnChatKey(SteadyTime at) noexcept { keyAt_ = at; }
+    void Update(bool gameplayVisible, SteadyTime now) noexcept;
+    [[nodiscard]] bool Open() const noexcept { return open_; }
+    void Reset() noexcept { *this = {}; }
+
+private:
+    std::optional<SteadyTime> keyAt_;
+    bool open_{};
+};
+
 // ---------------------------------------------------------------- Sprint
 
 // Decides whether the sprint key should be held on the player's behalf.

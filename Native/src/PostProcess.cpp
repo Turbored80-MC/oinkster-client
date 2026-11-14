@@ -34,6 +34,19 @@ SamplerState sampler0 : register(s0);
 Texture2D texture0 : register(t0);
 float4 main(PS_INPUT input) : SV_Target {
     float3 c = texture0.Sample(sampler0, input.uv).rgb;
+    if (extra.w > 0.0) {
+        float2 t = extra.yz * lerp(1.0, 6.0, extra.w);
+        float3 sum = c * 4.0;
+        sum += texture0.Sample(sampler0, input.uv + float2(t.x, 0)).rgb;
+        sum += texture0.Sample(sampler0, input.uv - float2(t.x, 0)).rgb;
+        sum += texture0.Sample(sampler0, input.uv + float2(0, t.y)).rgb;
+        sum += texture0.Sample(sampler0, input.uv - float2(0, t.y)).rgb;
+        sum += texture0.Sample(sampler0, input.uv + t).rgb;
+        sum += texture0.Sample(sampler0, input.uv - t).rgb;
+        sum += texture0.Sample(sampler0, input.uv + float2(t.x, -t.y)).rgb;
+        sum += texture0.Sample(sampler0, input.uv + float2(-t.x, t.y)).rgb;
+        c = lerp(c, sum / 12.0, extra.w);
+    }
     if (extra.x > 0.0) {
         float2 t = extra.yz;
         float3 n = texture0.Sample(sampler0, input.uv + float2(t.x, 0)).rgb
@@ -89,6 +102,7 @@ PostProcessConstants MakePostProcessConstants(float width, float height, const P
     constants.extra[0] = std::clamp(finite(settings.sharpen, 0.0F), 0.0F, 1.0F);
     constants.extra[1] = 1.0F / right;
     constants.extra[2] = 1.0F / bottom;
+    constants.extra[3] = std::clamp(finite(settings.blur, 0.0F), 0.0F, 1.0F);
     return constants;
 }
 

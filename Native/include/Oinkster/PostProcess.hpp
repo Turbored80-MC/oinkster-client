@@ -37,7 +37,7 @@ struct PostProcessConstants {
     float projection[16]{};
     float grade[4]{};   // saturation, contrast, brightness, vignette
     float tint[4]{};    // r, g, b, strength
-    float extra[4]{};   // sharpen, 1/width, 1/height, 0
+    float extra[4]{};   // sharpen, 1/width, 1/height, blur
 };
 [[nodiscard]] PostProcessConstants MakePostProcessConstants(float width, float height, const PostProcessSettings& settings) noexcept;
 

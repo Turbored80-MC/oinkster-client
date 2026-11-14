@@ -4,8 +4,10 @@
 #include "Oinkster/ReplayInjector.hpp"
 #include "Oinkster/SkinHead.hpp"
 #include <algorithm>
+#include <bit>
 #include <cctype>
 #include <cwctype>
+#include <cmath>
 
 namespace Oinkster::Modules {
 namespace {
@@ -34,6 +36,8 @@ std::uint32_t U32LE(Reader& reader) {
     return static_cast<std::uint32_t>(bytes[0]) | (static_cast<std::uint32_t>(bytes[1]) << 8U)
         | (static_cast<std::uint32_t>(bytes[2]) << 16U) | (static_cast<std::uint32_t>(bytes[3]) << 24U);
 }
+
+float F32LE(Reader& reader) { return std::bit_cast<float>(U32LE(reader)); }
 
 std::int64_t ZigZag(std::uint64_t value) noexcept {
     return static_cast<std::int64_t>(value >> 1U) ^ -static_cast<std::int64_t>(value & 1U);
@@ -384,6 +388,120 @@ std::optional<TextMessage> ParseText(std::span<const std::uint8_t> body) {
     return text;
 }
 
+namespace {
+// Fills printf-style "%s" / "%1$s" / "%%" placeholders, in order.
+std::string FillParameters(std::string_view pattern, const std::vector<std::string>& parameters) {
+    std::string out;
+    std::size_t next = 0;
+    for (std::size_t index = 0; index < pattern.size(); ++index) {
+        if (pattern[index] != '%' || index + 1 >= pattern.size()) { out += pattern[index]; continue; }
+        const char following = pattern[index + 1];
+        if (following == '%') { out += '%'; ++index; continue; }
+        if (following == 's') {
+            if (next < parameters.size()) out += parameters[next];
+            ++next;
+            ++index;
+            continue;
+        }
+        if (following >= '1' && following <= '9' && index + 3 < pattern.size() && pattern[index + 2] == '$' && pattern[index + 3] == 's') {
+            const auto slot = static_cast<std::size_t>(following - '1');
+            if (slot < parameters.size()) out += parameters[slot];
+            index += 3;
+            continue;
+        }
+        out += '%';
+    }
+    return out;
+}
+
+// The handful of keys vanilla chat shows most; others fall back to the key.
+std::optional<std::string_view> ChatPattern(std::string_view key) {
+    static constexpr std::array<std::pair<std::string_view, std::string_view>, 9> patterns{{
+        {"chat.type.text", "<%s> %s"},
+        {"chat.type.emote", "* %s %s"},
+        {"chat.type.announcement", "[%s] %s"},
+        {"chat.type.admin", "[%s: %s]"},
+        {"commands.message.display.incoming", "%s whispers to you: %s"},
+        {"commands.message.display.outgoing", "You whisper to %s: %s"},
+        {"multiplayer.player.joined", "%s joined the game"},
+        {"multiplayer.player.left", "%s left the game"},
+        {"death.attack.generic", "%s died"},
+    }};
+    for (const auto& [name, pattern] : patterns) {
+        if (name == key) return pattern;
+    }
+    return std::nullopt;
+}
+
+// A "%key" inside a translated message (often after colour codes).
+std::string Translate(std::string_view message, const std::vector<std::string>& parameters) {
+    const auto percent = message.find('%');
+    if (percent == std::string_view::npos) return FillParameters(message, parameters);
+    std::size_t end = percent + 1;
+    while (end < message.size() && (std::isalnum(static_cast<unsigned char>(message[end])) || message[end] == '.' || message[end] == '_')) ++end;
+    const auto key = message.substr(percent + 1, end - percent - 1);
+    std::string line(message.substr(0, percent));
+    if (const auto pattern = ChatPattern(key)) {
+        line += FillParameters(*pattern, parameters);
+    } else if (key.starts_with("death.") && !parameters.empty()) {
+        line += parameters.front() + " died";
+    } else {
+        line += key;
+        for (const auto& parameter : parameters) line += " " + parameter;
+    }
+    line += message.substr(end);
+    return line;
+}
+
+// Concatenates every "text" value of a JSON rawtext message.
+std::string RawText(std::string_view json) {
+    std::string out;
+    constexpr std::string_view Key = "\"text\"";
+    for (std::size_t at = json.find(Key); at != std::string_view::npos; at = json.find(Key, at + 1)) {
+        std::size_t index = at + Key.size();
+        while (index < json.size() && (json[index] == ' ' || json[index] == ':')) ++index;
+        if (index >= json.size() || json[index] != '"') continue;
+        for (++index; index < json.size() && json[index] != '"'; ++index) {
+            if (json[index] == '\\' && index + 1 < json.size()) {
+                const char escaped = json[++index];
+                out += escaped == 'n' ? '\n' : escaped;
+            } else {
+                out += json[index];
+            }
+        }
+    }
+    return out;
+}
+}
+
+std::optional<std::string> ChatLineFromText(const TextMessage& text) {
+    // TextPacket types: 0 raw, 1 chat, 2 translation, 3 popup, 4 jukebox
+    // popup, 5 tip, 6 system, 7 whisper, 8 announcement, 9-11 JSON variants.
+    std::string line;
+    switch (text.type) {
+    case 3: case 4: case 5:
+        return std::nullopt;
+    case 1:
+        line = text.source.empty() ? text.message : "<" + text.source + "> " + text.message;
+        break;
+    case 7:
+        line = text.source.empty() ? text.message : text.source + " whispers to you: " + text.message;
+        break;
+    case 8:
+        line = text.source.empty() ? text.message : "[" + text.source + "] " + text.message;
+        break;
+    case 9: case 10: case 11:
+        line = RawText(text.message);
+        break;
+    default:
+        line = text.message.find('%') != std::string::npos || !text.parameters.empty()
+            ? Translate(text.message, text.parameters) : text.message;
+        break;
+    }
+    if (line.empty()) return std::nullopt;
+    return line;
+}
+
 std::optional<TitleMessage> ParseTitle(std::span<const std::uint8_t> body) {
     Reader reader(body);
     TitleMessage title;
@@ -402,6 +520,119 @@ std::optional<FormRequest> ParseFormRequest(std::span<const std::uint8_t> body) 
     if (!reader.Ok() || !json) return std::nullopt;
     form.json = std::move(*json);
     return form;
+}
+
+std::optional<FoodAttributes> ParseFoodAttributes(std::span<const std::uint8_t> body) {
+    Reader reader(body);
+    (void)reader.VarU64();
+    const auto count = reader.VarU32();
+    if (!reader.Ok() || count > 64) return std::nullopt;
+    FoodAttributes food;
+    for (std::uint32_t index = 0; index < count; ++index) {
+        const float minimum = F32LE(reader);
+        const float maximum = F32LE(reader);
+        const float current = F32LE(reader);
+        const float defaultMinimum = F32LE(reader);
+        const float defaultMaximum = F32LE(reader);
+        const float defaultValue = F32LE(reader);
+        auto name = ReadString(reader, 128);
+        if (!reader.Ok() || !name || !std::isfinite(minimum) || !std::isfinite(maximum)
+            || !std::isfinite(current) || !std::isfinite(defaultMinimum) || !std::isfinite(defaultMaximum)
+            || !std::isfinite(defaultValue) || minimum > maximum || defaultMinimum > defaultMaximum
+            || current < minimum - 0.01F || current > maximum + 0.01F
+            || defaultValue < defaultMinimum - 0.01F || defaultValue > defaultMaximum + 0.01F) {
+            return std::nullopt;
+        }
+        if (*name == "minecraft:player.hunger" && current >= 0.0F && current <= 20.0F) food.hunger = current;
+        else if (*name == "minecraft:player.saturation" && current >= 0.0F && current <= 20.0F) food.saturation = current;
+        else if (*name == "minecraft:player.exhaustion" && current >= 0.0F && current <= 40.0F) food.exhaustion = current;
+        const auto modifiers = reader.VarU32();
+        if (!reader.Ok() || modifiers > 64) return std::nullopt;
+        for (std::uint32_t modifier = 0; modifier < modifiers; ++modifier) {
+            if (!SkipString(reader) || !SkipString(reader)) return std::nullopt;
+            (void)F32LE(reader);
+            (void)U32LE(reader);
+            (void)U32LE(reader);
+            if (reader.U8() > 1 || !reader.Ok()) return std::nullopt;
+        }
+    }
+    (void)reader.VarU64();  // tick
+    if (!reader.Ok() || (!food.hunger && !food.saturation && !food.exhaustion)) return std::nullopt;
+    return food;
+}
+
+std::optional<std::string> ParseRemoveObjective(std::span<const std::uint8_t> body) {
+    Reader reader(body);
+    auto objective = ReadString(reader, 128);
+    if (!reader.Ok() || !objective || reader.Remaining() != 0) return std::nullopt;
+    return objective;
+}
+
+std::optional<DisplayObjective> ParseDisplayObjective(std::span<const std::uint8_t> body) {
+    Reader reader(body);
+    DisplayObjective display;
+    auto slot = ReadString(reader, 32);
+    auto objective = ReadString(reader, 128);
+    auto name = ReadString(reader, 1024);
+    auto criteria = ReadString(reader, 128);
+    const auto order = static_cast<std::int32_t>(U32LE(reader));
+    if (!reader.Ok() || !slot || !objective || !name || !criteria || reader.Remaining() != 0 || (order != 0 && order != 1)) return std::nullopt;
+    display.slot = std::move(*slot);
+    display.objective = std::move(*objective);
+    display.displayName = std::move(*name);
+    display.descending = order != 0;
+    return display;
+}
+
+std::optional<ScoreUpdate> ParseScoreUpdate(std::span<const std::uint8_t> body) {
+    Reader reader(body);
+    const auto action = reader.U8();
+    const auto count = reader.VarU32();
+    if (!reader.Ok() || action > 1 || count > 1024) return std::nullopt;
+    ScoreUpdate update;
+    update.remove = action == 1;
+    update.entries.reserve(count);
+    for (std::uint32_t index = 0; index < count; ++index) {
+        ScoreEntry entry;
+        entry.id = ZigZag(reader.VarU64());
+        auto objective = ReadString(reader, 128);
+        entry.score = static_cast<std::int32_t>(U32LE(reader));
+        if (!reader.Ok() || !objective) return std::nullopt;
+        entry.objective = std::move(*objective);
+        if (!update.remove) {
+            const auto identity = reader.U8();
+            if (!reader.Ok() || identity < 1 || identity > 3) return std::nullopt;
+            if (identity == 1 || identity == 2) entry.entityId = ZigZag(reader.VarU64());
+            else {
+                auto name = ReadString(reader, 1024);
+                if (!name) return std::nullopt;
+                entry.displayName = std::move(*name);
+            }
+        }
+        if (!reader.Ok()) return std::nullopt;
+        update.entries.push_back(std::move(entry));
+    }
+    if (reader.Remaining() != 0) return std::nullopt;
+    return update;
+}
+
+std::optional<ScoreIdentityUpdate> ParseScoreIdentityUpdate(std::span<const std::uint8_t> body) {
+    Reader reader(body);
+    const auto action = reader.U8();
+    const auto count = reader.VarU32();
+    if (!reader.Ok() || action > 1 || count > 1024) return std::nullopt;
+    ScoreIdentityUpdate update;
+    update.remove = action == 1;
+    update.entries.reserve(count);
+    for (std::uint32_t index = 0; index < count; ++index) {
+        ScoreIdentity entry;
+        entry.scoreId = ZigZag(reader.VarU64());
+        if (!update.remove) entry.entityId = ZigZag(reader.VarU64());
+        if (!reader.Ok()) return std::nullopt;
+        update.entries.push_back(entry);
+    }
+    if (reader.Remaining() != 0) return std::nullopt;
+    return update;
 }
 
 }

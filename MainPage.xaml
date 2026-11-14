@@ -217,7 +217,7 @@
                 </Border>
                 <InfoBar x:Name="ActionInfo" Margin="20" MaxWidth="520" HorizontalAlignment="Center" VerticalAlignment="Bottom" IsClosable="True" IsOpen="False" Severity="Informational" Title="Preview only" Message="This action will be connected in a later milestone."/>
             </Grid>
-            <Grid x:Name="Footer" Grid.Row="2" Margin="34,0,34,18"><StackPanel Orientation="Horizontal" Spacing="8"><Ellipse x:Name="FooterStatusDot" Width="6" Height="6" VerticalAlignment="Center" Fill="#FF777179"/><TextBlock x:Name="FooterStatusText" Foreground="#FF777179" FontSize="11" Text="Detecting Bedrock"/></StackPanel><TextBlock x:Name="AppVersionText" HorizontalAlignment="Right" Foreground="#FF5F5961" FontSize="11" Text="Oinkster 1.0.0 Beta"/></Grid>
+            <Grid x:Name="Footer" Grid.Row="2" Margin="34,0,34,18"><StackPanel Orientation="Horizontal" Spacing="8"><Ellipse x:Name="FooterStatusDot" Width="6" Height="6" VerticalAlignment="Center" Fill="#FF777179"/><TextBlock x:Name="FooterStatusText" Foreground="#FF777179" FontSize="11" Text="Detecting Bedrock"/></StackPanel><TextBlock x:Name="AppVersionText" HorizontalAlignment="Right" Foreground="#FF5F5961" FontSize="11" Text="Oinkster"/></Grid>
         </Grid>
     </Grid>
 </Page>

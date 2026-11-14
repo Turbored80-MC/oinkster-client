@@ -48,4 +48,8 @@ inline constexpr std::size_t MaxContainerEntries = 16384;
 // Escapes a UTF-8 string for embedding between JSON quotes.
 [[nodiscard]] std::string Escape(std::string_view text);
 
+// Stable compact serialization used when a parsed document must be edited
+// without dropping fields unknown to this client.
+[[nodiscard]] std::string Stringify(const Value& value);
+
 }

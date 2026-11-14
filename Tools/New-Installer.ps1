@@ -16,6 +16,8 @@ if (Test-Path $publishDir) { Remove-Item -Recurse -Force $publishDir }
 
 dotnet publish "$root\OinksterClient.csproj" -c Release -p:Platform=x64 -r win-x64 -o $publishDir
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+dotnet publish "$root\Oinkster.MediaBroker\Oinkster.MediaBroker.csproj" -c Release -r win-x64 --self-contained true -o $publishDir
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 if (-not (Test-Path "$publishDir\Assets\OinksterReleasePublicKey.pem")) {
     throw "The published launcher is missing the release public key."
 }

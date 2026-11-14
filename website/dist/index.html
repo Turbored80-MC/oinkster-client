@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#bfe0f5">
+    <meta name="description" content="Oinkster is a free, open-source client for Minecraft Bedrock on Windows: HUD mods, input tools and visual tweaks, opened in-game with K.">
+    <title>Oinkster Client</title>
+    <link rel="icon" href="favicon.ico" sizes="any">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:ital,wght@0,400;0,700;1,400&family=Pixelify+Sans:wght@500;700&display=swap">
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <a class="skip-link" href="#main">Skip to content</a>
+
+    <div class="sky">
+        <header class="site-header">
+            <a class="brand" href="./">
+                <img src="assets/pig-64.png" alt="" width="36" height="36">
+                <span>Oinkster</span>
+            </a>
+            <nav aria-label="Main">
+                <a href="#mods">Mods</a>
+                <a href="#source">Source code</a>
+                <a href="#download">Download</a>
+                <a href="bugs.html">Report a bug</a>
+                <a href="suggestions.html">Suggest an idea</a>
+                <a href="https://github.com/Turbored80-MC/oinkster-client">GitHub</a>
+            </nav>
+        </header>
+
+        <section class="hero" aria-labelledby="hero-title">
+            <div class="hero-copy">
+                <p class="beta-tag" data-release-version>1.1.0 Beta</p>
+                <h1 id="hero-title">Oinkster</h1>
+                <p class="hero-lede">A free client for Minecraft Bedrock on Windows. Press K in-game to open it, then turn on the mods you want: FPS and CPS counters, keystrokes, zoom, a custom crosshair and about fifty more.</p>
+                <div class="hero-actions">
+                    <a class="button button-primary" href="#download">Download</a>
+                    <a class="button button-plain" href="https://github.com/Turbored80-MC/oinkster-client">Read the source</a>
+                </div>
+            </div>
+            <img class="hero-pig" src="assets/pig-512.png" alt="The Oinkster pig, a pink Minecraft-style pig head" width="512" height="512">
+        </section>
+        <div class="grass" aria-hidden="true"></div>
+    </div>
+
+    <main id="main">
+        <section class="block intro" aria-label="What it is">
+            <p>Oinkster has two parts. The launcher checks your Minecraft version, downloads the client and starts it. The client runs inside the game and draws its menu straight into the game window, so you never have to alt-tab out.</p>
+            <p>It's built for one exact Minecraft version at a time. Right now that's <strong data-release-bedrock>Bedrock 26.63</strong> (x64). After a Minecraft update, the launcher waits for a matching Oinkster update rather than loading something that might break your game.</p>
+        </section>
+
+        <section class="block" id="mods" aria-labelledby="mods-title">
+            <h2 id="mods-title">What's in it</h2>
+            <p class="section-lede">Every mod is off until you turn it on. HUD mods can be dragged anywhere on screen, and each one has its own settings.</p>
+            <div class="mod-groups">
+                <div class="mod-group">
+                    <h3>Performance</h3>
+                    <p>FPS, frame time, FPS statistics, frame-time graph, memory use, performance summary.</p>
+                </div>
+                <div class="mod-group">
+                    <h3>Input</h3>
+                    <p>CPS, keystrokes, input latency, double-click prevention, CPS cap, scroll wheel disabler, sensitivity multiplier, null movement.</p>
+                </div>
+                <div class="mod-group">
+                    <h3>Info</h3>
+                    <p>Ping, coordinates, direction, speed, clock, stopwatch, session stats, armor status, item durability, potion effects, server and resource pack display, player list.</p>
+                </div>
+                <div class="mod-group">
+                    <h3>PvP</h3>
+                    <p>Combo counter, hit distance, equipment warnings, potion counter.</p>
+                </div>
+                <div class="mod-group">
+                    <h3>Visual</h3>
+                    <p>Custom crosshair, block outline, hurt color, motion blur, zoom, freelook, FOV profiles, fullbright, time changer, weather off, chunk borders, third-person distance and more.</p>
+                </div>
+                <div class="mod-group">
+                    <h3>Comfort</h3>
+                    <p>Toggle sprint and sneak, subtitles, chat tools, less hurt-camera shake, lower FPS while the game is in the background.</p>
+                </div>
+            </div>
+        </section>
+
+        <section class="block source" id="source" aria-labelledby="source-title">
+            <div class="source-copy">
+                <h2 id="source-title">The code is open source</h2>
+                <p>Every line of Oinkster, the launcher and the in-game client, is public on GitHub under the AGPL-3.0 license. Anyone can read what it does, build it themselves, or suggest a fix.</p>
+                <p>That matters for something that runs inside your game. You don't have to trust a closed download: you can see exactly what Oinkster reads and changes in the game, and check that it collects nothing about you. The only thing it contacts is GitHub, to check for updates.</p>
+                <a class="button button-dark" href="https://github.com/Turbored80-MC/oinkster-client">Open the repository</a>
+            </div>
+            <div class="source-checks">
+                <h3>What the launcher checks before starting the client</h3>
+                <ol>
+                    <li>The release file is signed with the Oinkster release key that ships inside the launcher.</li>
+                    <li>The downloaded client matches the signed file size and SHA-256 hash exactly.</li>
+                    <li>Minecraft is the 64-bit Windows version and the exact build the client was made for.</li>
+                </ol>
+                <p>If any check fails, nothing is loaded.</p>
+            </div>
+        </section>
+
+        <section class="block download" id="download" aria-labelledby="download-title">
+            <h2 id="download-title">Download</h2>
+            <p class="section-lede">Oinkster <span data-release-version>1.1.0 Beta</span> is the current beta. Expect a few rough edges. When you find one, <a href="bugs.html">tell us about it</a>. Got an idea for a mod? <a href="suggestions.html">Suggest it</a>.</p>
+            <div id="download-action" class="download-action">
+                <span class="button button-disabled" aria-disabled="true">Installer coming soon</span>
+                <span class="download-note" id="release-status-label">The installer is being signed and will be posted here and on GitHub releases.</span>
+            </div>
+            <dl class="requirements">
+                <div><dt>Windows</dt><dd>10 or 11, 64-bit</dd></div>
+                <div><dt>Minecraft</dt><dd data-release-bedrock>Bedrock 26.63</dd></div>
+                <div><dt>Price</dt><dd>Free</dd></div>
+            </dl>
+        </section>
+
+        <section class="block faq" aria-labelledby="faq-title">
+            <h2 id="faq-title">Questions</h2>
+            <details>
+                <summary>Is this allowed on servers?</summary>
+                <p>Oinkster is built around information and comfort: HUDs, input display, visual tweaks. It doesn't aim for you, see through walls or move for you. For servers that ban specific tools, such as The Hive and CubeCraft banning click-limit mods, Oinkster turns those mods off for you while you're connected. Rules change, so check the server's own list too.</p>
+            </details>
+            <details>
+                <summary>Why only one Minecraft version?</summary>
+                <p>The client reads parts of the game's memory that move around between Minecraft updates. Loading it into a different version could crash the game, so the launcher refuses until a matching update is out.</p>
+            </details>
+            <details>
+                <summary>What does "beta" mean here?</summary>
+                <p>Everything listed works, but it hasn't been played by many people yet. Settings are saved between versions, so you won't lose your HUD layout when updates come out.</p>
+            </details>
+            <details>
+                <summary>Can I build it myself?</summary>
+                <p>Yes. The <a href="https://github.com/Turbored80-MC/oinkster-client#building">README on GitHub</a> lists what you need: Visual Studio 2022, CMake and the .NET 10 SDK.</p>
+            </details>
+            <details>
+                <summary>Is Oinkster made by Mojang or Microsoft?</summary>
+                <p>No. Oinkster is an independent project and isn't affiliated with, endorsed by, or sponsored by Mojang Studios or Microsoft.</p>
+            </details>
+        </section>
+    </main>
+
+    <footer class="site-footer">
+        <div class="footer-inner">
+            <a class="brand" href="./"><img src="assets/pig-64.png" alt="" width="32" height="32"><span>Oinkster</span></a>
+            <nav aria-label="Footer">
+                <a href="https://github.com/Turbored80-MC/oinkster-client">Client source</a>
+                <a href="https://github.com/Turbored80-MC/oinkster-client-website">Website source</a>
+                <a href="bugs.html">Report a bug</a>
+                <a href="suggestions.html">Suggest an idea</a>
+            </nav>
+            <p class="legal">Not an official Minecraft product. Not approved by or associated with Mojang Studios or Microsoft.</p>
+        </div>
+    </footer>
+
+    <script src="app.js" type="module"></script>
+</body>
+</html>

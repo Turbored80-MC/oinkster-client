@@ -38,7 +38,7 @@ The workbench has module, HUD, and settings surfaces. The menu and clean-unload 
 
 A module is available exactly when every capability it lists is Available. Adapters report capabilities with `ModuleManager::SetCapability`; every change is logged (`"event":"capability"`) with the capability id, state and reason. A module enabled by the player while unavailable is remembered and switches on automatically when its capabilities validate.
 
-| Capability | Provided by | State for Minecraft 1.26.5203 |
+| Capability | Provided by | State for Minecraft 26.63 |
 |---|---|---|
 | `render-metrics`, `frame-composition` | Oinkster's own DX12 Present hook | Available |
 | `local-input`, `input-synthesis` | Oinkster's subclassed Minecraft window (posted key messages) | Available |
@@ -52,6 +52,7 @@ A module is available exactly when every capability it lists is Available. Adapt
 | `packet-capture` | `ReplayPacketBridge` (validated decoded server-to-client packet boundary) | Supported; Pending until a server connection is classified, then Available |
 | `packet-send` | `PacketSender` (validated `BatchedNetworkPeer::sendPacket`; command/form layouts learned per build) | Supported; Pending until the current server peer validates, then Available |
 | `camera-presentation`, `camera-rotation`, `camera-motion`, `third-person-presentation`, `lighting-presentation`, `time-presentation`, `weather-presentation`, `screen-effects-presentation`, `hand-presentation`, `damage-render`, `selected-block-render`, `perspective-presentation` | `PresentationAdapter` (see Remaining live-validation work) | Pending until each hook validates live |
+| `fire-overlay-presentation` | none yet: the first-person fire overlay renderer (Low Fire) has not been located in 26.63 | Unsupported; `low-fire` ships unavailable |
 
 The supported build is defined once, in `include/Oinkster/SupportedBuild.hpp`. Signature scans go through `SignatureScan::FindUniqueInText`, which accepts a target only when exactly one location across all candidate patterns matches.
 
@@ -92,10 +93,13 @@ These items are implemented and unit-tested against typed snapshots, but cannot 
   - *Block outline*: the local player's `ILevel` (Actor+0x1D8) slot `0xA78` returns the block hit result (0x88-byte HitResult: type +0x18, face +0x1C, BlockPos +0x20); the getter must be a plain field access. The outline is drawn by Oinkster's overlay from this frame's camera (only edges of camera-facing faces, plus the looked-at face filled), on top of the game's own outline, and is a full cube for every block shape. Logs: `presentation_selection_validated`, or `presentation_hit_result_unvalidated` with the getter's bytes.
 - **Sprint synthesis.** Toggle sprint posts an ordinary sprint-key press to the Minecraft window, the same path the menu uses to release held keys. Confirm in-game that Minecraft honors it with the player's sprint binding.
 - **`CameraTelemetry` (crosshair perspective).** The perspective comes from the game's own option (`Options::getPlayerViewPerspective`: 0 first person, 1 third person back, 2 third person front), read through plain field loads from the `_renderLevelPrep` Actor: LocalPlayer+0xD70 is the ClientInstance, whose `getOptions` (vtable slot 0x578) is checked to be `mov rax, [rcx+disp]; ret` and supplies the Options offset (+0xE10); the Options perspective getter (slot 0x3C0) is checked byte for byte before the option at +0x10 + 3 * 8 is trusted, and that option must carry id 3 and the telemetry name `playerViewPerspective`. Overrides (OptionImpl+0x238) are followed the way the getter does. Any mismatch publishes `Unknown`, and the adapter publishes `Unknown` before it detaches. Check the log for `camera_validated` and one `camera_perspective` line per F5 press. Not covered: a server forcing a camera preset (`/camera`) without changing the option.
+- **`UserResourcePacks` (display and Global Resources editor).** The real in-game Settings page lists installed packs and stages enable/disable and highest-first priority changes. It reads the newest `minecraftpe/global_resource_packs.json` under `%APPDATA%\Minecraft Bedrock\Users\*\games\com.mojang` (or legacy UWP LocalState), matches UUIDs to manifests in `resource_packs` / `development_resource_packs`, preserves subpacks and unknown JSON fields, rejects conflicts and stacks over 64 packs, and replaces the file atomically with a retained rollback copy. World and server packs never occur in this file and are never persisted by the editor. Names resolve `.lang` keys and icons are downscaled to 40 px. The file is checked every 2 s; staged changes become an explicit conflict instead of being overwritten.
+- **`ResourcePackReloadAdapter`.** File Apply is separately gated by `resource-pack-reload`. It must uniquely validate the exact-build native Global Resources reload entry point, its owner, and its game-thread context before any file write. No such entry point is validated for 26.63, so the capability is `Unavailable` and Apply is disabled. The parser, serializer, conflict detection, atomic replacement, backup, and rollback path remain independently testable; no stack memory is patched.
+- **VSync controller.** `click-gui.disable-vsync` remains the persisted setting. The launcher temporarily changes only `gfx_vsync` to `0` before `minecraft:` activation and restores the exact original bytes after injection, allowing the first swap chain to opt into tearing without permanently changing Bedrock's preference. Native hooks cover both `IDXGIFactory2` creation methods, `Present`, `ResizeBuffers`, and `ResizeBuffers1`; resize preserves the original tearing flag. `PresentationAdapter` mirrors Flarial's Options path: when the already-reviewed Options getter supplies its owner, it uniquely finds the entry whose id matches its table slot and whose translated name is `options.vsync`, captures BoolOption+0x10, synchronizes it to the Oinkster selection, and restores it before hook teardown. With VSync enabled, Bedrock's original Present arguments pass through unchanged; disabled uses interval 0 plus `DXGI_PRESENT_ALLOW_TEARING` only on a compatible windowed chain and never for `DXGI_PRESENT_TEST`. Late attachment to an incompatible chain still reports `RestartRequired`, because DXGI does not permit adding the creation flag afterward. Diagnostics are transition-based (`vsync_creation_hooks`, `vsync_option_validated`, `vsync_option_transition`, `swapchain_present_caps`, `vsync_transition`) rather than per-frame.
 - **`CrosshairTexture` (game crosshair in third person).** With `custom-crosshair.source = game` and `third-person` on, Oinkster redraws the game's crosshair only while `CameraTelemetry` reports a third-person camera, since Bedrock hides it there; first person and `Unknown` draw nothing, so the game's own crosshair is never doubled. The texture is `textures/ui/cross_hair.png` from the first active resource pack that has a readable one (pack uuids come from PackManifest+0x150/+0x158 and are matched to `manifest.json` in the resource_packs, development_resource_packs and world pack folders and the game's built-in packs; a loose PNG or the pack's `__brarchive/textures/ui.brarchive`), else vanilla (`vanilla_base`). Encrypted packs (Marketplace, most server packs) cannot be read and fall through to the next pack. Files are read on a worker thread. Check `crosshair_texture` (size and which pack won). Pack priority order is the same assumption as `ResourcePackTelemetry` (highest first). Oinkster never hides or patches the game's own crosshair, so `custom` and `drawn` draw on top of it.
 - **Motion blur.** The DX12 resource lifecycle is tested on WARP. Verify visually in-game with each backbuffer format the game uses (`IsBlendableFormat` refuses others).
 
-### Adapter research notes (1.26.5203, not yet implemented)
+### Adapter research notes (historical 1.26.5203 baseline)
 
 RVAs are into the dumped image; nothing here ships until it is wired, tested and confirmed live.
 
@@ -119,7 +123,7 @@ RVAs are into the dumped image; nothing here ships until it is wired, tested and
 
 Settings persist in `settings.json` under `legacyModuleSettings` as `"<module-id>.<key>": "<value>"`. Values are normalized on load. Out-of-range numbers are clamped. Malformed values, unknown choices, and reserved keys (Escape, Windows, mouse buttons, the menu/unload keys) fall back to the default. Unknown keys are kept for forward compatibility. Formats: bool `true`/`false`; numbers in the "C" locale; colors `#AARRGGBB`; keys as decimal Win32 virtual-key codes. Every movable HUD module also stores its position, scale, background, opacity and colors in `modules.<id>.hud`.
 
-The in-game module browser stores favorites as `click-gui.favorite.<module-id>` boolean entries in the same map. These UI-owned keys are preserved by both the native runtime and launcher without changing the settings schema.
+The in-game module browser stores favorites as `click-gui.favorite.<module-id>` boolean entries in the same map. The Settings page stores `click-gui.scale` (home screen size), `click-gui.disable-vsync` and `click-gui.low-latency` (`"1"` = on) there too. These UI-owned keys are preserved by both the native runtime and launcher without changing the settings schema.
 
 | Module | Key | Type / range | Default | Label |
 |---|---|---|---|---|
@@ -135,6 +139,9 @@ The in-game module browser stores favorites as `click-gui.favorite.<module-id>` 
 | `process-memory` | - | HUD layout only | | |
 | `performance-summary` | `performance-summary.window-seconds` | int 2..60 | `10` | 1% low window |
 | `performance-summary` | `performance-summary.show-memory` | bool | `true` | Show memory |
+| `fps-boost` | `fps-boost.priority` | choice: normal / above-normal / high | `above-normal` | Process priority |
+| `fps-boost` | `fps-boost.disable-power-throttling` | bool | `true` | Disable power throttling |
+| `fps-boost` | `fps-boost.high-resolution-timer` | bool | `true` | High-resolution timer |
 | `cps` | `cps.show-right` | bool | `true` | Show right clicks |
 | `cps` | `cps.style` | choice: labelled / compact | `labelled` | Style |
 | `keystrokes` | `keystrokes.forward-key` | key: VK code 0-254, 0 = unbound | `87 (W)` | Forward key |
@@ -182,9 +189,24 @@ The in-game module browser stores favorites as `click-gui.favorite.<module-id>` 
 | `potion-effects` | `potion-effects.warn-seconds` | int 0..120 | `10` | Highlight below |
 | `server-display` | `server-display.show-kind` | bool | `true` | Show session type |
 | `server-display` | `server-display.show-addresses` | bool | `false` | Show address-like names |
-| `resource-pack-display` | `resource-pack-display.max-shown` | int 1..6 | `1` | Packs shown |
+| `resource-pack-display` | `resource-pack-display.rotate-seconds` | int 1..60 | `5` | Rotate every (seconds per pack) |
+| `resource-pack-display` | `resource-pack-display.show-icon` | bool | `true` | Show pack icon |
+| `resource-pack-display` | `resource-pack-display.show-author` | bool | `true` | Show who made it (`metadata.authors`, else a "by ..." credit in the description, then the name) |
 | `resource-pack-display` | `resource-pack-display.show-version` | bool | `false` | Show pack version |
+| `resource-pack-display` | `resource-pack-display.pack-<uuid>` | bool | `true` | Show that pack (one per installed pack, keyed by its lowercased header uuid; the ClickGUI lists only the packs loaded right now) |
 | `replay-mod` | `replay-mod.auto-record` | bool | `false` | Start recording when you join a world |
+| `screenshot` | `screenshot.capture-key` | key: VK code 0-254, 0 = unbound | `113 (F2)` | Capture PNG |
+| `screenshot` | `screenshot.include-hud` | bool | `true` | Include Oinkster HUD |
+| `saturation-hud` | `saturation-hud.display` | choice: saturation / hunger / both | `both` | Display |
+| `saturation-hud` | `saturation-hud.warning` | float 0.0..10.0 | `3.0` | Low saturation warning |
+| `scoreboard` | `scoreboard.max-lines` | int 1..30 | `15` | Maximum lines |
+| `scoreboard` | `scoreboard.show-scores` | bool | `true` | Show scores |
+| `scoreboard` | `scoreboard.strip-formatting` | bool | `false` | Strip formatting codes |
+| `attack-indicator` | `attack-indicator.recovery-ms` | int 100..2000 | `500` | Local visual recovery time |
+| `attack-indicator` | `attack-indicator.style` | choice: crosshair / hud / both | `crosshair` | Display style |
+| `attack-indicator` | `attack-indicator.hide-ready` | bool | `true` | Hide when ready |
+| `attack-indicator` | `attack-indicator.color` | color | `#FFF28FB5` | Indicator color |
+| `attack-indicator` | `attack-indicator.confirmed-color` | color | `#FF7FE0A3` | Confirmed hit color |
 | `combo-counter` | `combo-counter.timeout-seconds` | float 0.5..10.0 | `2.0` | Combo timeout |
 | `combo-counter` | `combo-counter.show-best` | bool | `false` | Show session best |
 | `combo-counter` | `combo-counter.hide-when-zero` | bool | `false` | Hide when no combo |
@@ -253,6 +275,7 @@ The in-game module browser stores favorites as `click-gui.favorite.<module-id>` 
 | `screen-overlay-suppression` | `screen-overlay-suppression.pumpkin-opacity` | float 0..100 | `0.0` | Pumpkin opacity (%) |
 | `screen-overlay-suppression` | `screen-overlay-suppression.vignette-opacity` | float 0..100 | `0.0` | Vignette opacity (%) |
 | `screen-overlay-suppression` | `screen-overlay-suppression.nausea-opacity` | float 0..100 | `0.0` | Nausea opacity (%) |
+| `low-fire` | `low-fire.height-offset` | float 0..60 | `30.0` | Lower by (% of screen height) |
 | `hurt-camera` | `hurt-camera.strength` | float 0..100 | `0.0` | Camera shake (%) |
 | `subtitles` | `subtitles.lifetime-seconds` | float 1.0..10.0 | `3.0` | Caption lifetime |
 | `subtitles` | `subtitles.max-lines` | int 1..12 | `6` | Maximum captions |
@@ -265,6 +288,18 @@ The in-game module browser stores favorites as `click-gui.favorite.<module-id>` 
 | `chat-tools` | `chat-tools.hidden-names` | text (<= 64) | `""` | Names to hide (comma separated) |
 | `chat-tools` | `chat-tools.replacement` | text (<= 64) | `"Player"` | Replacement |
 | `chat-tools` | `chat-tools.lines` | int 1..20 | `8` | Lines shown |
+| `moveable-chat` | `moveable-chat.preset` | choice: java / bedrock / custom | `java` | Preset |
+| `moveable-chat` | `moveable-chat.grow-upward` | bool (custom preset) | `true` | Grow upward |
+| `moveable-chat` | `moveable-chat.fade` | bool (custom preset) | `true` | Fade old lines |
+| `moveable-chat` | `moveable-chat.line-backdrops` | bool (custom preset) | `true` | Per-line backdrop |
+| `moveable-chat` | `moveable-chat.visible-seconds` | int 2..60 | `10` | Line lifetime |
+| `moveable-chat` | `moveable-chat.lines` | int 1..20 | `10` | Lines shown |
+| `moveable-chat` | `moveable-chat.open-lines` | int 5..50 | `20` | Lines while chat is open |
+| `moveable-chat` | `moveable-chat.width` | int 150..640 | `320` | Width (px) |
+| `moveable-chat` | `moveable-chat.hide-vanilla` | bool | `true` | Hide vanilla chat |
+| `moveable-chat` | `moveable-chat.timestamps` | bool | `false` | Timestamps |
+| `moveable-chat` | `moveable-chat.strip-formatting` | bool | `true` | Strip color/format codes |
+| `moveable-chat` | `moveable-chat.chat-key` | key: VK code 0-254, 0 = unbound | `84 (T)` | Game chat key |
 | `toggle-sprint-dynamic-fps` | `toggle-sprint-dynamic-fps.sprint-enabled` | bool | `true` | Toggle sprint |
 | `toggle-sprint-dynamic-fps` | `toggle-sprint-dynamic-fps.sprint-mode` | choice: always / toggle | `always` | Sprint mode |
 | `toggle-sprint-dynamic-fps` | `toggle-sprint-dynamic-fps.sprint-toggle-key` | key: VK code 0-254, 0 = unbound | `0 (unbound)` | Sprint toggle key |
@@ -309,6 +344,13 @@ The in-game module browser stores favorites as `click-gui.favorite.<module-id>` 
 | `post-processing` | `post-processing.vignette` | float 0.0..1.0 | `0.0` | Vignette |
 | `post-processing` | `post-processing.tint` | color | `#FFFFFFFF` | Tint |
 | `post-processing` | `post-processing.tint-strength` | float 0.0..1.0 | `0.0` | Tint strength |
+| `menu-blur` | `menu-blur.strength` | float 0.05..1.0 | `0.55` | Blur strength |
+| `menu-blur` | `menu-blur.dim` | float 0.0..0.4 | `0.12` | Background dimming |
+| `waypoints` | `waypoints.new-name` | text | `Waypoint` | New waypoint name |
+| `waypoints` | `waypoints.new-color` | color | `#FFF28FB5` | New waypoint color |
+| `waypoints` | `waypoints.max-distance` | int 16..10000 | `2000` | Maximum distance |
+| `waypoints` | `waypoints.hud-count` | int 1..8 | `3` | HUD waypoint count |
+| `waypoints` | `waypoints.edge-markers` | bool | `true` | Edge-of-screen markers |
 | `debug-menu` | `debug-menu.performance` | bool | `true` | Performance |
 | `debug-menu` | `debug-menu.network` | bool | `true` | Connection |
 | `debug-menu` | `debug-menu.target` | bool | `true` | Targeted block |

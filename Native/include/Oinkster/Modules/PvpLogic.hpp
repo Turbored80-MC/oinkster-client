@@ -128,4 +128,8 @@ struct PotionCounts {
 };
 [[nodiscard]] PotionCounts CountPotions(const InventorySnapshot& inventory) noexcept;
 
+// Informational local recovery timer used by Attack Indicator. This does not
+// alter, delay, or synthesize input and makes no claim about server cooldowns.
+[[nodiscard]] float AttackRecovery(SteadyTime started, SteadyTime now, SteadyClock::duration duration) noexcept;
+
 }

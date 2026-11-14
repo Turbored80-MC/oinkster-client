@@ -3,6 +3,7 @@
 #include "Oinkster/Diagnostics.hpp"
 #include "Oinkster/HookManager.hpp"
 #include "Oinkster/ModuleManager.hpp"
+#include "Oinkster/Modules/PacketLogic.hpp"
 #include "Oinkster/PacketSender.hpp"
 #include "Oinkster/ReplayBlockPack.hpp"
 #include "Oinkster/ReplayCapture.hpp"
@@ -90,11 +91,27 @@ struct Observed {
     bool sessionStart{};
     // A packet the client sent, seen on the local world's server side.
     bool fromClient{};
+    // A chat Text packet an enabled chat replacement shows instead; the game
+    // does not get it.
+    bool chatReplaced{};
 };
 
 // Classifies the packet the game just received; for server packets, also
 // publishes it to an enabled recorder. nullopt for client packets and
 // anything unreadable.
+constexpr std::uint32_t LoggedTextPackets = 8;
+std::atomic_uint32_t textLogged{};
+
+// The first few body bytes in hex: the Text packet's fixed header fields
+// (translation flag, payload kind, type), never the message itself.
+std::string TextHead(std::span<const std::uint8_t> body) {
+    std::string out;
+    for (std::size_t index = 0; index < std::min<std::size_t>(body.size(), 3); ++index) {
+        out += std::format("{}{:02x}", index ? " " : "", body[index]);
+    }
+    return out;
+}
+
 std::optional<Observed> Observe(void* connection, const void* out) noexcept {
     auto* modules = moduleManager.load(std::memory_order_acquire);
     if (!modules || !connection || !out) return std::nullopt;
@@ -127,7 +144,7 @@ std::optional<Observed> Observe(void* connection, const void* out) noexcept {
         }
         if (classification.direction == ReplayCapture::Direction::ClientToServer) return Observed{parsed->id, false, true};
         if (classification.direction != ReplayCapture::Direction::ServerToClient) return std::nullopt;
-        const Observed observed{parsed->id, classification.sessionStart};
+        Observed observed{parsed->id, classification.sessionStart};
         serverConnection.store(connection, std::memory_order_release);
 
         if (!validated.exchange(true)) {
@@ -142,6 +159,9 @@ std::optional<Observed> Observe(void* connection, const void* out) noexcept {
             Diagnostics::LogLine("info", "replay_capture_sample", std::format("session={} id={} bytes={}",
                 classification.session, parsed->id, header.size));
         }
+        // Chat diagnostics: what happens to the first Text packets after
+        // injection (sizes and flags only - chat content never reaches the log).
+        const bool logText = parsed->id == Modules::GamePacket::Text && textLogged.fetch_add(1) < LoggedTextPackets;
         // Copy the whole packet only when someone records or reads it - and
         // never while a replay is being watched.
         if (ReplayInjector::Running()) return observed;
@@ -151,11 +171,36 @@ std::optional<Observed> Observe(void* connection, const void* out) noexcept {
                 if (observer->WantsPacket(parsed->id)) { wanted = true; break; }
             }
         }
-        if (!wanted) return observed;
+        if (!wanted) {
+            if (logText) Diagnostics::LogLine("info", "chat_packet", std::format("bytes={} wanted=0", header.size));
+            return observed;
+        }
         ReplayPacketEvent event{SteadyClock::now(), classification.session, classification.sessionStart,
             classification.joinedFromStart, parsed->id, {}};
         if (!SafeMemory::ReadMsvcString(out, 0, event.bytes, MaxPacketBytes)) return observed;
         modules->Publish(event);
+        if (parsed->id == Modules::GamePacket::Text) {
+            const auto replacements = modules->EnabledModulesOf<IChatReplacementModule>();
+            const bool replacing = std::ranges::any_of(replacements,
+                [](const IChatReplacementModule* module) { return module->ReplacesVanillaChat(); });
+            if (replacing) {
+                const auto bytes = std::span(reinterpret_cast<const std::uint8_t*>(event.bytes.data()), event.bytes.size());
+                const auto packet = Modules::SplitPacket(bytes);
+                const auto text = packet ? Modules::ParseText(packet->body) : std::nullopt;
+                // Only lines the replacement actually shows are held back.
+                observed.chatReplaced = text && Modules::ChatLineFromText(*text).has_value();
+            }
+            if (logText) {
+                const auto bytes = std::span(reinterpret_cast<const std::uint8_t*>(event.bytes.data()), event.bytes.size());
+                const auto packet = Modules::SplitPacket(bytes);
+                const auto text = packet ? Modules::ParseText(packet->body) : std::nullopt;
+                Diagnostics::LogLine("info", "chat_packet", std::format(
+                    "bytes={} parsed={} type={} shown={} replacing={} heldBack={} head={}",
+                    event.bytes.size(), text.has_value(), text ? static_cast<int>(text->type) : -1,
+                    text && Modules::ChatLineFromText(*text).has_value(), replacing, observed.chatReplaced,
+                    TextHead(packet ? packet->body : std::span<const std::uint8_t>{})));
+            }
+        }
         return observed;
     } catch (...) {
         return std::nullopt;
@@ -246,6 +291,7 @@ int HookedReceive(void* connection, void* out, void* at) {
                         info.size(), info.find(ReplayBlockPack::PackUuid) != std::string::npos));
                 }
             }
+            if (observed && observed->chatReplaced) continue;
             if (!observed || ReplayInjector::OnServerPacket(key, observed->id, observed->sessionStart)
                     == ReplayInjector::Verdict::Pass) {
                 return status;

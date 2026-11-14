@@ -2,6 +2,8 @@
 
 #include "Oinkster/Module.hpp"
 #include "Oinkster/Modules/FrameStatistics.hpp"
+#include "Oinkster/MediaControlService.hpp"
+#include "Oinkster/UserResourcePacks.hpp"
 #include <chrono>
 #include <functional>
 #include <memory>
@@ -16,8 +18,13 @@ namespace Oinkster::Modules {
 struct SharedServices {
     std::shared_ptr<FrameHistory> frames = std::make_shared<FrameHistory>();
     std::shared_ptr<ProcessMemorySampler> memory = std::make_shared<ProcessMemorySampler>();
+    std::shared_ptr<IMediaControlService> media = MakeMediaControlService();
     // Wall clock for the Clock module; replaceable in tests.
     std::function<std::chrono::system_clock::time_point()> wallClock = [] { return std::chrono::system_clock::now(); };
+    // The player's own resource packs (UserResourcePacks); replaceable in tests.
+    std::function<std::vector<UserResourcePacks::Pack>()> installedPacks = [] { return UserResourcePacks::Installed(); };
+    std::function<std::shared_ptr<const std::vector<UserResourcePacks::Pack>>()> activePacks = [] { return UserResourcePacks::Current(); };
+    std::function<void(bool)> watchPacks = [](bool on) { on ? UserResourcePacks::Start() : UserResourcePacks::Stop(); };
 };
 
 // Common identity + settings plumbing. Every module guards its own mutable

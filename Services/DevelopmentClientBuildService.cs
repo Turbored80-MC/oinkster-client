@@ -18,18 +18,18 @@ public static class DevelopmentClientBuildService
     /// launcher cross-checks it after injection.
     /// </para>
     /// </summary>
-    public const string SupportedBedrockVersion = "1.26.5203.0";
+    public const string SupportedBedrockVersion = "1.26.6301.0";
 
-    public static InstalledClientBuild? TryLoad()
+    public static InstalledClientBuild? TryLoad(string? applicationDirectory = null)
     {
-#if DEBUG
-        var baseDirectory = new DirectoryInfo(AppContext.BaseDirectory);
+        applicationDirectory ??= AppContext.BaseDirectory;
+        var baseDirectory = new DirectoryInfo(applicationDirectory);
         var externalDevelopmentPath = baseDirectory.Name.Equals("AppX", StringComparison.OrdinalIgnoreCase)
-            ? Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "Native-v3", "oinkster-client-x64.dll"))
+            ? Path.GetFullPath(Path.Combine(applicationDirectory, "..", "Native-v3", "oinkster-client-x64.dll"))
             : null;
         var dllPath = externalDevelopmentPath is not null && File.Exists(externalDevelopmentPath)
             ? externalDevelopmentPath
-            : Path.Combine(AppContext.BaseDirectory, "Native-v3", "oinkster-client-x64.dll");
+            : Path.Combine(applicationDirectory, "Native-v3", "oinkster-client-x64.dll");
         if (!File.Exists(dllPath))
         {
             return null;
@@ -37,12 +37,9 @@ public static class DevelopmentClientBuildService
 
         var hash = Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(dllPath)));
         return new InstalledClientBuild(
-            "0.1.0-dev",
+            AppVersion.Number.ToString(3),
             dllPath,
             hash,
             new BedrockCompatibility(SupportedBedrockVersion));
-#else
-        return null;
-#endif
     }
 }

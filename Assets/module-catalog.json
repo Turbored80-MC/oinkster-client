@@ -17,6 +17,7 @@
     {"id": "direction", "name": "Direction", "description": "Facing direction and yaw.", "category": "Telemetry", "hud": true, "capabilities": ["local-player-rotation"], "available": true},
     {"id": "movement-speed", "name": "Movement speed", "description": "Observed player movement speed.", "category": "Telemetry", "hud": true, "capabilities": ["local-player-position"], "available": true},
     {"id": "clock", "name": "Clock", "description": "Local system time.", "category": "Status", "hud": true, "capabilities": [], "available": true},
+    {"id": "now-playing", "name": "Now playing", "description": "Shows and controls the current Windows media session.", "category": "Status", "hud": true, "capabilities": [], "available": true},
     {"id": "stopwatch", "name": "Stopwatch", "description": "A local stopwatch with start, pause, and reset.", "category": "Status", "hud": true, "capabilities": [], "available": true},
     {"id": "session-statistics", "name": "Session statistics", "description": "Session duration, input totals, and distance travelled.", "category": "Status", "hud": true, "capabilities": ["local-input"], "available": true},
     {"id": "armor-status", "name": "Armor status", "description": "Per-slot armor durability.", "category": "Status", "hud": true, "capabilities": ["equipment"], "available": true},
@@ -24,8 +25,12 @@
     {"id": "item-counter", "name": "Item counter", "description": "Count of the selected item.", "category": "Status", "hud": true, "capabilities": ["inventory"], "available": true},
     {"id": "potion-effects", "name": "Potion effects", "description": "Active effect names, levels, and durations.", "category": "Status", "hud": true, "capabilities": ["effects"], "available": true},
     {"id": "server-display", "name": "Server display", "description": "Current server or world name.", "category": "Status", "hud": true, "capabilities": ["server-state"], "available": true},
-    {"id": "resource-pack-display", "name": "Resource pack display", "description": "Active resource-pack names.", "category": "Status", "hud": true, "capabilities": ["resource-packs"], "available": true},
+    {"id": "resource-pack-display", "name": "Resource pack display", "description": "Your active global resource packs, with their icons.", "category": "Status", "hud": true, "capabilities": [], "available": true},
     {"id": "replay-mod", "name": "Replay Mod", "description": "Records the worlds you join so you can watch them back from the Replays menu.", "category": "Status", "hud": false, "capabilities": ["packet-capture"], "available": true},
+    {"id": "screenshot", "name": "Screenshot", "description": "Saves a PNG of the game, optionally including the Oinkster HUD.", "category": "Status", "hud": false, "capabilities": ["frame-composition"], "available": true},
+    {"id": "saturation-hud", "name": "Saturation HUD", "description": "Shows hunger and hidden food saturation from validated attribute packets.", "category": "Status", "hud": true, "capabilities": ["packet-capture"], "available": true},
+    {"id": "scoreboard", "name": "Scoreboard", "description": "A movable sidebar scoreboard decoded from server packets.", "category": "Status", "hud": true, "capabilities": ["packet-capture"], "available": true},
+    {"id": "attack-indicator", "name": "Attack indicator", "description": "A visual local attack-recovery timer with confirmed-hit feedback.", "category": "PvP feedback", "hud": true, "capabilities": ["local-input"], "available": true},
     {"id": "combo-counter", "name": "Combo counter", "description": "Confirmed consecutive hits.", "category": "PvP feedback", "hud": true, "capabilities": ["combat-events"], "available": true},
     {"id": "hit-distance", "name": "Hit distance", "description": "Distance of the last confirmed hit.", "category": "PvP feedback", "hud": true, "capabilities": ["combat-events"], "available": true},
     {"id": "equipment-warnings", "name": "Equipment warnings", "description": "Warns about low equipment durability.", "category": "PvP feedback", "hud": true, "capabilities": ["equipment"], "available": true},
@@ -57,9 +62,14 @@
     {"id": "snap-look", "name": "Snap look", "description": "Hold a key to look behind you without changing your perspective setting.", "category": "Visual", "hud": false, "capabilities": ["perspective-presentation"], "available": true},
     {"id": "chunk-borders", "name": "Chunk borders", "description": "Draws Java-style chunk borders around you.", "category": "Visual", "hud": false, "capabilities": ["camera-presentation", "local-player-position"], "available": true},
     {"id": "post-processing", "name": "Post processing", "description": "Local colour grading: saturation, contrast, brightness, sharpen, tint, and vignette.", "category": "Visual", "hud": false, "capabilities": ["frame-composition"], "available": true},
+    {"id": "menu-blur", "name": "Menu blur", "description": "Blurs and dims the game behind in-game screens.", "category": "Visual", "hud": false, "capabilities": ["frame-composition"], "available": true},
+    {"id": "waypoints", "name": "Waypoints", "description": "Persistent world markers with distance and edge indicators.", "category": "Visual", "hud": true, "capabilities": ["camera-presentation", "local-player-position"], "available": true},
     {"id": "debug-menu", "name": "Debug menu", "description": "A Java-style F3 overlay with coordinates, chunk, facing, targeted block, and performance.", "category": "Telemetry", "hud": false, "capabilities": ["local-player-position"], "available": true},
     {"id": "player-list", "name": "Player list", "description": "A Java-style tab list of everyone on the server, with their heads.", "category": "Status", "hud": false, "capabilities": ["packet-capture"], "available": true},
     {"id": "hive-utils", "name": "Hive utils", "description": "The Hive helpers: auto re-queue, party and friend invites, map votes, and join codes.", "category": "Status", "hud": true, "capabilities": ["packet-capture", "packet-send", "server-state"], "available": true},
-    {"id": "skin-grabber", "name": "Skin grabber", "description": "Saves the skin of the player you look at, or wears it yourself.", "category": "Status", "hud": false, "capabilities": ["packet-capture", "packet-send"], "available": true}
+    {"id": "skin-grabber", "name": "Skin grabber", "description": "Saves the skin of the player you look at, or wears it yourself.", "category": "Status", "hud": false, "capabilities": ["packet-capture", "packet-send"], "available": true},
+    {"id": "fps-boost", "name": "FPS Boost", "description": "Gives Minecraft more CPU time: higher process priority, no power throttling, and a 1 ms timer.", "category": "Performance", "hud": false, "capabilities": [], "available": true},
+    {"id": "moveable-chat", "name": "Moveable chat", "description": "Replaces the game chat with a draggable one; the Java preset grows upward from the bottom-left and fades.", "category": "Accessibility", "hud": true, "capabilities": ["packet-capture"], "available": true},
+    {"id": "low-fire", "name": "Low Fire", "description": "Lowers the first-person fire overlay so burning covers less of the screen.", "category": "Visual", "hud": false, "capabilities": ["fire-overlay-presentation"], "available": false, "unavailableReason": "The first-person fire overlay hook has not been found for Minecraft 26.63 yet."}
   ]
 }

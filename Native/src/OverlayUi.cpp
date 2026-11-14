@@ -3,11 +3,12 @@
 #include "Oinkster/ModuleManager.hpp"
 #include "Oinkster/Dx12Overlay.hpp"
 #include "Oinkster/Diagnostics.hpp"
-#include "Oinkster/MouseInputBlocker.hpp"
 #include "Oinkster/ReplayInjector.hpp"
 #include "Oinkster/ReplayWorld.hpp"
 #include "Oinkster/ReplayTimeline.hpp"
 #include "Oinkster/SettingsStore.hpp"
+#include "Oinkster/UserResourcePacks.hpp"
+#include "Oinkster/ResourcePackReloadAdapter.hpp"
 #include "Oinkster/WorldTelemetry.hpp"
 #include "Oinkster/SkinHead.hpp"
 #include "Oinkster/VideoRecorder.hpp"
@@ -72,7 +73,6 @@ Clock::time_point sessionStarted{};
 std::atomic_bool sessionActive{};
 ControlCapture controlCapture{};
 std::string controlMessage;
-bool showCapabilities{};
 SkinHeadTexture playerHeadTexture{};
 std::uint64_t playerHeadRevision{};
 bool playerHeadReady{};
@@ -85,6 +85,14 @@ std::string pendingDeleteProfile;
 std::string profileMessage;
 bool profileMessageIsError{};
 std::array<char, 33> newProfileName{};
+std::optional<UserResourcePacks::Snapshot> packSnapshot;
+std::vector<std::string> stagedPackUuids;
+std::array<char, 96> packSearch{};
+Clock::time_point packFileCheckedAt{};
+bool packEditsDirty{};
+bool packFileConflict{};
+std::string packMessage;
+bool packMessageIsError{};
 float headYaw{};
 float headPitch{8.0F};
 float headYawVelocity{};
@@ -1937,11 +1945,6 @@ void DrawCubeLayer(ImDrawList* draw, ImVec2 center, float size, float yaw, float
     }
 }
 
-bool SkinReady() {
-    std::scoped_lock lock(playerHeadMutex);
-    return playerHeadReady;
-}
-
 // Stand-in head used until PlayerSkinTelemetry delivers the real skin (and if
 // it never does - e.g. the pattern scan missed on this Minecraft build). The
 // home hub previously drew nothing at all in that window, leaving its three
@@ -2164,7 +2167,61 @@ void DrawKeyRows(const std::string& moduleId, const std::vector<std::vector<HudK
     ImGui::Dummy(ImVec2(totalWidth, y - origin.y));
 }
 
-bool DrawHud(ModuleManager& modules, bool editMode) {
+// An ArgbImage as solid cells (no texture upload needed for icon-sized
+// images). Cell edges are snapped to whole pixels so neighbours never leave
+// seams, and runs of one color in a row become one rectangle.
+void DrawArgbImage(ImDrawList* draw, const ArgbImage& image, ImVec2 origin, float size) {
+    if (!image.Valid()) return;
+    const float cell = size / static_cast<float>(std::max(image.width, image.height));
+    const float left = origin.x + (size - cell * static_cast<float>(image.width)) * 0.5F;
+    const float top = origin.y + (size - cell * static_cast<float>(image.height)) * 0.5F;
+    const auto edgeX = [&](std::uint32_t column) { return std::floor(left + cell * static_cast<float>(column) + 0.5F); };
+    const auto edgeY = [&](std::uint32_t row) { return std::floor(top + cell * static_cast<float>(row) + 0.5F); };
+    for (std::uint32_t row = 0; row < image.height; ++row) {
+        const auto* pixels = image.pixels.data() + static_cast<std::size_t>(row) * image.width;
+        for (std::uint32_t column = 0; column < image.width;) {
+            const std::uint32_t argb = pixels[column];
+            std::uint32_t end = column + 1;
+            while (end < image.width && pixels[end] == argb) ++end;
+            if ((argb >> 24U) != 0) {
+                draw->AddRectFilled(ImVec2(edgeX(column), edgeY(row)), ImVec2(edgeX(end), edgeY(row + 1)), FromArgb(argb));
+            }
+            column = end;
+        }
+    }
+}
+
+// Java-chat style lines: wrapped at a fixed width, each with its own backdrop
+// strip, faded by the line's alpha.
+void DrawWrappedHudLines(const HudContent& content, const HudLayout& layout) {
+    const float scale = layout.scale;
+    const float width = content.wrapWidth * scale;
+    const float padX = 4.0F * scale;
+    const float padY = 1.0F * scale;
+    auto* draw = ImGui::GetWindowDrawList();
+    for (const auto& line : content.lines) {
+        const float alpha = std::clamp(line.alpha, 0.0F, 1.0F);
+        const ImVec2 start = ImGui::GetCursorScreenPos();
+        const ImVec2 textSize = ImGui::CalcTextSize(line.text.c_str(), nullptr, false, width);
+        const float height = textSize.y + padY * 2.0F;
+        if (content.lineBackdrops && layout.background) {
+            draw->AddRectFilled(start, ImVec2(start.x + width + padX * 2.0F, start.y + height),
+                WithAlpha(FromArgb(layout.backgroundColor), layout.backgroundOpacity * alpha * 0.6F));
+        }
+        ImGui::SetCursorScreenPos(ImVec2(start.x + padX, start.y + padY));
+        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + width);
+        ImGui::PushStyleColor(ImGuiCol_Text, ToVec4(WithAlpha(ToneColor(line.tone, layout), alpha)));
+        ImGui::TextUnformatted(line.text.c_str());
+        ImGui::PopStyleColor();
+        ImGui::PopTextWrapPos();
+        ImGui::SetCursorScreenPos(ImVec2(start.x, start.y + height));
+    }
+    ImGui::Dummy(ImVec2(width + padX * 2.0F, 0.0F));
+}
+
+// gameplayVisible: the in-world HUD is showing. Otherwise (a game screen such
+// as chat owns the cursor) only content marked overGameScreens is drawn.
+bool DrawHud(ModuleManager& modules, bool editMode, bool gameplayVisible) {
     bool dirty{};
     const auto display = ImGui::GetIO().DisplaySize;
     auto hudModules = modules.EnabledHudModules();
@@ -2176,9 +2233,12 @@ bool DrawHud(ModuleManager& modules, bool editMode) {
         // A module with nothing to say right now (e.g. "hide when OK") takes
         // no space - except in edit mode, where it must stay draggable.
         if (empty && !editMode) continue;
+        if (!gameplayVisible && !editMode && !content.overGameScreens) continue;
         auto layout = module->Layout();
-        if (!editMode) ImGui::SetNextWindowPos(ImVec2(layout.normalizedX * display.x, layout.normalizedY * display.y), ImGuiCond_Always);
-        else ImGui::SetNextWindowPos(ImVec2(layout.normalizedX * display.x, layout.normalizedY * display.y), ImGuiCond_Appearing);
+        // Bottom-anchored widgets store their bottom edge in normalizedY.
+        const ImVec2 pivot(0.0F, content.anchorBottom ? 1.0F : 0.0F);
+        const ImVec2 anchor(layout.normalizedX * display.x, layout.normalizedY * display.y);
+        ImGui::SetNextWindowPos(anchor, editMode ? ImGuiCond_Appearing : ImGuiCond_Always, pivot);
         // Bare content (key grids) draws its own tiles; a panel behind them
         // only adds a box around the keys. Edit mode keeps the border so it
         // can still be found and dragged.
@@ -2204,11 +2264,29 @@ bool DrawHud(ModuleManager& modules, bool editMode) {
         ImGui::Begin(id.c_str(), nullptr, flags);
         ImGui::SetWindowFontScale(layout.scale);
         if (empty) ImGui::TextColored(ToVec4(Muted), "%s", Narrow(module->Metadata().name).c_str());
-        for (const auto& line : content.lines) {
-            ImGui::PushStyleColor(ImGuiCol_Text, ToVec4(ToneColor(line.tone, layout)));
-            ImGui::TextUnformatted(line.text.c_str());
-            ImGui::PopStyleColor();
+        const bool icon = content.icon && content.icon->Valid() && !content.lines.empty();
+        if (icon) {
+            // Icon on the left, the lines centered against it.
+            const float iconSize = std::round(ImGui::GetFontSize() * 2.2F);
+            const float top = ImGui::GetCursorPosY();
+            DrawArgbImage(ImGui::GetWindowDrawList(), *content.icon, ImGui::GetCursorScreenPos(), iconSize);
+            ImGui::Dummy(ImVec2(iconSize, iconSize));
+            ImGui::SameLine(0.0F, 8.0F * layout.scale);
+            const float textHeight = static_cast<float>(content.lines.size()) * ImGui::GetTextLineHeightWithSpacing()
+                - ImGui::GetStyle().ItemSpacing.y;
+            ImGui::SetCursorPosY(top + std::max(0.0F, (iconSize - textHeight) * 0.5F));
+            ImGui::BeginGroup();
         }
+        if (content.wrapWidth > 0.0F && !icon) {
+            DrawWrappedHudLines(content, layout);
+        } else {
+            for (const auto& line : content.lines) {
+                ImGui::PushStyleColor(ImGuiCol_Text, ToVec4(WithAlpha(ToneColor(line.tone, layout), line.alpha)));
+                ImGui::TextUnformatted(line.text.c_str());
+                ImGui::PopStyleColor();
+            }
+        }
+        if (icon) ImGui::EndGroup();
         if (!content.keyRows.empty()) DrawKeyRows(module->Metadata().id, content.keyRows, layout);
         if (content.graph && !content.graph->values.empty()) {
             const auto& graph = *content.graph;
@@ -2218,6 +2296,14 @@ bool DrawHud(ModuleManager& modules, bool editMode) {
                 graph.caption.empty() ? nullptr : graph.caption.c_str(), graph.minimum, graph.maximum,
                 ImVec2(220.0F * layout.scale, 62.0F * layout.scale));
             ImGui::PopStyleColor(2);
+        }
+        // Widgets stay fully on screen, including mid-drag in edit mode.
+        {
+            const ImVec2 current = ImGui::GetWindowPos();
+            const ImVec2 extent = ImGui::GetWindowSize();
+            const ImVec2 clamped(std::clamp(current.x, 0.0F, std::max(0.0F, display.x - extent.x)),
+                std::clamp(current.y, 0.0F, std::max(0.0F, display.y - extent.y)));
+            if (clamped.x != current.x || clamped.y != current.y) ImGui::SetWindowPos(clamped);
         }
         const auto position = ImGui::GetWindowPos();
         const auto size = ImGui::GetWindowSize();
@@ -2229,8 +2315,10 @@ bool DrawHud(ModuleManager& modules, bool editMode) {
             HudLayout next = layout;
             next.normalizedX = std::clamp(position.x / std::max(display.x, 1.0F), 0.0F,
                 std::max(0.0F, 1.0F - size.x / std::max(display.x, 1.0F)));
-            next.normalizedY = std::clamp(position.y / std::max(display.y, 1.0F), 0.0F,
-                std::max(0.0F, 1.0F - size.y / std::max(display.y, 1.0F)));
+            const float heightFraction = size.y / std::max(display.y, 1.0F);
+            next.normalizedY = content.anchorBottom
+                ? std::clamp((position.y + size.y) / std::max(display.y, 1.0F), std::min(1.0F, heightFraction), 1.0F)
+                : std::clamp(position.y / std::max(display.y, 1.0F), 0.0F, std::max(0.0F, 1.0F - heightFraction));
             if (next.normalizedX != layout.normalizedX || next.normalizedY != layout.normalizedY) {
                 module->SetLayout(next);
                 dirty = true;
@@ -2956,7 +3044,7 @@ void DrawModulePanel(ModuleManager& modules, const ModuleMetadata& metadata, flo
         if (!metadata.available) CaptionText(Muted, "Saved now, applied once the module is available.");
         const auto reader = modules.SettingsFor(metadata.id);
         for (const auto& descriptor : module->Settings()) {
-            if (!IsSettingVisible(descriptor, reader)) continue;
+            if (!IsSettingVisible(descriptor, reader) || !module->IsSettingRelevant(descriptor.key)) continue;
             // A change can show or hide later rows; they appear next frame.
             if (DrawSettingControl(modules, metadata.id, descriptor, reader, form)) dirty = true;
         }
@@ -4292,6 +4380,149 @@ void DrawHudPage(ModuleManager& modules, bool& editMode, bool& dirty) {
     if (!any) CaptionText(Muted, "No HUD widgets are installed.");
 }
 
+void LoadPackEditor() {
+    auto snapshot = UserResourcePacks::LoadSnapshot();
+    stagedPackUuids.clear();
+    for (const auto& entry : snapshot.active) stagedPackUuids.push_back(entry.uuid);
+    packSnapshot = std::move(snapshot);
+    packEditsDirty = false;
+    packFileConflict = false;
+    packFileCheckedAt = Clock::now();
+}
+
+bool PackFileChanged() {
+    if (!packSnapshot || packSnapshot->path.empty()) return false;
+    std::error_code error;
+    if (!std::filesystem::exists(packSnapshot->path, error)) return packSnapshot->size != 0;
+    const auto written = std::filesystem::last_write_time(packSnapshot->path, error);
+    if (error || written != packSnapshot->written) return true;
+    const auto size = std::filesystem::file_size(packSnapshot->path, error);
+    return error || size != packSnapshot->size;
+}
+
+void DrawPackIcon(const UserResourcePacks::Pack& pack, const ImVec2 origin, const float edge) {
+    auto* draw = ImGui::GetWindowDrawList();
+    draw->AddRectFilled(origin, ImVec2(origin.x + edge, origin.y + edge), SurfaceRaised, 5.0F);
+    if (!pack.icon || pack.icon->pixels.empty() || pack.icon->width == 0 || pack.icon->height == 0) {
+        const std::string initial = Narrow(pack.name).substr(0, 1);
+        const ImVec2 size = BodyFont()->CalcTextSizeA(BodyFont()->FontSize, FLT_MAX, 0.0F, initial.c_str());
+        draw->AddText(BodyFont(), BodyFont()->FontSize,
+            ImVec2(origin.x + (edge - size.x) * 0.5F, origin.y + (edge - size.y) * 0.5F), Pink, initial.c_str());
+        return;
+    }
+    constexpr std::uint32_t Cells = 8;
+    const float cell = edge / static_cast<float>(Cells);
+    for (std::uint32_t y = 0; y < Cells; ++y) {
+        for (std::uint32_t x = 0; x < Cells; ++x) {
+            const auto sourceX = std::min(pack.icon->width - 1, x * pack.icon->width / Cells);
+            const auto sourceY = std::min(pack.icon->height - 1, y * pack.icon->height / Cells);
+            const ImU32 color = FromArgb(pack.icon->pixels[static_cast<std::size_t>(sourceY) * pack.icon->width + sourceX]);
+            draw->AddRectFilled(ImVec2(origin.x + x * cell, origin.y + y * cell),
+                ImVec2(origin.x + (x + 1) * cell + 0.5F, origin.y + (y + 1) * cell + 0.5F), color);
+        }
+    }
+}
+
+void DrawTexturePackSettings(ModuleManager& modules) {
+    if (!packSnapshot) LoadPackEditor();
+    const auto now = Clock::now();
+    if (now - packFileCheckedAt >= std::chrono::seconds(2)) {
+        packFileCheckedAt = now;
+        if (PackFileChanged()) {
+            if (packEditsDirty) packFileConflict = true;
+            else LoadPackEditor();
+        }
+    }
+
+    GroupLabel("Texture packs");
+    CaptionText(Muted, "Global Resources only. The top enabled pack has highest priority.");
+    ImGui::SetNextItemWidth(std::min(ImGui::GetContentRegionAvail().x, 420.0F));
+    ImGui::InputTextWithHint("##pack-search", "Search installed packs", packSearch.data(), packSearch.size());
+    if (!packSnapshot || !packSnapshot->Ready()) {
+        CaptionText(Amber, packSnapshot ? Narrow(packSnapshot->error).c_str() : "Loading texture packs...");
+        return;
+    }
+    if (packFileConflict) CaptionText(Amber, "Global Resources changed outside Oinkster. Revert before applying.");
+
+    std::string query(packSearch.data());
+    std::ranges::transform(query, query.begin(), [](const char value) {
+        return static_cast<char>(std::tolower(static_cast<unsigned char>(value)));
+    });
+    std::vector<const UserResourcePacks::Pack*> rows;
+    rows.reserve(packSnapshot->packs.size());
+    const auto appendMatching = [&](const std::string& uuid) {
+        const auto found = std::ranges::find_if(packSnapshot->packs, [&](const auto& pack) { return pack.uuid == uuid; });
+        if (found == packSnapshot->packs.end()) return;
+        std::string searchable = Narrow(found->name) + " " + Narrow(found->author) + " " + found->uuid;
+        std::ranges::transform(searchable, searchable.begin(), [](const char value) {
+            return static_cast<char>(std::tolower(static_cast<unsigned char>(value)));
+        });
+        if (query.empty() || searchable.find(query) != std::string::npos) rows.push_back(&*found);
+    };
+    for (const auto& uuid : stagedPackUuids) appendMatching(uuid);
+    for (const auto& pack : packSnapshot->packs) {
+        if (std::ranges::find(stagedPackUuids, pack.uuid) == stagedPackUuids.end()) appendMatching(pack.uuid);
+    }
+
+    ImGui::BeginChild("##texture-pack-list", ImVec2(std::min(ImGui::GetContentRegionAvail().x, 620.0F), 270.0F), true);
+    if (rows.empty()) CaptionText(Muted, query.empty() ? "No installed texture packs were found." : "No texture packs match your search.");
+    for (const auto* pack : rows) {
+        ImGui::PushID(pack->uuid.c_str());
+        constexpr float RowHeight = 56.0F;
+        const ImVec2 origin = ImGui::GetCursorScreenPos();
+        const float width = ImGui::GetContentRegionAvail().x;
+        const auto position = std::ranges::find(stagedPackUuids, pack->uuid);
+        const bool enabled = position != stagedPackUuids.end();
+        DrawPackIcon(*pack, ImVec2(origin.x + 8.0F, origin.y + 8.0F), 40.0F);
+        ImGui::GetWindowDrawList()->AddText(BodyFont(), BodyFont()->FontSize, ImVec2(origin.x + 58.0F, origin.y + 9.0F), Text,
+            Ellipsize(BodyFont(), Narrow(pack->name), std::max(40.0F, width - 210.0F)).c_str());
+        std::string metadata = pack->author.empty() ? Narrow(pack->version)
+            : "by " + Narrow(pack->author) + (pack->version.empty() ? "" : Dot + Narrow(pack->version));
+        ImGui::GetWindowDrawList()->AddText(CompactFont(), CompactFont()->FontSize, ImVec2(origin.x + 58.0F, origin.y + 31.0F), Muted,
+            Ellipsize(CompactFont(), metadata, std::max(40.0F, width - 210.0F)).c_str());
+        if (enabled) {
+            const auto index = static_cast<std::size_t>(std::distance(stagedPackUuids.begin(), position));
+            ImGui::SetCursorScreenPos(ImVec2(origin.x + width - 132.0F, origin.y + 14.0F));
+            ImGui::BeginDisabled(index == 0);
+            if (ImGui::SmallButton("^") && index > 0) { std::swap(stagedPackUuids[index], stagedPackUuids[index - 1]); packEditsDirty = true; }
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            ImGui::BeginDisabled(index + 1 >= stagedPackUuids.size());
+            if (ImGui::SmallButton("v") && index + 1 < stagedPackUuids.size()) { std::swap(stagedPackUuids[index], stagedPackUuids[index + 1]); packEditsDirty = true; }
+            ImGui::EndDisabled();
+        }
+        ImGui::SetCursorScreenPos(ImVec2(origin.x + width - 44.0F, origin.y + 18.0F));
+        if (Switch("##pack-enabled", enabled)) {
+            if (enabled) stagedPackUuids.erase(std::ranges::find(stagedPackUuids, pack->uuid));
+            else stagedPackUuids.push_back(pack->uuid);
+            packEditsDirty = true;
+            packMessage.clear();
+        }
+        ImGui::SetCursorScreenPos(ImVec2(origin.x, origin.y + RowHeight));
+        ImGui::Separator();
+        ImGui::PopID();
+    }
+    ImGui::EndChild();
+
+    const auto capability = modules.CapabilityStatusOf(Capability::ResourcePackReload);
+    const bool canApply = packEditsDirty && !packFileConflict && capability.IsAvailable()
+        && ResourcePackReloadAdapter::Available();
+    ImGui::BeginDisabled(!canApply);
+    if (PrimaryButton("Apply changes", ImVec2(126.0F, 0.0F))) {
+        const auto result = UserResourcePacks::ApplyStack(*packSnapshot, stagedPackUuids, ResourcePackReloadAdapter::Reload);
+        packMessage = Narrow(result.message);
+        packMessageIsError = !result.Succeeded();
+        if (result.Succeeded()) LoadPackEditor();
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!packEditsDirty && !packFileConflict);
+    if (ImGui::Button("Revert")) { LoadPackEditor(); packMessage = "Changes reverted."; packMessageIsError = false; }
+    ImGui::EndDisabled();
+    if (!capability.IsAvailable()) CaptionText(Amber, Narrow(capability.reason).c_str());
+    if (!packMessage.empty()) CaptionText(packMessageIsError ? Amber : Green, packMessage.c_str());
+}
+
 void DrawSettingsPage(ModuleManager& modules, bool& dirty) {
     PageHeader("Settings", nullptr);
     const Form form = MakeForm(std::min(ImGui::GetContentRegionAvail().x, 600.0F));
@@ -4346,60 +4577,36 @@ void DrawSettingsPage(ModuleManager& modules, bool& dirty) {
         CaptionText(Amber, controlMessage.c_str());
     }
 
-    // Live state rather than hardcoded labels, so problems are visible
-    // in-game instead of only in oinkster-native.log.
-    GroupLabel("Status");
-    const auto statusRow = [&](const char* label, bool ok, const char* detail, const char* tooltip = nullptr) {
-        const ImVec2 start = ImGui::GetCursorScreenPos();
-        const float lineHeight = ImGui::GetTextLineHeight();
-        ImGui::GetWindowDrawList()->AddCircleFilled(ImVec2(start.x + 4.0F, start.y + lineHeight * 0.5F), 3.5F, ok ? Green : Muted);
-        ImGui::SetCursorScreenPos(ImVec2(start.x + 16.0F, start.y));
-        ImGui::TextColored(ToVec4(Secondary), "%s", label);
-        if (tooltip && *tooltip && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tooltip);
-        ImGui::SameLine(0.0F, 0.0F);
-        ImGui::SetCursorScreenPos(ImVec2(start.x + form.labelWidth, start.y + 2.0F));
-        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + form.controlWidth);
-        CaptionText(Muted, detail);
-        ImGui::PopTextWrapPos();
-        ImGui::SetCursorScreenPos(ImVec2(start.x, ImGui::GetCursorScreenPos().y + 2.0F));
-    };
+    GroupLabel("Rendering");
+    const float renderRowX = ImGui::GetCursorScreenPos().x;
+    const bool vsyncOff = modules.ModuleSetting("click-gui.disable-vsync", "0") == "1";
+    if (FormSwitch(form, "Disable VSync", "##disable-vsync", vsyncOff,
+            "Presents frames without waiting for the display refresh.")) {
+        Dx12Overlay::SetVsyncDisabled(!vsyncOff);
+        dirty = true;
+    }
+    FormIndent(form, renderRowX);
+    const auto vsyncState = Dx12Overlay::CurrentVsyncState();
+    const char* vsyncStatus = "Normal Bedrock presentation";
+    ImU32 vsyncStatusColor = Muted;
+    if (vsyncState == VsyncState::Disabled) vsyncStatus = "Uncapped frame rate; may show screen tearing";
+    else if (vsyncState == VsyncState::RestartRequired) { vsyncStatus = "Restart Minecraft to apply"; vsyncStatusColor = Amber; }
+    else if (vsyncState == VsyncState::Unsupported) { vsyncStatus = "Tearing is not supported on this system"; vsyncStatusColor = Amber; }
+    CaptionText(vsyncStatusColor, vsyncStatus);
+    const bool latencySupported = Dx12Overlay::LowLatencySupported();
+    const bool lowLatency = latencySupported && modules.ModuleSetting("click-gui.low-latency", "0") == "1";
+    FormLabel(form, "Low latency mode", "Queues at most one frame ahead, cutting input lag.");
+    const ImVec2 latencyCursor = ImGui::GetCursorScreenPos();
+    ImGui::SetCursorScreenPos(ImVec2(latencyCursor.x, latencyCursor.y + (ImGui::GetFrameHeight() - 20.0F) * 0.5F));
+    if (Switch("##low-latency", lowLatency, latencySupported)) {
+        modules.SetModuleSetting("click-gui.low-latency", lowLatency ? "0" : "1");
+        dirty = true;
+    }
+    FormIndent(form, renderRowX);
+    CaptionText(Muted, latencySupported ? "One queued frame; can lower FPS slightly"
+                                        : "Not supported by this swapchain");
 
-    statusRow("Overlay", true, "Direct3D 12 present hook attached");
-    switch (MouseInputBlocker::State()) {
-    case MouseInputBlocker::InstallState::Ready:
-        statusRow("Input routing", true, "Window scoping and GameInput mouse guard");
-        break;
-    case MouseInputBlocker::InstallState::Initializing:
-        statusRow("Input routing", false, "Window scoping only - discovering GameInput");
-        break;
-    default:
-        statusRow("Input routing", false, "Window scoping only - GameInput guard unavailable");
-        break;
-    }
-    const auto telemetry = modules.CapabilityStatusOf(Capability::LocalPlayerPosition);
-    statusRow("World telemetry", telemetry.IsAvailable(), telemetry.IsAvailable()
-        ? "Camera position signature matched"
-        : telemetry.state == CapabilityState::Pending ? "Validating signature" : "Unavailable for this build");
-    statusRow("Player skin", SkinReady(), SkinReady()
-        ? "Equipped skin loaded from the game"
-        : "Not loaded yet - showing a placeholder head");
-
-    ImGui::Dummy(ImVec2(0.0F, 4.0F));
-    if (LinkButton("##toggle-capabilities", showCapabilities ? "Hide capabilities" : "Show all capabilities")) {
-        showCapabilities = !showCapabilities;
-    }
-    if (showCapabilities) {
-        ImGui::Dummy(ImVec2(0.0F, 2.0F));
-        const auto capabilities = modules.Capabilities();
-        for (std::size_t index = 0; index < capabilities.size(); ++index) {
-            const auto& status = capabilities[index];
-            const std::string name = Narrow(CapabilityName(static_cast<Capability>(index)));
-            const char* state = status.IsAvailable() ? "Available"
-                : status.state == CapabilityState::Pending ? "Checking" : "Unavailable";
-            const std::string reason = Narrow(status.reason);
-            statusRow(name.c_str(), status.IsAvailable(), state, reason.c_str());
-        }
-    }
+    DrawTexturePackSettings(modules);
 }
 
 void DrawEditOverlay(ModuleManager& modules, bool& editMode, bool& dirty) {
@@ -4442,6 +4649,12 @@ void BeginSession() noexcept {
     sessionStarted = Clock::now();
     sessionActive.store(true);
     search[0] = '\0';
+    packSearch[0] = '\0';
+    packSnapshot.reset();
+    stagedPackUuids.clear();
+    packEditsDirty = false;
+    packFileConflict = false;
+    packMessage.clear();
     expandedModule.clear();
     hudWindowStability.clear();
     if (moduleBrowser) {
@@ -4585,7 +4798,9 @@ DrawResult Draw(ModuleManager& modules, const DrawMode& mode, bool& hudEditMode,
     if (!menuVisible && gameplayHudVisible && !cleanShot) DrawDebugOverlays(modules, display);
     if (!menuVisible && gameplayHudVisible && !cleanShot) DrawPlayerLists(modules, display);
     if (!menuVisible && !cleanShot) DrawModuleNotices(modules, display);
-    if ((!menuVisible && gameplayHudVisible && !cleanShot) || hudEditMode) result.settingsDirty |= DrawHud(modules, hudEditMode);
+    if ((!menuVisible && !cleanShot) || hudEditMode) {
+        result.settingsDirty |= DrawHud(modules, hudEditMode, gameplayHudVisible || hudEditMode);
+    }
     if (!menuVisible) {
         menuWasVisible = false;
         return result;

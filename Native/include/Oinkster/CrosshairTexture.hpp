@@ -32,7 +32,11 @@ namespace Oinkster::CrosshairTexture {
 // header.uuid of a manifest.json (comments tolerated), lowercased.
 [[nodiscard]] std::optional<std::string> ManifestHeaderUuid(std::string_view manifest);
 // PNG -> ARGB via WIC; nullopt for anything else or images over 512 px.
-[[nodiscard]] std::optional<ArgbImage> DecodePng(std::span<const std::uint8_t> bytes) noexcept;
+// A nonzero fitWithin instead downscales larger images (up to 4096 px) to fit
+// a fitWithin x fitWithin box.
+[[nodiscard]] std::optional<ArgbImage> DecodePng(std::span<const std::uint8_t> bytes, std::uint32_t fitWithin = 0) noexcept;
+// Removes // and /* */ comments outside strings (Bedrock's JSON tolerates them).
+[[nodiscard]] std::string StripJsonComments(std::string_view text);
 
 // Worker lifecycle. Request is cheap and may be called every few seconds
 // from the render thread with the active packs, highest priority first;

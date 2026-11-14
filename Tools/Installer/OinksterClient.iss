@@ -1,13 +1,13 @@
 ; Builds OinksterClient-Setup-<version>.exe from a published launcher folder.
 ; Run it through Tools\New-Installer.ps1, which publishes the launcher first.
 ;
-;   ISCC.exe /DSourceDir=<publish dir> /DAppVersion=1.0.0 /DVersionLabel="1.0.0 Beta" /DOutputDir=<dir> OinksterClient.iss
+;   ISCC.exe /DSourceDir=<publish dir> /DAppVersion=1.1.0 /DVersionLabel="1.1.0 Beta" /DOutputDir=<dir> OinksterClient.iss
 
 #ifndef SourceDir
   #error SourceDir must point at the published launcher folder.
 #endif
 #ifndef AppVersion
-  #define AppVersion "1.0.0"
+  #define AppVersion "1.1.0"
 #endif
 #ifndef VersionLabel
   #define VersionLabel AppVersion

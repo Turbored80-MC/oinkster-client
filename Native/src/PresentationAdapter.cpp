@@ -1,6 +1,7 @@
 #include "Oinkster/PresentationAdapter.hpp"
 #include "Oinkster/CameraTelemetry.hpp"
 #include "Oinkster/Diagnostics.hpp"
+#include "Oinkster/Dx12Overlay.hpp"
 #include "Oinkster/EnttRegistry.hpp"
 #include "Oinkster/HookManager.hpp"
 #include "Oinkster/ModuleManager.hpp"
@@ -123,6 +124,18 @@ constexpr auto SnapshotLifetime = std::chrono::seconds(1);
 constexpr auto BoomProbeInterval = std::chrono::seconds(5);
 constexpr unsigned MaxBoomProbes = 12;
 
+// Exact-build Options layout also validated by CameraTelemetry. Flarial finds
+// this same entry by its translated name and writes BoolOption+0x10.
+constexpr std::size_t OptionsTable = 0x10;
+constexpr std::size_t MaximumOptionId = 0x335;
+constexpr std::size_t OptionImpl = 0x8;
+constexpr std::size_t OptionImplTranslateName = 0x158;
+constexpr std::size_t OptionImplTelemetryName = 0x1A8;
+constexpr std::size_t OptionImplId = 0x1CC;
+constexpr std::size_t BoolOptionValue = 0x10;
+constexpr std::string_view VsyncTranslateName = "options.vsync";
+constexpr std::string_view VsyncTelemetryName = "vsync";
+
 struct Hook {
     std::string_view name;
     void* target{};
@@ -131,6 +144,12 @@ struct Hook {
 std::atomic<ModuleManager*> moduleManager{};
 std::atomic_bool attached{};
 std::atomic_uint32_t activeCallbacks{};
+void* observedOptions{};
+void* vsyncOption{};
+std::uint32_t vsyncOptionId{};
+bool vsyncOptionOriginal{};
+bool vsyncOptionOriginalCaptured{};
+bool vsyncOptionSearchCompleted{};
 
 CameraUpdateFn originalCameraUpdate{};
 CameraLookupFn originalCameraLookup{};
@@ -256,6 +275,90 @@ bool WriteFloat(void* address, float value) noexcept {
     constexpr DWORD writable = PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
     if (information.State != MEM_COMMIT || (information.Protect & writable) == 0 || (information.Protect & PAGE_GUARD) != 0) return false;
     return SafeMemory::CopyGuarded(address, &value, sizeof(value));
+}
+
+bool WriteBool(void* address, const bool value) noexcept {
+    MEMORY_BASIC_INFORMATION information{};
+    if (!address || VirtualQuery(address, &information, sizeof(information)) != sizeof(information)) return false;
+    constexpr DWORD writable = PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    if (information.State != MEM_COMMIT || (information.Protect & writable) == 0 || (information.Protect & PAGE_GUARD) != 0) return false;
+    return SafeMemory::CopyGuarded(address, &value, sizeof(value));
+}
+
+bool IsVsyncOption(const void* option, const std::uint32_t expectedId, bool& value, std::string* telemetry = nullptr) noexcept {
+    const void* impl{};
+    std::uint32_t id{};
+    if (!option || !SafeMemory::ReadField(option, OptionImpl, impl) || !impl
+        || !SafeMemory::ReadField(impl, OptionImplId, id) || id != expectedId) return false;
+    try {
+        std::string translated;
+        if (!SafeMemory::ReadMsvcString(impl, OptionImplTranslateName, translated, 64)
+            || translated != VsyncTranslateName) return false;
+        if (telemetry) {
+            std::string observed;
+            if (SafeMemory::ReadMsvcString(impl, OptionImplTelemetryName, observed, 64)) *telemetry = std::move(observed);
+        }
+    } catch (...) {
+        return false;
+    }
+    return SafeMemory::ReadField(option, BoolOptionValue, value);
+}
+
+void RestoreVsyncOption() noexcept {
+    if (vsyncOption && vsyncOptionOriginalCaptured) {
+        bool current{};
+        if (IsVsyncOption(vsyncOption, vsyncOptionId, current) && current != vsyncOptionOriginal) {
+            (void)WriteBool(static_cast<std::uint8_t*>(vsyncOption) + BoolOptionValue, vsyncOptionOriginal);
+        }
+    }
+    observedOptions = nullptr;
+    vsyncOption = nullptr;
+    vsyncOptionId = 0;
+    vsyncOptionOriginal = false;
+    vsyncOptionOriginalCaptured = false;
+    vsyncOptionSearchCompleted = false;
+}
+
+void SynchronizeVsyncOption(void* options) noexcept {
+    if (!options) return;
+    if (observedOptions != options) {
+        // A new Options owner means the prior pointer is no longer safe to
+        // dereference. Its lifetime ended with the old game state.
+        observedOptions = options;
+        vsyncOption = nullptr;
+        vsyncOptionId = 0;
+        vsyncOptionOriginalCaptured = false;
+        vsyncOptionSearchCompleted = false;
+    }
+    if (!vsyncOption && !vsyncOptionSearchCompleted) {
+        vsyncOptionSearchCompleted = true;
+        for (std::uint32_t id = 0; id <= MaximumOptionId; ++id) {
+            void* candidate{};
+            if (!SafeMemory::ReadField(options, OptionsTable + static_cast<std::size_t>(id) * sizeof(void*), candidate)) break;
+            bool value{};
+            std::string telemetry;
+            if (!IsVsyncOption(candidate, id, value, &telemetry)) continue;
+            vsyncOption = candidate;
+            vsyncOptionId = id;
+            vsyncOptionOriginal = value;
+            vsyncOptionOriginalCaptured = true;
+            Diagnostics::LogLine("info", "vsync_option_validated", std::format(
+                "id={} telemetry={} original={}", id, telemetry.empty() ? "<empty>" : telemetry, value ? 1 : 0));
+            break;
+        }
+        if (!vsyncOption) Diagnostics::LogLine("warning", "vsync_option_unavailable", "options.vsync was not uniquely validated");
+    }
+    if (!vsyncOption) return;
+    bool current{};
+    if (!IsVsyncOption(vsyncOption, vsyncOptionId, current)) {
+        vsyncOption = nullptr;
+        return;
+    }
+    const bool wanted = !Dx12Overlay::VsyncDisabledRequested();
+    if (current == wanted) return;
+    if (WriteBool(static_cast<std::uint8_t*>(vsyncOption) + BoolOptionValue, wanted)) {
+        Diagnostics::LogLine("info", "vsync_option_transition", wanted ? "enabled" : "disabled");
+    }
 }
 
 // Writes a float the camera update reads and remembers the game's value so
@@ -646,6 +749,7 @@ void* HookedCameraUpdate(void* self, void* frame, float alpha, void* extra) {
 
 float HookedGamma(void* options) {
     const CallbackGuard callback;
+    SynchronizeVsyncOption(options);
     const float vanilla = originalGamma ? originalGamma(options) : 0.5F;
     if (!attached.load(std::memory_order_acquire)) return vanilla;
     if (std::isfinite(vanilla) && vanilla >= 0.0F && vanilla <= 1.5F) {
@@ -928,6 +1032,7 @@ void SetStatus(ModuleManager& modules, Capability capability, CapabilityState st
 }
 
 bool Install(ModuleManager& modules, std::wstring& detail) noexcept {
+    RestoreVsyncOption();
     const std::wstring build(SupportedBuild::DisplayVersion);
     const std::array<Target, 9> targets{{
         {"camera-update",
@@ -1058,6 +1163,9 @@ void Remove() noexcept {
         UnloadGuard::Block("presentation adapter trampoline still had a live thread at detach");
         return;
     }
+    // No option getter can be running now. Restore the captured Bedrock
+    // preference and release its pointer before the hook trampolines go away.
+    RestoreVsyncOption();
     for (auto& hook : hooks) {
         if (hook.target) (void)HookManager::Remove(hook.target);
         hook.target = nullptr;

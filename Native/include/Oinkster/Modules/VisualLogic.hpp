@@ -130,6 +130,10 @@ struct ScreenEffectsRequest {
     float nausea{};
 };
 
+// Low Fire: how far to lower the first-person fire overlay, as a fraction of
+// the screen height (Java's "low fire").
+struct LowFireRequest { float offset{}; };
+
 // Snap look: the perspective the game should render from while held.
 struct PerspectiveRequest { CameraPerspective perspective{CameraPerspective::ThirdPersonFront}; };
 // Asks the adapter to publish CameraPoseEvent every frame (and, with
@@ -153,6 +157,7 @@ struct PresentationProfile {
     std::optional<TimeRequest> time;
     std::optional<WeatherRequest> weather;
     std::optional<ScreenEffectsRequest> screenEffects;
+    std::optional<LowFireRequest> lowFire;
 };
 
 class IPresentationModule {
@@ -189,6 +194,14 @@ struct CameraView {
     float verticalFov{};
 };
 [[nodiscard]] CameraView ViewOf(const CameraPoseEvent& pose) noexcept;
+
+struct ProjectedPoint {
+    float x{};
+    float y{};
+    float depth{};
+};
+[[nodiscard]] std::optional<ProjectedPoint> ProjectPoint(const CameraView& view,
+    const std::array<float, 3>& point, float width, float height) noexcept;
 
 // Projects a world-space segment, clipped against the near plane; nothing
 // when it lies wholly behind the camera or the view is implausible.

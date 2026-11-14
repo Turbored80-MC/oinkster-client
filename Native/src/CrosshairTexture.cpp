@@ -29,6 +29,7 @@ constexpr std::size_t BrarchiveEntry = 256;
 constexpr std::size_t BrarchiveNameCapacity = 247;
 constexpr std::uint32_t MaxBrarchiveEntries = 1U << 16;
 constexpr std::uint32_t MaxImageEdge = 512;
+constexpr std::uint32_t MaxScaledSourceEdge = 4096;
 constexpr std::uintmax_t MaxManifestBytes = 256 * 1024;
 constexpr std::uintmax_t MaxPngBytes = 4 * 1024 * 1024;
 constexpr std::uintmax_t MaxArchiveBytes = 64 * 1024 * 1024;
@@ -41,8 +42,9 @@ std::uint32_t ReadU32(std::span<const std::uint8_t> bytes, std::size_t offset) n
     return value;
 }
 
-// Removes // and /* */ comments outside strings (Bedrock tolerates them).
-std::string StripComments(std::string_view text) {
+}
+
+std::string StripJsonComments(std::string_view text) {
     std::string result;
     result.reserve(text.size());
     bool inString = false;
@@ -70,6 +72,8 @@ std::string StripComments(std::string_view text) {
     }
     return result;
 }
+
+namespace {
 
 std::optional<std::vector<std::uint8_t>> ReadFileBytes(const fs::path& path, std::uintmax_t limit) {
     std::error_code error;
@@ -240,7 +244,7 @@ std::string FormatPackUuid(std::uint64_t high, std::uint64_t low) {
 }
 
 std::optional<std::string> ManifestHeaderUuid(std::string_view manifest) {
-    const auto parsed = Json::Parse(StripComments(manifest));
+    const auto parsed = Json::Parse(StripJsonComments(manifest));
     if (!parsed) return std::nullopt;
     const auto* header = parsed->Find("header");
     const auto* uuid = header ? header->Find("uuid") : nullptr;
@@ -253,7 +257,7 @@ std::optional<std::string> ManifestHeaderUuid(std::string_view manifest) {
     return lowered;
 }
 
-std::optional<ArgbImage> DecodePng(std::span<const std::uint8_t> bytes) noexcept {
+std::optional<ArgbImage> DecodePng(std::span<const std::uint8_t> bytes, std::uint32_t fitWithin) noexcept {
     constexpr std::array<std::uint8_t, 8> signature{0x89, 'P', 'N', 'G', '\r', '\n', 0x1A, '\n'};
     if (bytes.size() < signature.size() || bytes.size() > MaxPngBytes
         || !std::equal(signature.begin(), signature.end(), bytes.begin())) {
@@ -267,6 +271,7 @@ std::optional<ArgbImage> DecodePng(std::span<const std::uint8_t> bytes) noexcept
             ComPtr<IWICStream> stream;
             ComPtr<IWICBitmapDecoder> decoder;
             ComPtr<IWICBitmapFrameDecode> frame;
+            ComPtr<IWICBitmapScaler> scaler;
             ComPtr<IWICFormatConverter> converter;
             UINT width{};
             UINT height{};
@@ -275,8 +280,21 @@ std::optional<ArgbImage> DecodePng(std::span<const std::uint8_t> bytes) noexcept
                 && SUCCEEDED(stream->InitializeFromMemory(const_cast<BYTE*>(bytes.data()), static_cast<DWORD>(bytes.size())))
                 && SUCCEEDED(factory->CreateDecoderFromStream(stream.Get(), nullptr, WICDecodeMetadataCacheOnLoad, &decoder))
                 && SUCCEEDED(decoder->GetFrame(0, &frame))
+                && SUCCEEDED(frame->GetSize(&width, &height));
+            IWICBitmapSource* source = frame.Get();
+            if (success && fitWithin != 0 && (width > fitWithin || height > fitWithin)) {
+                // Downscale to fit, keeping the aspect ratio.
+                const double factor = static_cast<double>(fitWithin) / static_cast<double>(std::max(width, height));
+                const auto scaledWidth = std::max<UINT>(1, static_cast<UINT>(width * factor + 0.5));
+                const auto scaledHeight = std::max<UINT>(1, static_cast<UINT>(height * factor + 0.5));
+                success = width <= MaxScaledSourceEdge && height <= MaxScaledSourceEdge
+                    && SUCCEEDED(factory->CreateBitmapScaler(&scaler))
+                    && SUCCEEDED(scaler->Initialize(frame.Get(), scaledWidth, scaledHeight, WICBitmapInterpolationModeFant));
+                source = scaler.Get();
+            }
+            success = success
                 && SUCCEEDED(factory->CreateFormatConverter(&converter))
-                && SUCCEEDED(converter->Initialize(frame.Get(), GUID_WICPixelFormat32bppRGBA, WICBitmapDitherTypeNone, nullptr, 0.0,
+                && SUCCEEDED(converter->Initialize(source, GUID_WICPixelFormat32bppRGBA, WICBitmapDitherTypeNone, nullptr, 0.0,
                     WICBitmapPaletteTypeCustom))
                 && SUCCEEDED(converter->GetSize(&width, &height))
                 && width != 0 && height != 0 && width <= MaxImageEdge && height <= MaxImageEdge;

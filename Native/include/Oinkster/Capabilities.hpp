@@ -31,6 +31,7 @@ enum class Capability : std::uint8_t {
     NetworkMetrics,
     ServerState,
     ResourcePacks,
+    ResourcePackReload,
     CombatEvents,
     SelectedBlockRender,
     DamageRender,
@@ -48,6 +49,7 @@ enum class Capability : std::uint8_t {
     PacketCapture,        // Decoded incoming game packets (NetworkConnection::receivePacket)
     PerspectivePresentation,
     PacketSend,
+    FireOverlayPresentation, // First-person on-fire overlay (Low Fire); no reviewed hook yet
     Count
 };
 

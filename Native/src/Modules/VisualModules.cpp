@@ -250,6 +250,25 @@ CameraView ViewOf(const CameraPoseEvent& pose) noexcept {
     return {pose.position, pose.rotation, pose.verticalFov};
 }
 
+std::optional<ProjectedPoint> ProjectPoint(const CameraView& view,
+    const std::array<float, 3>& point, float width, float height) noexcept {
+    namespace CM = CameraMath;
+    if (width <= 0.0F || height <= 0.0F || !(view.verticalFov > 0.01F && view.verticalFov < 3.1F)) return std::nullopt;
+    const CM::Quat rotation{view.rotation[0], view.rotation[1], view.rotation[2], view.rotation[3]};
+    if (!CM::IsFinite(rotation)) return std::nullopt;
+    const CM::Quat toCamera{-rotation.x, -rotation.y, -rotation.z, rotation.w};
+    const CM::Float3 eye{view.position[0], view.position[1], view.position[2]};
+    const auto camera = CM::Rotate(toCamera, CM::Float3{point[0], point[1], point[2]} - eye);
+    const float depth = -camera.z;
+    if (!(depth >= 0.05F)) return std::nullopt;
+    const float tanHalf = std::tan(view.verticalFov * 0.5F);
+    const float aspect = width / height;
+    const float x = ((camera.x / depth) / (tanHalf * aspect) + 1.0F) * 0.5F * width;
+    const float y = (1.0F - (camera.y / depth) / tanHalf) * 0.5F * height;
+    if (!std::isfinite(x) || !std::isfinite(y)) return std::nullopt;
+    return ProjectedPoint{x, y, depth};
+}
+
 std::optional<OverlayLine> ProjectSegment(const CameraView& view, const std::array<float, 3>& from,
     const std::array<float, 3>& to, float width, float height, std::uint32_t argb, float thickness) noexcept {
     namespace CM = CameraMath;
@@ -787,6 +806,21 @@ private:
     ScreenEffectsRequest request_{};
 };
 
+class LowFireModule final : public VisualModule<IPresentationModule> {
+public:
+    LowFireModule(ModuleMetadata metadata, HudLayout, SharedServices&)
+        : VisualModule(std::move(metadata), {
+            FloatSetting("height-offset", "Lower by", 30.0, 0.0, 60.0, "%.0f%%", "How far the flames drop, as a share of the screen height.")}) {}
+    void OnSettingsChanged(const SettingsReader& settings) override {
+        std::scoped_lock lock(mutex_);
+        request_.offset = settings.Float("height-offset") / 100.0F;
+    }
+    void Contribute(PresentationProfile& profile) const override { std::scoped_lock lock(mutex_); profile.lowFire = request_; }
+
+private:
+    LowFireRequest request_{0.3F};
+};
+
 class HurtCameraModule final : public VisualModule<IPresentationModule> {
 public:
     HurtCameraModule(ModuleMetadata metadata, HudLayout, SharedServices&)
@@ -817,6 +851,7 @@ std::unique_ptr<IModule> MakeFullbright(ModuleMetadata m, HudLayout l, SharedSer
 std::unique_ptr<IModule> MakeTimeChanger(ModuleMetadata m, HudLayout l, SharedServices& s) { return std::make_unique<TimeChangerModule>(std::move(m), l, s); }
 std::unique_ptr<IModule> MakeWeatherSuppression(ModuleMetadata m, HudLayout l, SharedServices& s) { return std::make_unique<WeatherSuppressionModule>(std::move(m), l, s); }
 std::unique_ptr<IModule> MakeScreenOverlaySuppression(ModuleMetadata m, HudLayout l, SharedServices& s) { return std::make_unique<ScreenOverlaySuppressionModule>(std::move(m), l, s); }
+std::unique_ptr<IModule> MakeLowFire(ModuleMetadata m, HudLayout l, SharedServices& s) { return std::make_unique<LowFireModule>(std::move(m), l, s); }
 std::unique_ptr<IModule> MakeHurtCamera(ModuleMetadata m, HudLayout l, SharedServices& s) { return std::make_unique<HurtCameraModule>(std::move(m), l, s); }
 
 }

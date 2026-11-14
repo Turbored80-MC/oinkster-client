@@ -8,6 +8,7 @@
 #include "Oinkster/ReplayPacketBridge.hpp"
 #include "Oinkster/ReplayInjector.hpp"
 #include "Oinkster/ReplayWorld.hpp"
+#include "Oinkster/ResourcePackReloadAdapter.hpp"
 #include "Oinkster/ScreenTelemetry.hpp"
 #include "Oinkster/SessionTelemetry.hpp"
 #include "Oinkster/SoundTelemetry.hpp"
@@ -126,6 +127,20 @@ private:
     static constexpr std::array capabilities_{Capability::PacketCapture};
 };
 
+class ResourceReloadAdapter final : public ICapabilityAdapter {
+public:
+    [[nodiscard]] std::string_view Name() const noexcept override { return "resource-pack-reload"; }
+    [[nodiscard]] std::span<const Capability> Capabilities() const noexcept override { return capabilities_; }
+    [[nodiscard]] CapabilityAdapterResult Install(ModuleManager& modules) noexcept override {
+        std::wstring detail;
+        return {ResourcePackReloadAdapter::Install(modules, detail), std::move(detail)};
+    }
+    void Remove() noexcept override { ResourcePackReloadAdapter::Remove(); }
+
+private:
+    static constexpr std::array capabilities_{Capability::ResourcePackReload};
+};
+
 std::string NarrowAscii(std::wstring_view value) {
     std::string result;
     result.reserve(value.size());
@@ -160,6 +175,7 @@ bool Install(ModuleManager& modules, std::wstring& detail) noexcept {
         adapters.push_back(std::make_unique<PacketSendAdapter>());
         adapters.push_back(std::make_unique<PacketCaptureAdapter>());
         adapters.push_back(std::make_unique<PresentationRenderAdapter>());
+        adapters.push_back(std::make_unique<ResourceReloadAdapter>());
         for (auto& adapter : adapters) {
             const auto result = adapter->Install(modules);
             Diagnostics::LogLine(result.installed ? "info" : "warn",

@@ -20,12 +20,17 @@ inline constexpr std::uint32_t StartGame = 11;
 inline constexpr std::uint32_t AddPlayer = 12;
 inline constexpr std::uint32_t MoveActorAbsolute = 18;
 inline constexpr std::uint32_t MovePlayer = 19;
+inline constexpr std::uint32_t UpdateAttributes = 29;
 inline constexpr std::uint32_t ChangeDimension = 61;
 inline constexpr std::uint32_t PlayerSkin = 93;
 inline constexpr std::uint32_t MoveActorDelta = 111;
 inline constexpr std::uint32_t PlayerList = 63;
 inline constexpr std::uint32_t SetTitle = 88;
 inline constexpr std::uint32_t ModalFormRequest = 100;
+inline constexpr std::uint32_t RemoveObjective = 106;
+inline constexpr std::uint32_t SetDisplayObjective = 107;
+inline constexpr std::uint32_t SetScore = 108;
+inline constexpr std::uint32_t SetScoreboardIdentity = 112;
 }
 
 // The packet id and body of a whole packet (header varint first).
@@ -111,6 +116,11 @@ struct TextMessage {
     std::vector<std::string> parameters;
 };
 [[nodiscard]] std::optional<TextMessage> ParseText(std::span<const std::uint8_t> body);
+// The line Bedrock's chat would show for a Text packet (UTF-8, formatting
+// codes kept), or nothing for the types that never reach chat: popups,
+// jukebox popups and tips. Common translation keys are filled in; other keys
+// show the key itself followed by their parameters.
+[[nodiscard]] std::optional<std::string> ChatLineFromText(const TextMessage& text);
 
 // SetTitle (88): type (2 = title, 3 = subtitle, 4 = action bar ...) and text.
 struct TitleMessage {
@@ -125,5 +135,35 @@ struct FormRequest {
     std::string json;
 };
 [[nodiscard]] std::optional<FormRequest> ParseFormRequest(std::span<const std::uint8_t> body);
+
+struct FoodAttributes {
+    std::optional<float> hunger;
+    std::optional<float> saturation;
+    std::optional<float> exhaustion;
+};
+// UpdateAttributes (29): extracts only the bounded player food attributes;
+// all other attributes and modifiers are validated and skipped.
+[[nodiscard]] std::optional<FoodAttributes> ParseFoodAttributes(std::span<const std::uint8_t> body);
+
+struct DisplayObjective {
+    std::string slot;
+    std::string objective;
+    std::string displayName;
+    bool descending{};
+};
+struct ScoreEntry {
+    std::int64_t id{};
+    std::string objective;
+    std::int32_t score{};
+    std::optional<std::int64_t> entityId;
+    std::string displayName;
+};
+struct ScoreUpdate { bool remove{}; std::vector<ScoreEntry> entries; };
+struct ScoreIdentity { std::int64_t scoreId{}; std::int64_t entityId{}; };
+struct ScoreIdentityUpdate { bool remove{}; std::vector<ScoreIdentity> entries; };
+[[nodiscard]] std::optional<std::string> ParseRemoveObjective(std::span<const std::uint8_t> body);
+[[nodiscard]] std::optional<DisplayObjective> ParseDisplayObjective(std::span<const std::uint8_t> body);
+[[nodiscard]] std::optional<ScoreUpdate> ParseScoreUpdate(std::span<const std::uint8_t> body);
+[[nodiscard]] std::optional<ScoreIdentityUpdate> ParseScoreIdentityUpdate(std::span<const std::uint8_t> body);
 
 }

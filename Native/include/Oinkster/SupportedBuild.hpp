@@ -13,10 +13,10 @@
 // Services/ReviewedClientInjector.cs's manifest expectations.
 namespace Oinkster::SupportedBuild {
 
-inline constexpr std::wstring_view PackageVersion = L"1.26.5203.0";
-inline constexpr std::wstring_view DisplayVersion = L"1.26.5203";
-inline constexpr std::string_view GameVersion = "1.26.50";
-inline constexpr std::int32_t NetworkProtocol = 2193;
+inline constexpr std::wstring_view PackageVersion = L"1.26.6301.0";
+inline constexpr std::wstring_view DisplayVersion = L"26.63";
+inline constexpr std::string_view GameVersion = "26.63";
+inline constexpr std::int32_t NetworkProtocol = 2225;
 inline constexpr std::wstring_view Executable = L"Minecraft.Windows.exe";
 
 }

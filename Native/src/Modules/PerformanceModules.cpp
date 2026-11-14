@@ -1,5 +1,8 @@
 #include "Oinkster/Modules/Factories.hpp"
 #include "Oinkster/Modules/HudFormat.hpp"
+#include "Oinkster/Modules/PerformanceLogic.hpp"
+#include <Windows.h>
+#include <timeapi.h>
 #include <cmath>
 #include <format>
 
@@ -210,6 +213,86 @@ private:
     bool showMemory_{true};
     std::optional<std::uint64_t> bytes_;
 };
+// Tunes how Windows schedules the game process (priority, EcoQoS power
+// throttling, timer resolution). Bedrock exposes no engine-side knobs to
+// these hooks, so gains are modest and largest on laptops and busy systems.
+// Everything applied is undone on disable or unload.
+class FpsBoostModule final : public ModuleBase<IModule> {
+public:
+    FpsBoostModule(ModuleMetadata metadata, HudLayout, SharedServices&)
+        : ModuleBase(std::move(metadata), {
+            ChoiceSetting("priority", "Process priority", "above-normal", {
+                {"normal", "Normal"}, {"above-normal", "Above normal"}, {"high", "High"}},
+                "How much CPU time Windows gives Minecraft over other programs."),
+            BoolSetting("disable-power-throttling", "Disable power throttling", true,
+                "Stops Windows running Minecraft on efficiency cores or at reduced clocks."),
+            BoolSetting("high-resolution-timer", "High-resolution timer", true,
+                "1 ms system timer for steadier frame pacing; uses slightly more power.")}) {}
+    ~FpsBoostModule() override { std::scoped_lock lock(mutex_); Restore(); }
+    FpsBoostModule(const FpsBoostModule&) = delete;
+    FpsBoostModule& operator=(const FpsBoostModule&) = delete;
+
+    void OnSettingsChanged(const SettingsReader& settings) override {
+        std::scoped_lock lock(mutex_);
+        const ProcessBoostConfig wanted{BoostPriorityClass(settings.Choice("priority")),
+            settings.Bool("disable-power-throttling"), settings.Bool("high-resolution-timer")};
+        if (wanted == config_) return;
+        config_ = wanted;
+        if (enabled_) {
+            Restore();
+            Apply();
+        }
+    }
+    void OnEnable() override {
+        std::scoped_lock lock(mutex_);
+        enabled_ = true;
+        Apply();
+    }
+    void OnDisable() override {
+        std::scoped_lock lock(mutex_);
+        enabled_ = false;
+        Restore();
+    }
+
+private:
+    void Apply() {
+        HANDLE process = GetCurrentProcess();
+        const DWORD previous = GetPriorityClass(process);
+        if (previous != 0 && SetPriorityClass(process, config_.priorityClass)) previousPriority_ = previous;
+        if (config_.disablePowerThrottling) {
+            // ControlMask set with StateMask clear = explicitly not throttled.
+            PROCESS_POWER_THROTTLING_STATE state{};
+            state.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+            state.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
+            throttlingSet_ = SetProcessInformation(process, ProcessPowerThrottling, &state, sizeof(state)) != FALSE;
+        }
+        if (config_.highResolutionTimer) timerRaised_ = timeBeginPeriod(1) == TIMERR_NOERROR;
+    }
+    void Restore() noexcept {
+        HANDLE process = GetCurrentProcess();
+        if (previousPriority_ != 0) {
+            (void)SetPriorityClass(process, previousPriority_);
+            previousPriority_ = 0;
+        }
+        if (throttlingSet_) {
+            // An empty ControlMask hands the decision back to Windows.
+            PROCESS_POWER_THROTTLING_STATE state{};
+            state.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+            (void)SetProcessInformation(process, ProcessPowerThrottling, &state, sizeof(state));
+            throttlingSet_ = false;
+        }
+        if (timerRaised_) {
+            (void)timeEndPeriod(1);
+            timerRaised_ = false;
+        }
+    }
+
+    ProcessBoostConfig config_{};
+    bool enabled_{};
+    DWORD previousPriority_{};
+    bool throttlingSet_{};
+    bool timerRaised_{};
+};
 }
 
 std::unique_ptr<IModule> MakeFps(ModuleMetadata m, HudLayout l, SharedServices& s) { return std::make_unique<FpsModule>(std::move(m), l, s); }
@@ -218,5 +301,6 @@ std::unique_ptr<IModule> MakeFpsStatistics(ModuleMetadata m, HudLayout l, Shared
 std::unique_ptr<IModule> MakeFrameTimeGraph(ModuleMetadata m, HudLayout l, SharedServices& s) { return std::make_unique<FrameTimeGraphModule>(std::move(m), l, s); }
 std::unique_ptr<IModule> MakeProcessMemory(ModuleMetadata m, HudLayout l, SharedServices& s) { return std::make_unique<ProcessMemoryModule>(std::move(m), l, s); }
 std::unique_ptr<IModule> MakePerformanceSummary(ModuleMetadata m, HudLayout l, SharedServices& s) { return std::make_unique<PerformanceSummaryModule>(std::move(m), l, s); }
+std::unique_ptr<IModule> MakeFpsBoost(ModuleMetadata m, HudLayout l, SharedServices& s) { return std::make_unique<FpsBoostModule>(std::move(m), l, s); }
 
 }

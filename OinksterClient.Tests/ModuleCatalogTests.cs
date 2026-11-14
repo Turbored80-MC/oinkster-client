@@ -26,9 +26,16 @@ public sealed class ModuleCatalogTests
         "packet-send"
     ];
 
+    // Known to the native client but without a reviewed implementation yet.
+    private static readonly HashSet<string> UnsupportedCapabilities =
+    [
+        "fire-overlay-presentation"
+    ];
+
     private static readonly HashSet<string> KnownCapabilities =
     [
-        .. SupportedCapabilities
+        .. SupportedCapabilities,
+        .. UnsupportedCapabilities
     ];
 
     [Fact]
@@ -36,7 +43,7 @@ public sealed class ModuleCatalogTests
     {
         var catalog = await ModuleSettingsService.LoadCatalogAsync();
 
-        Assert.Equal(60, catalog.Count);
+        Assert.Equal(70, catalog.Count);
         Assert.Equal(catalog.Count, catalog.Select(module => module.Id).Distinct(StringComparer.Ordinal).Count());
         Assert.All(catalog, module => Assert.Matches("^[a-z0-9-]+$", module.Id));
     }

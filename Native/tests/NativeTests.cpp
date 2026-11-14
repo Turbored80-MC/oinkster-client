@@ -15,6 +15,7 @@
 #include "Oinkster/ReplayWorld.hpp"
 #include "Oinkster/ClickGui.hpp"
 #include "Oinkster/CrosshairTexture.hpp"
+#include "Oinkster/UserResourcePacks.hpp"
 #include "Oinkster/Dx12Overlay.hpp"
 #include "Oinkster/EnttRegistry.hpp"
 #include "Oinkster/GameItems.hpp"
@@ -26,6 +27,7 @@
 #include "Oinkster/UnloadGuard.hpp"
 #include "Oinkster/VideoRecorder.hpp"
 #include "Oinkster/WorldTelemetry.hpp"
+#include "Oinkster/Modules/PerformanceLogic.hpp"
 #include "Oinkster/Modules/AccessibilityLogic.hpp"
 #include "Oinkster/Modules/FrameStatistics.hpp"
 #include "Oinkster/Modules/HudFormat.hpp"
@@ -88,6 +90,14 @@ private:
         Oinkster::ModuleCategory::Accessibility, false, true, Oinkster::EventPriority::Immediate};
 };
 
+class FakeMediaControlService final : public Oinkster::IMediaControlService {
+public:
+    Oinkster::MediaStatusSnapshot snapshot;
+    std::vector<std::string> commands;
+    [[nodiscard]] Oinkster::MediaStatusSnapshot Snapshot() const override { return snapshot; }
+    void Queue(std::string_view command) override { commands.emplace_back(command); }
+};
+
 void Require(bool condition, const char* message) { if (!condition) throw std::runtime_error(message); }
 void RequireNear(double actual, double expected, double tolerance, const char* message) {
     if (!(std::abs(actual - expected) <= tolerance)) {
@@ -129,7 +139,7 @@ std::string Narrow(std::wstring_view value) { return M::ToUtf8(value); }
 
 void CatalogIdsAreUniqueAndWellFormed() {
     Catalog catalog;
-    Require(catalog.manager.Size() == 60, "Catalog must contain 60 modules");
+    Require(catalog.manager.Size() == 70, "Catalog must contain 70 modules");
     std::unordered_set<std::string> ids;
     std::vector<std::string> defaultEnabled;
     for (const auto& entry : Oinkster::CatalogEntries()) {
@@ -188,6 +198,24 @@ void NativeCatalogMatchesLauncherJson() {
             throw std::runtime_error("Catalog unavailableReason drift" + where);
         }
     }
+}
+
+void NowPlayingUsesCachedMediaAndQueuesActions() {
+    M::SharedServices services;
+    auto media = std::make_shared<FakeMediaControlService>();
+    services.media = media;
+    Oinkster::ModuleManager manager;
+    for (auto& module : Oinkster::CreateModuleCatalog(services)) manager.Register(std::move(module));
+    const auto* hud = manager.FindHudModule("now-playing");
+    Require(hud != nullptr, "Now playing is a HUD module");
+    Require(hud->DisplayText() == "Media controls unavailable", "A missing broker has a useful empty state");
+
+    media->snapshot = {true, false};
+    Require(hud->DisplayText() == "Nothing playing", "A connected broker with no session has a distinct empty state");
+    media->snapshot = {true, true, "Spotify.exe", "Hoppipolla", "Sigur Ros", "playing", true, true, true};
+    Require(hud->DisplayText() == "Hoppipolla\nSigur Ros", "Track and artist use the cached broker snapshot");
+    Require(manager.InvokeAction("now-playing", "next", At(1)), "The next action is recognized");
+    Require(media->commands == std::vector<std::string>{"next"}, "Actions are queued without blocking the render thread");
 }
 
 // ------------------------------------------------------------------ availability
@@ -1480,6 +1508,146 @@ void GameCrosshairTextureSource() {
         "Truncated and non-PNG data does not decode");
 }
 
+void UserResourcePackParsing() {
+    namespace U = Oinkster::UserResourcePacks;
+    const auto ids = U::ParseGlobalPackList(R"([ // comment
+        {"pack_id": "88BC79D5-FD23-44CE-BC49-1459934A5FF2", "subpack": "16xsword", "version": [1, 10, 1]},
+        {"pack_id": "short"},
+        {"pack_id": "1e3894be-03ea-4355-80c1-27d33bcf0628", "version": [1, 0, 0]},
+        {"pack_id": "88bc79d5-fd23-44ce-bc49-1459934a5ff2"}])");
+    Require(ids == std::vector<std::string>{"88bc79d5-fd23-44ce-bc49-1459934a5ff2", "1e3894be-03ea-4355-80c1-27d33bcf0628"},
+        "Global pack ids keep file order, lowercased, without malformed ids or duplicates");
+    Require(U::ParseGlobalPackList("not json").empty() && U::ParseGlobalPackList("{}").empty(), "A malformed list has no packs");
+
+    const auto header = U::ParseManifestHeader(R"({"header": {"name": "\u00a76Taj \u00a7l4k", "uuid": "AAAAAAAA-0000-1111-2222-333333333333",
+        "version": [1, 10, 1]}})");
+    Require(header && header->uuid == "aaaaaaaa-0000-1111-2222-333333333333" && header->name == "\xC2\xA7" "6Taj \xC2\xA7l4k"
+        && header->version == "1.10.1", "Manifest headers give uuid, raw name and dotted version");
+    const auto textVersion = U::ParseManifestHeader(R"({"header": {"uuid": "aaaaaaaa-0000-1111-2222-333333333333", "version": "2.0.0"}})");
+    Require(textVersion && textVersion->version == "2.0.0" && textVersion->name.empty(), "Format 3 string versions are kept");
+    Require(!U::ParseManifestHeader(R"({"header": {"uuid": "short"}})"), "A manifest without a full uuid is refused");
+
+    const std::string lang = "## header\r\npack.description=Nice\r\npack.name=Taj 4k Edition\t## the name\r\n";
+    Require(U::LookupLangValue(lang, "pack.name") == std::optional<std::string>("Taj 4k Edition"), "Lang values drop CRLF and comments");
+    Require(!U::LookupLangValue(lang, "pack.nam") && !U::LookupLangValue(lang, "missing"), "Only whole keys match");
+    Require(U::DisplayName("pack.name", lang, L"Folder") == L"Taj 4k Edition", "Lang-key names resolve through the lang file");
+    Require(U::DisplayName("pack.name", "other=x", L"Folder") == L"Folder", "An unresolved lang key falls back to the folder");
+    Require(U::DisplayName("\xC2\xA7" "6Foxy's\xC2\xA7r  ", "", L"Folder") == L"Foxy's", "Formatting codes and padding are removed");
+    Require(U::DisplayName("", "", L"Folder") == L"Folder", "An empty name falls back to the folder");
+
+    const auto withAuthors = U::ParseManifestHeader(R"({"header": {"uuid": "aaaaaaaa-0000-1111-2222-333333333333",
+        "description": "pack.description"}, "metadata": {"authors": ["ya_rifat", "EchoRif", 7]}})");
+    Require(withAuthors && withAuthors->description == "pack.description"
+        && withAuthors->authors == std::vector<std::string>{"ya_rifat", "EchoRif"}, "Manifests give their description and authors");
+    Require(U::PackAuthor({"ya_rifat", "EchoRif"}, "Made by someone else", "") == L"ya_rifat, EchoRif", "Listed authors win");
+    Require(U::PackAuthor({}, "Mashed Pack by Zoo", "") == L"Zoo", "A trailing credit is found");
+    Require(U::PackAuthor({}, "Reverts the Pause Screen to be how it was before 1.21.120.\nMade by Jzen.", "") == L"Jzen",
+        "Made-by credits drop the sentence's period");
+    Require(U::PackAuthor({}, "Pack By \xC2\xA7" "6FoxyNoTail\xC2\xA7r | Blur when wearing a pumpkin", "") == L"FoxyNoTail",
+        "Credits stop at a separator and lose formatting codes");
+    Require(U::PackAuthor({}, "edit of Toggle Emissive ESP by @T1M0THYYT", "") == L"T1M0THYYT", "A leading @ is dropped");
+    Require(U::PackAuthor({}, "Skins + Capes", "Skins + Capes (Mobile Cape OAUQ) by MCTools") == L"MCTools",
+        "The name is the last place a credit is looked for");
+    Require(U::PackAuthor({}, "Nearby blocks glow", "Standby").empty()
+        && U::PackAuthor({}, "Made by the people who wanted a much better pause screen", "").empty(),
+        "Words containing 'by' and sentence-length credits are not authors");
+
+    using namespace std::chrono_literals;
+    Require(M::RotationIndex(3, 0s, 5s) == 0 && M::RotationIndex(3, 4999ms, 5s) == 0 && M::RotationIndex(3, 5s, 5s) == 1
+        && M::RotationIndex(3, 16s, 5s) == 0, "The rotation advances every interval and wraps");
+    Require(M::RotationIndex(0, 10s, 5s) == 0 && M::RotationIndex(4, 10s, 0s) == 0, "Empty lists and zero intervals stay on 0");
+}
+
+void ResourcePackEntriesRoundTripUnknownFields() {
+    namespace U = Oinkster::UserResourcePacks;
+    const auto entries = U::ParseGlobalPackEntries(R"([{"pack_id":"aaaaaaaa-0000-1111-2222-333333333333",
+        "version":[1,10,1],"subpack":"short","future":{"enabled":true}}])");
+    Require(entries && entries->size() == 1 && entries->front().version == "1.10.1"
+        && entries->front().subpack == "short", "Editable pack entries expose version and subpack");
+    const auto serialized = U::SerializeGlobalPackEntries(*entries);
+    const auto reparsed = Oinkster::Json::Parse(serialized);
+    const auto* array = reparsed ? reparsed->AsArray() : nullptr;
+    const auto* future = array && !array->empty() ? array->front().Find("future") : nullptr;
+    const auto* enabled = future ? future->Find("enabled") : nullptr;
+    Require(enabled && enabled->AsBool() && *enabled->AsBool(), "Unknown pack entry fields survive a round trip");
+    Require(!U::ParseGlobalPackEntries(R"([{"pack_id":"aaaaaaaa-0000-1111-2222-333333333333","version":[1,0,0]},
+        {"pack_id":"AAAAAAAA-0000-1111-2222-333333333333","version":[1,0,0]}])"),
+        "Editable pack stacks reject duplicate UUIDs");
+    Require(!U::ParseGlobalPackEntries(R"([{"pack_id":"not-a-uuid","version":[1,0,0]}])"),
+        "Editable pack stacks reject malformed UUIDs");
+}
+
+void VsyncPolicyUsesOnlyLegalTearingPresents() {
+    using namespace Oinkster;
+    constexpr std::uint32_t AllowTearing = 0x200;
+    constexpr std::uint32_t Test = 0x1;
+    auto decision = DecideVsyncPresent({true, true, true, false, false, 1, 0}, AllowTearing);
+    Require(decision.state == VsyncState::Disabled && decision.interval == 0
+        && (decision.flags & AllowTearing) != 0, "A tearing-capable windowed chain disables VSync legally");
+    decision = DecideVsyncPresent({true, true, false, false, false, 1, 0}, AllowTearing);
+    Require(decision.state == VsyncState::RestartRequired && decision.interval == 1 && decision.flags == 0,
+        "Late injection never sends tearing flags to an incompatible chain");
+    decision = DecideVsyncPresent({true, false, false, false, false, 1, 0}, AllowTearing);
+    Require(decision.state == VsyncState::Unsupported && decision.interval == 1, "Unsupported tearing fails closed");
+    decision = DecideVsyncPresent({true, true, true, true, false, 1, 0}, AllowTearing);
+    Require(decision.state == VsyncState::Disabled && decision.interval == 0 && decision.flags == 0,
+        "Exclusive fullscreen uses interval zero without ALLOW_TEARING");
+    decision = DecideVsyncPresent({true, true, true, false, true, 1, Test}, AllowTearing);
+    Require(decision.interval == 1 && decision.flags == Test, "DXGI_PRESENT_TEST is never changed");
+    decision = DecideVsyncPresent({false, true, true, false, false, 2, AllowTearing}, AllowTearing);
+    Require(decision.state == VsyncState::Enabled && decision.interval == 2 && decision.flags == AllowTearing,
+        "Enabled leaves Bedrock's synchronized presentation arguments unchanged");
+}
+
+void ResourcePackDisplayRotatesUserPacks() {
+    namespace U = Oinkster::UserResourcePacks;
+    M::SharedServices services;
+    const auto pack = [](std::string uuid, std::wstring name) {
+        return U::Pack{std::move(uuid), std::move(name), L"1.0.0", L"Zoo", std::make_shared<const Oinkster::ArgbImage>(
+            Oinkster::ArgbImage{1, 1, {0xFF00FF00U}})};
+    };
+    std::vector<U::Pack> installed{pack("aaaaaaaa-0000-0000-0000-000000000001", L"Alpha"),
+        pack("aaaaaaaa-0000-0000-0000-000000000002", L"Beta"), pack("aaaaaaaa-0000-0000-0000-000000000003", L"Gamma")};
+    std::shared_ptr<const std::vector<U::Pack>> active;
+    bool watching{};
+    services.installedPacks = [&] { return installed; };
+    services.activePacks = [&] { return active; };
+    services.watchPacks = [&](bool on) { watching = on; };
+    Oinkster::ModuleManager manager;
+    for (auto& module : Oinkster::CreateModuleCatalog(services)) manager.Register(std::move(module));
+    auto* hud = manager.FindHudModule("resource-pack-display");
+    Require(hud != nullptr, "The resource pack display is a HUD module");
+    Require(std::ranges::count_if(hud->Settings(), [](const auto& d) { return d.key.starts_with("pack-"); }) == 3,
+        "Every installed pack gets its own toggle");
+    Require(manager.SetEnabled("resource-pack-display", true) && watching, "Enabling starts the pack watcher");
+    Require(hud->Content().lines.front().text == "Resource packs  --", "Nothing is shown before the first read");
+    active = std::make_shared<const std::vector<U::Pack>>(std::vector<U::Pack>{installed[0], installed[2]});
+    Require(hud->IsSettingRelevant("rotate-seconds") && hud->IsSettingRelevant("pack-aaaaaaaa-0000-0000-0000-000000000001")
+        && !hud->IsSettingRelevant("pack-aaaaaaaa-0000-0000-0000-000000000002")
+        && hud->IsSettingRelevant("pack-aaaaaaaa-0000-0000-0000-000000000003"), "Only the loaded packs' toggles are listed");
+    manager.Publish(Frame(1, 0.0, 0.016F));
+    auto content = hud->Content();
+    Require(content.lines.size() == 2 && content.lines[1].text == "by Zoo" && content.icon, "One pack with its icon and author at a time");
+    const auto firstName = content.lines.front().text;
+    manager.Publish(Frame(2, 5.0, 0.016F));
+    const auto secondName = hud->Content().lines.front().text;
+    Require(firstName != secondName && (firstName == "Alpha" || firstName == "Gamma") && (secondName == "Alpha" || secondName == "Gamma"),
+        "Several active packs rotate");
+    manager.SetModuleSetting("resource-pack-display.pack-aaaaaaaa-0000-0000-0000-000000000001", "false");
+    Require(hud->Content().lines.front().text == "Gamma", "A hidden pack leaves the rotation");
+    manager.Publish(Frame(3, 10.0, 0.016F));
+    Require(hud->Content().lines.front().text == "Gamma", "One visible pack stays put");
+    manager.SetModuleSetting("resource-pack-display.show-icon", "false");
+    manager.SetModuleSetting("resource-pack-display.show-version", "true");
+    content = hud->Content();
+    Require(!content.icon && content.lines.size() == 2 && content.lines[1].text == "by Zoo  v1.0.0", "Icon and version follow their settings");
+    manager.SetModuleSetting("resource-pack-display.show-author", "false");
+    Require(hud->Content().lines[1].text == "v1.0.0", "The author can be turned off");
+    manager.SetModuleSetting("resource-pack-display.pack-aaaaaaaa-0000-0000-0000-000000000003", "false");
+    Require(hud->Content().lines.front().text == "No resource packs", "Hiding every pack says so");
+    Require(manager.SetEnabled("resource-pack-display", false) && !watching, "Disabling stops the pack watcher");
+}
+
 void CrosshairGeometryAndPresentation() {
     M::CrosshairStyle style;
     style.length = 6;
@@ -1698,6 +1866,82 @@ void ChatPresentationTransforms() {
     options.hideNicknames = false;
     options.stripFormatting = false;
     Require(M::PresentChatLine(event, options, 9, 5) == L"<Steve> hi \u00A7aAlex", "Every transform can be turned off");
+}
+
+void MoveableChatFadesAndFollowsTheChatScreen() {
+    using namespace std::chrono_literals;
+    Require(M::ChatLineAlpha(0s, 10.0F) == 1.0F && M::ChatLineAlpha(8s, 10.0F) == 1.0F, "Lines stay opaque for most of their life");
+    const float fading = M::ChatLineAlpha(9500ms, 10.0F);
+    Require(fading > 0.0F && fading < 1.0F, "The last tenth of a line's life fades");
+    Require(M::ChatLineAlpha(10s, 10.0F) == 0.0F && M::ChatLineAlpha(30s, 10.0F) == 0.0F, "Expired lines are invisible");
+    Require(M::ChatLineAlpha(1s, 0.0F) == 0.0F, "A zero lifetime never shows a line");
+
+    M::ChatScreenTracker tracker;
+    tracker.Update(false, At(1));
+    Require(!tracker.Open(), "A screen opened without the chat key (inventory) is not chat");
+    tracker.Update(true, At(2));
+    tracker.OnChatKey(At(3));
+    tracker.Update(true, At(3.05));
+    Require(!tracker.Open(), "Gameplay is still visible just after the key");
+    tracker.Update(false, At(3.2));
+    Require(tracker.Open(), "The HUD hiding right after the chat key means chat opened");
+    tracker.Update(false, At(10));
+    Require(tracker.Open(), "Chat stays open until gameplay returns");
+    tracker.Update(true, At(11));
+    Require(!tracker.Open(), "Gameplay returning closes chat");
+    tracker.OnChatKey(At(12));
+    tracker.Update(true, At(13));
+    tracker.Update(false, At(13.1));
+    Require(!tracker.Open(), "A stale chat key does not count");
+
+    Catalog catalog;
+    catalog.manager.SetCapability(Oinkster::Capability::PacketCapture, {Oinkster::CapabilityState::Available, {}});
+    Require(catalog.manager.SetEnabled("moveable-chat", true), "Moveable chat enables once packet capture validates");
+    const auto replacements = catalog.manager.EnabledModulesOf<Oinkster::IChatReplacementModule>();
+    Require(replacements.size() == 1 && replacements.front()->ReplacesVanillaChat(), "Vanilla chat is replaced by default");
+    const auto observers = catalog.manager.EnabledModulesOf<Oinkster::IPacketObserverModule>();
+    Require(observers.size() == 1 && observers.front()->WantsPacket(M::GamePacket::Text), "It reads the server's Text packets");
+    const auto textPacket = [](std::string_view source, std::string_view message, std::uint8_t type = 1) {
+        Oinkster::ReplayPacketEvent event;
+        event.packetId = M::GamePacket::Text;
+        event.bytes.push_back(static_cast<char>(M::GamePacket::Text));
+        event.bytes += std::string{'\0', static_cast<char>(source.empty() ? 0 : 1), static_cast<char>(type)};
+        if (!source.empty()) {
+            event.bytes.push_back(static_cast<char>(source.size()));
+            event.bytes += source;
+        }
+        event.bytes.push_back(static_cast<char>(message.size()));
+        event.bytes += message;
+        event.bytes += std::string{'\0', '\0'};
+        return event;
+    };
+    catalog.manager.Publish(textPacket("Steve", "\xC2\xA7" "aone"));
+    catalog.manager.Publish(textPacket("", "Saved", 5));
+    catalog.manager.Publish(textPacket("Alex", "two"));
+    const auto* chat = catalog.manager.FindHudModule("moveable-chat");
+    const auto content = chat->Content();
+    Require(content.anchorBottom && content.lineBackdrops && content.wrapWidth > 0.0F, "The Java preset grows upward with per-line backdrops");
+    Require(chat->DisplayText() == "<Steve> one\n<Alex> two", "Oldest first, newest at the bottom, tips skipped, formatting stripped");
+    catalog.manager.SetModuleSetting("moveable-chat.preset", "bedrock");
+    Require(!chat->Content().anchorBottom && chat->Layout().normalizedY < 0.2F, "The Bedrock preset moves the chat to the top-left");
+    catalog.manager.SetModuleSetting("moveable-chat.hide-vanilla", "false");
+    Require(!replacements.front()->ReplacesVanillaChat(), "Vanilla chat can be kept");
+
+    Require(M::BoostPriorityClass("above-normal") == M::AboveNormalPriorityClassValue
+        && M::BoostPriorityClass("high") == M::HighPriorityClassValue, "FPS Boost maps its priority choices");
+    Require(M::BoostPriorityClass("realtime") == M::NormalPriorityClassValue, "An unknown priority never raises the process");
+    Require(!catalog.manager.Availability("low-fire").available, "Low Fire stays unavailable until its hook exists");
+
+    M::TextMessage joined{2, {}, "\xC2\xA7" "e%multiplayer.player.joined", {"Bob"}};
+    Require(M::ChatLineFromText(joined) == std::string("\xC2\xA7" "eBob joined the game"), "Known translation keys are filled in");
+    M::TextMessage said{2, {}, "%chat.type.text", {"Bob", "hi"}};
+    Require(M::ChatLineFromText(said) == std::string("<Bob> hi"), "Translated chat keeps its author");
+    M::TextMessage unknown{2, {}, "%some.key", {"a", "b"}};
+    Require(M::ChatLineFromText(unknown) == std::string("some.key a b"), "Unknown keys show the key and parameters");
+    M::TextMessage json{10, {}, R"({"rawtext":[{"text":"Hello "},{"text":"there"}]})", {}};
+    Require(M::ChatLineFromText(json) == std::string("Hello there"), "JSON rawtext is flattened");
+    Require(!M::ChatLineFromText({3, {}, "popup", {}}) && !M::ChatLineFromText({5, {}, "tip", {}}), "Popups and tips are not chat");
+    Require(M::ChatLineFromText({7, "Bob", "psst", {}}) == std::string("Bob whispers to you: psst"), "Whispers name the sender");
 }
 
 void SprintAndFramePacingStayWithinPlayerControls() {
@@ -2648,7 +2892,7 @@ void ReplayPlaybackHandshakeAndPacing() {
 
     const auto now = P::Clock::now();
     std::vector<Bytes> out;
-    auto handled = session->OnClientPacket(Bytes{0xC1, 0x01, 0x00, 0x00, 0x08, 0x91}, now, out);  // protocol 2193
+    auto handled = session->OnClientPacket(Bytes{0xC1, 0x01, 0x00, 0x00, 0x08, 0xB1}, now, out);  // protocol 2225
     Require(handled.accepted, "The supported protocol is accepted");
     Require(out.size() == 1 && out[0] == P::NetworkSettingsPacket() && session->CompressionEnabled(),
         "Network settings are answered and compression framing begins");
@@ -3487,14 +3731,97 @@ void PostProcessConstantsAreBounded() {
     settings.contrast = NAN;
     settings.tint = 0xFF336699U;
     settings.tintStrength = 0.5F;
+    settings.blur = 3.0F;
     const auto constants = Oinkster::MakePostProcessConstants(1920.0F, 1080.0F, settings);
     RequireNear(constants.grade[0], 2.0, 1e-6, "Saturation clamps");
     RequireNear(constants.grade[1], 1.0, 1e-6, "A non-finite contrast falls back to neutral");
     RequireNear(constants.tint[0], 0x33 / 255.0, 1e-6, "Tint red comes from the ARGB colour");
     RequireNear(constants.tint[2], 0x99 / 255.0, 1e-6, "Tint blue comes from the ARGB colour");
     RequireNear(constants.extra[1], 1.0 / 1920.0, 1e-9, "Texel size follows the display");
+    RequireNear(constants.extra[3], 1.0, 1e-6, "Blur strength clamps");
     RequireNear(constants.projection[0], 2.0 / 1920.0, 1e-9, "The projection matches ImGui's");
     static_assert(sizeof(Oinkster::PostProcessConstants) == 28 * sizeof(float));
+}
+
+void NewModuleMathFailsClosed() {
+    const auto start = At(10);
+    RequireNear(M::AttackRecovery({}, At(11), 500ms), 1.0, 1e-6, "No attack is ready");
+    RequireNear(M::AttackRecovery(start, start, 500ms), 0.0, 1e-6, "A new attack starts empty");
+    RequireNear(M::AttackRecovery(start, start + 250ms, 500ms), 0.5, 1e-6, "Attack recovery is linear");
+    RequireNear(M::AttackRecovery(start, start + 2s, 500ms), 1.0, 1e-6, "Attack recovery clamps ready");
+
+    const M::CameraView view{{0.0F, 0.0F, 0.0F}, {0.0F, 0.0F, 0.0F, 1.0F}, M::CameraMath::Pi * 0.5F};
+    const auto center = M::ProjectPoint(view, {0.0F, 0.0F, -5.0F}, 1920.0F, 1080.0F);
+    Require(center.has_value(), "A waypoint in front of the camera projects");
+    RequireNear(center->x, 960.0, 1e-4, "The forward point is horizontally centered");
+    RequireNear(center->y, 540.0, 1e-4, "The forward point is vertically centered");
+    RequireNear(center->depth, 5.0, 1e-6, "Projected depth is forward distance");
+    Require(!M::ProjectPoint(view, {0.0F, 0.0F, 5.0F}, 1920.0F, 1080.0F), "A point behind the camera is rejected");
+    Require(!M::ProjectPoint(view, {0.0F, 0.0F, -5.0F}, 0.0F, 1080.0F), "An invalid viewport is rejected");
+}
+
+void FoodAndScoreboardPacketsAreBounded() {
+    const auto string = [](Oinkster::RakNet::Writer& writer, std::string_view value) {
+        writer.VarU32(static_cast<std::uint32_t>(value.size()));
+        writer.Bytes(std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(value.data()), value.size()));
+    };
+
+    Oinkster::RakNet::Writer attributes;
+    attributes.VarU64(42);
+    attributes.VarU32(3);
+    const auto attribute = [&](std::string_view name, float maximum, float current) {
+        attributes.F32LE(0.0F);
+        attributes.F32LE(maximum);
+        attributes.F32LE(current);
+        attributes.F32LE(0.0F);
+        attributes.F32LE(maximum);
+        attributes.F32LE(maximum);
+        string(attributes, name);
+        attributes.VarU32(0);
+    };
+    attribute("minecraft:player.hunger", 20.0F, 17.0F);
+    attribute("minecraft:player.saturation", 20.0F, 4.5F);
+    attribute("minecraft:player.exhaustion", 40.0F, 2.0F);
+    attributes.VarU64(9001);
+    const auto food = M::ParseFoodAttributes(attributes.Data());
+    Require(food && food->hunger && food->saturation && food->exhaustion, "The bounded food attributes decode");
+    RequireNear(*food->hunger, 17.0, 1e-6, "Hunger keeps its current value");
+    RequireNear(*food->saturation, 4.5, 1e-6, "Saturation keeps its current value");
+    Oinkster::RakNet::Writer tooManyAttributes;
+    tooManyAttributes.VarU64(1);
+    tooManyAttributes.VarU32(65);
+    Require(!M::ParseFoodAttributes(tooManyAttributes.Data()), "An oversized attribute list fails closed");
+
+    Oinkster::RakNet::Writer displayBytes;
+    string(displayBytes, "sidebar");
+    string(displayBytes, "oinkster:test");
+    string(displayBytes, "Test board");
+    string(displayBytes, "dummy");
+    displayBytes.U32LE(1);
+    const auto display = M::ParseDisplayObjective(displayBytes.Data());
+    Require(display && display->slot == "sidebar" && display->objective == "oinkster:test"
+        && display->displayName == "Test board" && display->descending, "A sidebar objective decodes");
+
+    Oinkster::RakNet::Writer scores;
+    scores.U8(0);
+    scores.VarU32(1);
+    scores.VarU64(14);  // zig-zag encoded score id 7
+    string(scores, "oinkster:test");
+    scores.U32LE(42);
+    scores.U8(3);
+    string(scores, "Alice");
+    const auto update = M::ParseScoreUpdate(scores.Data());
+    Require(update && !update->remove && update->entries.size() == 1, "A scoreboard change decodes");
+    Require(update->entries.front().id == 7 && update->entries.front().score == 42
+        && update->entries.front().displayName == "Alice", "Scoreboard entry fields remain intact");
+    auto trailing = scores.Data();
+    trailing.push_back(0xFF);
+    Require(!M::ParseScoreUpdate(trailing), "Trailing scoreboard bytes fail closed");
+
+    Oinkster::RakNet::Writer remove;
+    string(remove, "oinkster:test");
+    const auto objective = M::ParseRemoveObjective(remove.Data());
+    Require(objective && *objective == "oinkster:test", "Objective removal decodes");
 }
 
 void BlueberryParityModulesCompose() {
@@ -3825,11 +4152,14 @@ void SkinsSaveAndWear() {
 }
 
 int main() {
-    const std::array<std::pair<const char*, void (*)()>, 89> tests{{
+    const std::array<std::pair<const char*, void (*)()>, 97> tests{{
+        {"MoveableChatFadesAndFollowsTheChatScreen", MoveableChatFadesAndFollowsTheChatScreen},
         {"CatalogIdsAreUniqueAndWellFormed", CatalogIdsAreUniqueAndWellFormed},
         {"NullMovementKeepsOnlyTheNewestKey", NullMovementKeepsOnlyTheNewestKey},
         {"ChunkBordersProjectAroundThePlayer", ChunkBordersProjectAroundThePlayer},
         {"PostProcessConstantsAreBounded", PostProcessConstantsAreBounded},
+        {"NewModuleMathFailsClosed", NewModuleMathFailsClosed},
+        {"FoodAndScoreboardPacketsAreBounded", FoodAndScoreboardPacketsAreBounded},
         {"BlueberryParityModulesCompose", BlueberryParityModulesCompose},
         {"PlayerListPacketsBuildARoster", PlayerListPacketsBuildARoster},
         {"ChatTitleAndFormPacketsDecode", ChatTitleAndFormPacketsDecode},
@@ -3837,6 +4167,7 @@ int main() {
         {"PacketSenderLearnsTheGamesOwnLayouts", PacketSenderLearnsTheGamesOwnLayouts},
         {"SkinsSaveAndWear", SkinsSaveAndWear},
         {"NativeCatalogMatchesLauncherJson", NativeCatalogMatchesLauncherJson},
+        {"NowPlayingUsesCachedMediaAndQueuesActions", NowPlayingUsesCachedMediaAndQueuesActions},
         {"AvailabilityFollowsCapabilities", AvailabilityFollowsCapabilities},
         {"ModuleLifecycleIsIsolated", ModuleLifecycleIsIsolated},
         {"ClickFiltersAreDeterministicAndFailSafe", ClickFiltersAreDeterministicAndFailSafe},
@@ -3874,6 +4205,10 @@ int main() {
         {"CrosshairSourceAndPerspective", CrosshairSourceAndPerspective},
         {"CrosshairDrawnAndGameCopy", CrosshairDrawnAndGameCopy},
         {"GameCrosshairTextureSource", GameCrosshairTextureSource},
+        {"UserResourcePackParsing", UserResourcePackParsing},
+        {"ResourcePackEntriesRoundTripUnknownFields", ResourcePackEntriesRoundTripUnknownFields},
+        {"VsyncPolicyUsesOnlyLegalTearingPresents", VsyncPolicyUsesOnlyLegalTearingPresents},
+        {"ResourcePackDisplayRotatesUserPacks", ResourcePackDisplayRotatesUserPacks},
         {"CameraMathMatchesGameConvention", CameraMathMatchesGameConvention},
         {"VisualPresentationModulesCompose", VisualPresentationModulesCompose},
         {"SubtitlesExpireDeduplicateAndOrient", SubtitlesExpireDeduplicateAndOrient},

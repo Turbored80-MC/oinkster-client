@@ -18,11 +18,25 @@ std::vector<void*> targets;
 }
 }
 
-bool Create(void* target, void* detour, void** original) noexcept {
-    if (!target || !detour || !original) return false;
+bool Create(void* target, void* detour, void** original, std::string* error) noexcept {
+    const auto fail = [error](const char* operation, MH_STATUS status) {
+        if (!error) return;
+        const char* detail = MH_StatusToString(status);
+        *error = std::string(operation) + ": " + (detail ? detail : "unknown MinHook error");
+    };
+    if (!target || !detour || !original) {
+        if (error) *error = "invalid hook target, detour, or original pointer";
+        return false;
+    }
     std::scoped_lock lock(registryMutex);
-    if (MH_CreateHook(target, detour, original) != MH_OK) return false;
-    if (MH_EnableHook(target) != MH_OK) {
+    const auto createStatus = MH_CreateHook(target, detour, original);
+    if (createStatus != MH_OK) {
+        fail("MH_CreateHook", createStatus);
+        return false;
+    }
+    const auto enableStatus = MH_EnableHook(target);
+    if (enableStatus != MH_OK) {
+        fail("MH_EnableHook", enableStatus);
         MH_RemoveHook(target);
         *original = nullptr;
         return false;
