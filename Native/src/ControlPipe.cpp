@@ -1,5 +1,6 @@
 #include "Oinkster/ControlPipe.hpp"
 #include "Oinkster/PipeWait.hpp"
+#include "Oinkster/SettingsStore.hpp"
 #include <Windows.h>
 #include <sddl.h>
 #include <fstream>
@@ -52,6 +53,11 @@ void ControlPipe::Run() noexcept {
                 if(reply.empty())reply="{}";
             } else if(request.starts_with("set\n")) {
                 try {
+                    // Refuse a payload that would not parse: writing it would
+                    // make the reload quarantine the player's real settings
+                    // and fall back to defaults.
+                    const auto parsed=ParseClientSettings(std::string_view(request).substr(4));
+                    if(!parsed||parsed->clickGuiKey==parsed->unloadKey)throw std::runtime_error("invalid settings");
                     std::filesystem::create_directories(settingsPath_.parent_path());auto temporary=settingsPath_;temporary+=L".incoming";
                     {std::ofstream output(temporary,std::ios::binary|std::ios::trunc);output.write(request.data()+4,static_cast<std::streamsize>(request.size()-4));output.flush();if(!output.good())throw std::runtime_error("write");}
                     // Atomic replace - see SettingsStore::Save. The old

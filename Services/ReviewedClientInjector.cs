@@ -136,6 +136,18 @@ public sealed class ReviewedClientInjector : IClientInjector
                 }
 
                 cancellationToken.ThrowIfCancellationRequested();
+                // LoadLibraryW on a module that is already mapped only bumps
+                // its reference count; DllMain does not run again, so the
+                // runtime would never start. That happens when a previous
+                // unload had to leave the image in place (UnloadGuard). The
+                // caller only gets here when no live runtime answered the
+                // status pipe, so a mapped DLL means a dead one.
+                if (IsModuleLoaded(target, Path.GetFileName(dllPath)))
+                {
+                    return Failure(InjectionStatus.SecurityValidationFailed,
+                        "Oinkster is still loaded from an earlier session but is not running. Restart Minecraft, then press Play.");
+                }
+
                 threadHandle = CreateRemoteThread(processHandle, IntPtr.Zero, 0, loadLibrary, remotePath, 0, out _);
                 if (threadHandle == IntPtr.Zero)
                 {
@@ -145,6 +157,15 @@ public sealed class ReviewedClientInjector : IClientInjector
                 // WAIT_TIMEOUT, WAIT_FAILED and WAIT_ABANDONED all used to be
                 // reported as "timed out", which is only true of the first.
                 var wait = WaitForSingleObject(threadHandle, 10_000);
+                if (wait != WaitObject0)
+                {
+                    // The remote LoadLibraryW may still be running and reading
+                    // the path buffer (a slow disk, or antivirus scanning a
+                    // freshly updated DLL). Freeing it under the live loader
+                    // thread could crash Minecraft, so leak the few bytes.
+                    remotePath = IntPtr.Zero;
+                }
+
                 if (wait == WaitFailed)
                 {
                     return Failure(InjectionStatus.SecurityValidationFailed, Win32("Waiting on the activation thread failed."));
@@ -153,7 +174,7 @@ public sealed class ReviewedClientInjector : IClientInjector
                 if (wait != WaitObject0)
                 {
                     return Failure(InjectionStatus.TimedOut,
-                        "Client activation did not finish within 10 seconds. Minecraft may be busy or blocking the load.");
+                        "Client activation is taking longer than expected (antivirus may be scanning it). Wait a moment and press Play again; it may still finish loading.");
                 }
 
                 if (!GetExitCodeThread(threadHandle, out var exitCode))
@@ -208,6 +229,27 @@ public sealed class ReviewedClientInjector : IClientInjector
             return Failure(InjectionStatus.SecurityValidationFailed,
                 $"The installed client DLL could not be read: {exception.Message}");
         }
+    }
+
+    private static bool IsModuleLoaded(Process process, string moduleFileName)
+    {
+        try
+        {
+            process.Refresh();
+            foreach (ProcessModule module in process.Modules)
+            {
+                using (module)
+                {
+                    if (module.ModuleName.Equals(moduleFileName, StringComparison.OrdinalIgnoreCase)) return true;
+                }
+            }
+        }
+        catch (Exception exception) when (exception is Win32Exception or InvalidOperationException)
+        {
+            // Enumeration is best effort; fall through to a normal activation.
+        }
+
+        return false;
     }
 
     private static string? GetPackageName(IntPtr processHandle)

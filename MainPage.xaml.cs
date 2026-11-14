@@ -995,8 +995,15 @@ public sealed partial class MainPage : Page
             mediaBrokerService.TryStart(processId.Value);
         }
         var existingStatus = await nativeStatusService.QueryAsync();
+        // A runtime that answers the status pipe but is still starting (e.g.
+        // an earlier activation that outlasted the injector's wait) must be
+        // waited on, not activated a second time.
+        var existingStarting = existingStatus is not null
+            && string.Equals(existingStatus.State, "validating", StringComparison.OrdinalIgnoreCase);
         var injection = existingStatus?.State == "ready" && existingStatus.HooksInstalled == true
             ? new InjectionResult(InjectionStatus.Success, $"Oinkster is already active. Press {FormatKey(moduleSettings.MenuKey)} in-game to open it.")
+            : existingStarting
+                ? new InjectionResult(InjectionStatus.Success, "Oinkster was activated.")
             : processId is null
                 ? new InjectionResult(InjectionStatus.TargetExited, "Minecraft did not become ready in time.")
                 : await clientInjector.InjectAsync(processId.Value, clientUpdate!.InstalledBuild!);

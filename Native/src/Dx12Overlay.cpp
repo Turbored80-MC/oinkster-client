@@ -146,6 +146,18 @@ std::atomic_int extraHorizontalWheel{};
 // Remembered so settings changes, focus loss, and unload always emit key-up.
 std::vector<std::uint32_t> heldAssistKeys;
 bool menuKeyDown{};
+// A fresh WM_KEYDOWN of the menu key, latched by the window procedures and
+// consumed by the next Present. Polling GetAsyncKeyState once per frame alone
+// misses a quick tap on a slow or hitching frame, and on some setups the
+// async state lags or never shows the key at all; the message path catches
+// those. Both sources feed one press, de-duplicated by MenuToggleDebounce.
+std::atomic_bool menuKeyPressQueued{};
+std::chrono::steady_clock::time_point lastMenuToggleAt{};
+std::chrono::steady_clock::time_point lastMenuRefusalLogAt{};
+// Window thread only: the menu/unload key's last WM_KEYDOWN was passed to the
+// game (typed into chat), so its WM_KEYUP must be passed on too.
+bool menuKeyForwardedToGame{};
+bool unloadKeyForwardedToGame{};
 bool unloadKeyDown{};
 bool escapeKeyDown{};
 bool cursorVisibilityInitialized{};
@@ -200,6 +212,14 @@ bool cursorStateSaved{};
 std::atomic_bool cursorRestorePending{};
 
 bool IsCursorVisible() noexcept;
+
+bool GameProcessOwnsForeground() noexcept {
+    const HWND foreground = GetForegroundWindow();
+    if (!foreground) return false;
+    if (foreground == gameWindow) return true;
+    DWORD process{};
+    return GetWindowThreadProcessId(foreground, &process) != 0 && process == GetCurrentProcessId();
+}
 
 UINT WINAPI HookGetRawInputData(HRAWINPUT input, UINT command, LPVOID data, PUINT size, UINT headerSize) noexcept;
 
@@ -276,6 +296,12 @@ std::mutex extraProceduresMutex;
 std::unordered_map<HWND, WNDPROC> extraOriginalProcedures;
 
 LRESULT CALLBACK ExtraInputBlockingProcedure(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+    // On builds where a separate CoreWindow receives the keyboard, the menu
+    // key's WM_KEYDOWN only ever arrives here.
+    if ((message == WM_KEYDOWN || message == WM_SYSKEYDOWN) && (lParam & (1LL << 30)) == 0
+        && wParam == configuredMenuKey.load()) {
+        menuKeyPressQueued.store(true, std::memory_order_release);
+    }
     if (menuVisible) {
         const bool mouseRange = message >= WM_MOUSEFIRST && message <= WM_MOUSELAST;
         const bool keyRange = message >= WM_KEYFIRST && message <= WM_KEYLAST;
@@ -951,6 +977,9 @@ LRESULT CALLBACK WindowProcedure(HWND window, UINT message, WPARAM wParam, LPARA
         if (pressed && !repeated && wParam == VK_ESCAPE && !menuVisible) {
             pauseProbeRequested.store(true, std::memory_order_release);
         }
+        if (pressed && !repeated && wParam == configuredMenuKey.load()) {
+            menuKeyPressQueued.store(true, std::memory_order_release);
+        }
         {
             std::scoped_lock keyLock(keyStateMutex);
             keyStateTracker.Observe(static_cast<std::uint32_t>(wParam), pressed);
@@ -1022,6 +1051,23 @@ LRESULT CALLBACK WindowProcedure(HWND window, UINT message, WPARAM wParam, LPARA
         CloseMenuForFocusLoss();
         hudEditMode = false;
     }
+    // A menu/unload key press that went to the game (typed into chat) gets its
+    // release delivered too, even if the menu has opened in between, so the
+    // game never sees that key stuck down.
+    const bool menuControlKey = keyboardMessage && wParam == configuredMenuKey.load();
+    const bool unloadControlKey = keyboardMessage && wParam == configuredUnloadKey.load();
+    if ((menuControlKey || unloadControlKey) && (message == WM_KEYUP || message == WM_SYSKEYUP)) {
+        // ImGui saw this key go down (typed into a menu text field); it must
+        // see it come up too, or it keeps the key held.
+        if (menuVisible || overlayControlsVisible.load(std::memory_order_acquire)) {
+            std::scoped_lock imguiLock(imguiInputMutex);
+            if (imguiReady) (void)ImGui_ImplWin32_WndProcHandler(window, message, wParam, lParam);
+        }
+        bool& forwarded = menuControlKey ? menuKeyForwardedToGame : unloadKeyForwardedToGame;
+        if (!forwarded) return 0;
+        forwarded = false;
+        return CallWindowProcW(originalWindowProcedure, window, message, wParam, lParam);
+    }
     const bool controlsVisible = overlayControlsVisible.load(std::memory_order_acquire);
     if (menuVisible || controlsVisible) {
         bool wantCaptureMouse = false;
@@ -1036,14 +1082,17 @@ LRESULT CALLBACK WindowProcedure(HWND window, UINT message, WPARAM wParam, LPARA
         if (menuVisible && (mouseMessage || keyMessage || message == WM_INPUT || message == WM_CHAR)) return 0;
         if (controlsVisible && mouseMessage && wantCaptureMouse) return 0;
     }
-    // The menu's own toggle key is read via GetAsyncKeyState polling in the
-    // Present hook, on a completely separate timeline from this Win32 message
-    // pump. menuVisible only flips *after* that poll runs, so the raw
-    // WM_KEYDOWN/WM_KEYUP for the very keypress that opens the menu always
-    // arrives here first and would otherwise fall through to the game, every
-    // time, regardless of menuVisible. 'K' is reserved for us and must never
-    // reach gameplay, independent of menu state.
-    if (keyboardMessage && (wParam == configuredMenuKey.load() || wParam == configuredUnloadKey.load())) return 0;
+    // The menu key is acted on in the Present hook, on a separate timeline
+    // from this message pump: menuVisible only flips *after* this WM_KEYDOWN,
+    // so during gameplay the menu and unload keys are always swallowed here
+    // and never reach the game's own keybinds. When a game screen has the
+    // cursor (chat, signs, books, world names) they are ordinary letters the
+    // player is typing, and must reach the game; Present refuses the toggle
+    // and the unload there for the same reason.
+    if (menuControlKey || unloadControlKey) {
+        if (gameplayCaptured.load(std::memory_order_acquire)) return 0;
+        (menuControlKey ? menuKeyForwardedToGame : unloadKeyForwardedToGame) = true;
+    }
     if (!allowGameplay) return 0;
     if ((message == WM_KEYDOWN || message == WM_KEYUP) && moduleManager && !menuVisible
         && gameplayCaptured.load(std::memory_order_acquire) && TransformKeyMessage(window, message, wParam, lParam)) {
@@ -1366,12 +1415,12 @@ HRESULT STDMETHODCALLTYPE HookPresent(IDXGISwapChain* baseSwapChain, UINT interv
     const CallbackGuard callback;
     // GetAsyncKeyState is process-wide, not per-window: without this gate,
     // typing the menu key in a browser or Discord toggled the overlay, and the
-    // unload key ejected the client outright.
-    const bool gameFocused = gameWindow && GetForegroundWindow() == gameWindow;
-    const bool unloadDown = gameFocused
-        && (GetAsyncKeyState(static_cast<int>(configuredUnloadKey.load())) & 0x8000) != 0;
-    if (unloadDown && !unloadKeyDown) ejectRequested.store(true);
-    unloadKeyDown = unloadDown;
+    // unload key ejected the client outright. Focus is judged by process, not
+    // by one HWND: depending on the Minecraft build and Windows version the
+    // foreground window can be a different top-level window of this same
+    // process (a CoreWindow host, an IME window) than the one subclassed as
+    // gameWindow, and an exact-HWND match then left K dead on those PCs.
+    const bool gameFocused = gameWindow && GameProcessOwnsForeground();
     if (cursorRestorePending.exchange(false, std::memory_order_acq_rel) && !menuVisible) RestoreShowCursorCount();
     const bool cursorVisible = IsCursorVisible();
     const bool escapeDown = gameFocused && (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
@@ -1395,6 +1444,10 @@ HRESULT STDMETHODCALLTYPE HookPresent(IDXGISwapChain* baseSwapChain, UINT interv
     }
     const bool menuDown = gameFocused
         && (GetAsyncKeyState(static_cast<int>(configuredMenuKey.load())) & 0x8000) != 0;
+    // Always drained, so a press refused now (chat open, main menu) can never
+    // fire later.
+    const bool menuPressQueued = menuKeyPressQueued.exchange(false, std::memory_order_acq_rel);
+    const bool menuPressed = (menuDown && !menuKeyDown) || (gameFocused && menuPressQueued);
     // While a replay plays, K opens its editor; the editor's gear button
     // switches to the ClickGUI.
     bool replayRunning = ReplayInjector::Running();
@@ -1409,8 +1462,38 @@ HRESULT STDMETHODCALLTYPE HookPresent(IDXGISwapChain* baseSwapChain, UINT interv
         typingInMenu = imguiReady && ImGui::GetIO().WantTextInput;
     }
     const bool menuKeyAllowed = menuVisible ? !typingInMenu : (inWorld && (!cursorVisible || minecraftPauseVisible));
-    if (menuDown && !menuKeyDown && menuKeyAllowed) {
-        SetMenuVisible(!menuVisible, replayRunning ? MenuKind::ReplayEditor : MenuKind::ClickGui);
+    // The unload key is a character too: typed into chat or a menu text
+    // field it must not eject the client.
+    // Outside a world every Minecraft screen shows the cursor, and many have
+    // text fields (server address, world and realm names); only the title
+    // screen itself is known to have none.
+    const bool titleScreenOnly = !inWorld && ScreenTelemetry::Known() && ScreenTelemetry::OnTitleScreen();
+    const bool gameScreenTyping = !menuVisible && cursorVisible && !minecraftPauseVisible && !titleScreenOnly;
+    // Only a press that *starts* while unloading is allowed counts: tracking
+    // the raw held state means holding the key through closing chat is not
+    // mistaken for a fresh press.
+    const bool unloadDown = gameFocused
+        && (GetAsyncKeyState(static_cast<int>(configuredUnloadKey.load())) & 0x8000) != 0;
+    if (unloadDown && !unloadKeyDown && !typingInMenu && !gameScreenTyping) ejectRequested.store(true);
+    unloadKeyDown = unloadDown;
+    if (menuPressed) {
+        // One physical press usually reaches both sources (the async state
+        // and the window message) a frame or two apart; the second sighting
+        // must not toggle the menu straight back.
+        constexpr auto MenuToggleDebounce = std::chrono::milliseconds(200);
+        const auto pressedAt = std::chrono::steady_clock::now();
+        if (pressedAt - lastMenuToggleAt < MenuToggleDebounce) {
+            // Same press, already handled.
+        } else if (menuKeyAllowed) {
+            lastMenuToggleAt = pressedAt;
+            SetMenuVisible(!menuVisible, replayRunning ? MenuKind::ReplayEditor : MenuKind::ClickGui);
+        } else if (!typingInMenu && pressedAt - lastMenuRefusalLogAt >= std::chrono::seconds(2)) {
+            lastMenuRefusalLogAt = pressedAt;
+            Diagnostics::LogLine("info", "menu_key", std::format(
+                "press ignored inWorld={} worldKnown={} cursorVisible={} pauseVisible={} source={}",
+                inWorld, worldKnown, cursorVisible, minecraftPauseVisible,
+                menuPressQueued ? "message" : "poll"));
+        }
     }
     menuKeyDown = menuDown;
     // The replay hotbar takes the wheel and left click while the replay is
@@ -2170,6 +2253,11 @@ void Remove() noexcept {
     rawInputDataImportSlot = nullptr;
     moduleManager = nullptr;
     menuKeyDown = false;
+    menuKeyPressQueued.store(false, std::memory_order_release);
+    lastMenuToggleAt = {};
+    lastMenuRefusalLogAt = {};
+    menuKeyForwardedToGame = false;
+    unloadKeyForwardedToGame = false;
     unloadKeyDown = false;
     cursorVisibilityInitialized = false;
     menuVisible.store(false, std::memory_order_release);

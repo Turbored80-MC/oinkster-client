@@ -2692,12 +2692,27 @@ void DrawChevron(ImDrawList* draw, ImVec2 center, bool open, ImU32 color) {
     draw->AddPolyline(points.data(), static_cast<int>(points.size()), color, ImDrawFlags_None, 1.6F);
 }
 
-// Next key pressed since the last poll, or 0. Only called while a rebind is pending.
+// Next key pressed since the last poll, or 0. Only called while a rebind is
+// pending. Edge-detects the held bit (0x8000) against the previous call rather
+// than reading GetAsyncKeyState's low "pressed since last call" bit: that bit
+// is cleared by *any* GetAsyncKeyState call in the process, and the Present
+// hook samples every key each frame before the menu draws, so captures almost
+// never saw a press. The first call of a capture (no call on the previous
+// frame) only snapshots, so keys already held, such as the click on the
+// button that started the capture, are never taken as the new binding.
 int PollPressedKey() {
+    static std::array<bool, 256> wasDown{};
+    static int lastFrame = -2;
+    const int frame = ImGui::GetFrameCount();
+    const bool primed = frame - lastFrame <= 1;
+    lastFrame = frame;
+    int pressed = 0;
     for (int key = 8; key < 256; ++key) {
-        if ((GetAsyncKeyState(key) & 1) != 0) return key;
+        const bool down = (GetAsyncKeyState(key) & 0x8000) != 0;
+        if (primed && down && !wasDown[static_cast<std::size_t>(key)] && pressed == 0) pressed = key;
+        wasDown[static_cast<std::size_t>(key)] = down;
     }
-    return 0;
+    return pressed;
 }
 
 bool KeyButton(const char* id, std::uint32_t key, bool capturing, float width) {
