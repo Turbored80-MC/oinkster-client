@@ -10,4 +10,10 @@ public interface IClientUpdateService
         ClientRelease release,
         IProgress<DownloadProgress>? progress = null,
         CancellationToken cancellationToken = default);
+
+    // Downloads and verifies the launcher installer; returns its local path.
+    Task<string> DownloadLauncherAsync(
+        LauncherUpdate update,
+        IProgress<DownloadProgress>? progress = null,
+        CancellationToken cancellationToken = default);
 }

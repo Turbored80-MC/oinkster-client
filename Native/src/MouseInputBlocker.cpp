@@ -1,12 +1,16 @@
 #include "Oinkster/MouseInputBlocker.hpp"
+#include "Oinkster/Capabilities.hpp"
 #include "Oinkster/Diagnostics.hpp"
 #include "Oinkster/Dx12Overlay.hpp"
+#include "Oinkster/Module.hpp"
+#include "Oinkster/ModuleManager.hpp"
 #include <Windows.h>
 #include <GameInput.h>
 #include <MinHook.h>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstring>
 #include <format>
@@ -44,14 +48,59 @@ void* hookTarget{};
 void* internalHookTarget{};
 MouseFeedFunction originalMouseFeed{};
 std::atomic_bool internalWasActive{};
+std::atomic_bool buttonFilteringReady{};
+std::atomic_bool suppressedLeftRelease{};
+std::atomic_bool suppressedRightRelease{};
+std::atomic_bool forwardedLeftDown{};
+std::atomic_bool forwardedRightDown{};
+std::atomic_bool replayHotbar{};
+// A left/right press the replay hotbar took; its release must not reach
+// the game.
+std::atomic_bool hotbarSwallowedLeftDown{};
+std::atomic_bool hotbarSwallowedRightDown{};
+std::atomic<ModuleManager*> moduleManager{};
 std::chrono::steady_clock::time_point discoveryDeadline{};
 
+std::atomic_bool lookCapture{};
 bool havePosition{};
 bool wasActive{};
+bool wasCapturing{};
+std::int64_t captureLastX{};
+std::int64_t captureLastY{};
+std::int64_t capturedX{};
+std::int64_t capturedY{};
 std::int64_t offsetX{};
 std::int64_t offsetY{};
 std::int64_t frozenX{};
 std::int64_t frozenY{};
+
+std::atomic_bool blockWheel{};
+std::atomic<float> sensitivityX{1.0F};
+std::atomic<float> sensitivityY{1.0F};
+// Sensitivity: the reported position integrates scaled movement, so any
+// multiplier change (or 1.0) continues smoothly from where it was.
+bool haveScaled{};
+std::int64_t scaledInputX{};
+std::int64_t scaledInputY{};
+double scaledX{};
+double scaledY{};
+
+// Applied last to whatever position the reading reports (transformMutex held).
+void ApplySensitivity(GameInputMouseState* mouse) noexcept {
+    if (!haveScaled) {
+        scaledInputX = mouse->positionX;
+        scaledInputY = mouse->positionY;
+        scaledX = static_cast<double>(mouse->positionX);
+        scaledY = static_cast<double>(mouse->positionY);
+        haveScaled = true;
+    }
+    scaledX += static_cast<double>(mouse->positionX - scaledInputX) * sensitivityX.load(std::memory_order_relaxed);
+    scaledY += static_cast<double>(mouse->positionY - scaledInputY) * sensitivityY.load(std::memory_order_relaxed);
+    scaledInputX = mouse->positionX;
+    scaledInputY = mouse->positionY;
+    mouse->positionX = static_cast<std::int64_t>(std::llround(scaledX));
+    mouse->positionY = static_cast<std::int64_t>(std::llround(scaledY));
+}
 
 void DumpLoadedMinecraftImage(HMODULE module) noexcept {
 #if defined(_DEBUG)
@@ -179,6 +228,36 @@ bool STDMETHODCALLTYPE HookGetMouseState(void* reading, GameInputMouseState* mou
         mouse->buttons = static_cast<GameInputMouseButtons>(0);
         mouse->wheelX = 0;
         mouse->wheelY = 0;
+        ApplySensitivity(mouse);
+        return true;
+    }
+
+    if (lookCapture.load(std::memory_order_acquire)) {
+        if (!wasCapturing) {
+            frozenX = logicalX;
+            frozenY = logicalY;
+            captureLastX = logicalX;
+            captureLastY = logicalY;
+            wasCapturing = true;
+        }
+        capturedX += logicalX - captureLastX;
+        capturedY += logicalY - captureLastY;
+        captureLastX = logicalX;
+        captureLastY = logicalY;
+        mouse->positionX = frozenX;
+        mouse->positionY = frozenY;
+        ApplySensitivity(mouse);
+        return true;
+    }
+
+    if (wasCapturing) {
+        // Resume from the frozen position so the player does not jump.
+        offsetX = mouse->positionX - frozenX;
+        offsetY = mouse->positionY - frozenY;
+        mouse->positionX = frozenX;
+        mouse->positionY = frozenY;
+        wasCapturing = false;
+        ApplySensitivity(mouse);
         return true;
     }
 
@@ -191,11 +270,17 @@ bool STDMETHODCALLTYPE HookGetMouseState(void* reading, GameInputMouseState* mou
         mouse->wheelX = 0;
         mouse->wheelY = 0;
         wasActive = false;
+        ApplySensitivity(mouse);
         return true;
     }
 
     mouse->positionX = logicalX;
     mouse->positionY = logicalY;
+    if (blockWheel.load(std::memory_order_relaxed)) {
+        mouse->wheelX = 0;
+        mouse->wheelY = 0;
+    }
+    ApplySensitivity(mouse);
     return true;
 }
 
@@ -207,6 +292,10 @@ void __fastcall HookMouseFeed(void* mouseDevice, std::int8_t type, std::int8_t a
         if (!internalWasActive.exchange(true, std::memory_order_acq_rel) && originalMouseFeed) {
             originalMouseFeed(mouseDevice, 1, 0, mouseX, mouseY, 0, 0, extra);
             originalMouseFeed(mouseDevice, 2, 0, mouseX, mouseY, 0, 0, extra);
+            forwardedLeftDown.store(false, std::memory_order_release);
+            forwardedRightDown.store(false, std::memory_order_release);
+            suppressedLeftRelease.store(false, std::memory_order_release);
+            suppressedRightRelease.store(false, std::memory_order_release);
         }
         if (type == 4) {
             const auto rawAction = static_cast<std::uint8_t>(action);
@@ -216,6 +305,59 @@ void __fastcall HookMouseFeed(void* mouseDevice, std::int8_t type, std::int8_t a
         return;
     }
     internalWasActive.store(false, std::memory_order_release);
+
+    // Replay hotbar: wheel notches pick a slot and a left click uses it.
+    if (type == 1 && action == 0 && hotbarSwallowedLeftDown.exchange(false, std::memory_order_acq_rel)) return;
+    if (type == 2 && action == 0 && hotbarSwallowedRightDown.exchange(false, std::memory_order_acq_rel)) return;
+    if (replayHotbar.load(std::memory_order_acquire)) {
+        if (type == 4) {
+            const auto rawAction = static_cast<std::uint8_t>(action);
+            if (rawAction == 0x78 || rawAction == 0x7f) Dx12Overlay::QueueReplayHotbarScroll(1);
+            else if (rawAction == 0x80 || rawAction == 0x88) Dx12Overlay::QueueReplayHotbarScroll(-1);
+            return;
+        }
+        if (type == 1 && action != 0 && !forwardedLeftDown.load(std::memory_order_acquire)) {
+            hotbarSwallowedLeftDown.store(true, std::memory_order_release);
+            Dx12Overlay::QueueReplayHotbarClick();
+            return;
+        }
+        if (type == 2 && action != 0 && !forwardedRightDown.load(std::memory_order_acquire)) {
+            hotbarSwallowedRightDown.store(true, std::memory_order_release);
+            Dx12Overlay::QueueReplayHotbarRightClick();
+            return;
+        }
+    }
+
+    // Scroll wheel disabler: the hotbar never sees the notch.
+    if (type == 4 && blockWheel.load(std::memory_order_relaxed)) return;
+
+    // MouseDevice::feed types 1/2 are left/right button transitions and
+    // action 0/1 is up/down. This is the authoritative producer shared by
+    // GameInput and Win32 raw input on the reviewed build. Publish before the
+    // game receives the packet so Immediate modules can cancel it; later
+    // modules still observe the same event as raw telemetry.
+    if ((type == 1 || type == 2) && buttonFilteringReady.load(std::memory_order_acquire)) {
+        const std::uint32_t button = type == 1 ? 1U : 2U;
+        const bool pressed = action != 0;
+        auto& pairedRelease = type == 1 ? suppressedLeftRelease : suppressedRightRelease;
+        auto& forwardedDown = type == 1 ? forwardedLeftDown : forwardedRightDown;
+        if (!pressed && pairedRelease.exchange(false, std::memory_order_acq_rel)) return;
+        if (auto* modules = moduleManager.load(std::memory_order_acquire)) {
+            const MouseEvent event{static_cast<float>(mouseX), static_cast<float>(mouseY), 0.0F,
+                pressed ? button : 0U, button, pressed, false, SteadyClock::now()};
+            if (!modules->PublishInput(event)) {
+                // Suppress the matching release only when gameplay never saw
+                // a down. If a device emits a duplicate down while already
+                // held, its eventual up must still be forwarded or the game
+                // would be left with a stuck attack/use button.
+                if (pressed && !forwardedDown.load(std::memory_order_acquire)) {
+                    pairedRelease.store(true, std::memory_order_release);
+                }
+                return;
+            }
+        }
+        forwardedDown.store(pressed, std::memory_order_release);
+    }
     if (originalMouseFeed) {
         originalMouseFeed(mouseDevice, type, action, mouseX, mouseY, movementX, movementY, extra);
     }
@@ -257,6 +399,7 @@ bool TryInstallInternalQueueHook(std::wstring& detail) noexcept {
     }
 
     internalHookTarget = feedTarget;
+    buttonFilteringReady.store(true, std::memory_order_release);
     detail = L"GameInput and the exact 1.26 mouse feed are guarded.";
     Diagnostics::LogLine("info", "internal_mouse_scan", "Validated Minecraft 1.26 MouseDevice::feed hook installed");
     return true;
@@ -266,15 +409,31 @@ InstallState RetryOrFail(std::wstring& detail, std::wstring_view message) noexce
     detail.assign(message);
     if (std::chrono::steady_clock::now() < discoveryDeadline) return InstallState::Initializing;
     state.store(InstallState::Unavailable, std::memory_order_release);
+    if (auto* modules = moduleManager.load(std::memory_order_acquire)) {
+        try {
+            modules->SetCapability(Capability::InputFiltering, {CapabilityState::Unavailable,
+                L"The reviewed mouse input path did not become available: " + detail});
+        } catch (...) {}
+    }
     return InstallState::Unavailable;
 }
 }
 
-bool Install(std::wstring& detail) noexcept {
+bool Install(ModuleManager& modules, std::wstring& detail) noexcept {
     std::scoped_lock lock(installMutex);
+    moduleManager.store(&modules, std::memory_order_release);
+    buttonFilteringReady.store(false, std::memory_order_release);
+    suppressedLeftRelease.store(false, std::memory_order_release);
+    suppressedRightRelease.store(false, std::memory_order_release);
+    forwardedLeftDown.store(false, std::memory_order_release);
+    forwardedRightDown.store(false, std::memory_order_release);
     active.store(false, std::memory_order_release);
     discoveryDeadline = std::chrono::steady_clock::now() + DiscoveryTimeout;
     state.store(InstallState::Initializing, std::memory_order_release);
+    try {
+        modules.SetCapability(Capability::InputFiltering, {CapabilityState::Pending,
+            L"Waiting for the reviewed Minecraft mouse queue hook to validate."});
+    } catch (...) {}
     detail = L"GameInput mouse discovery is initializing.";
     return true;
 }
@@ -332,6 +491,14 @@ InstallState PollInstall(std::wstring& detail) noexcept {
         internalReady ? "Validated Minecraft 1.26 MouseDevice::feed hook installed"
             : "Minecraft 1.26 mouse feed signature unavailable; see internal_mouse_scan counts");
     state.store(InstallState::Ready, std::memory_order_release);
+    if (auto* modules = moduleManager.load(std::memory_order_acquire)) {
+        try {
+            modules->SetCapability(Capability::InputFiltering, internalReady
+                ? CapabilityStatus{CapabilityState::Available, {}}
+                : CapabilityStatus{CapabilityState::Unavailable,
+                    L"The reviewed Minecraft mouse queue signature did not validate; button filtering is disabled."});
+        } catch (...) {}
+    }
     detail = internalReady ? internalDetail : L"GameInput is guarded; the internal 1.26 mouse queue signature was unavailable.";
     Diagnostics::LogLine("info", "mouse_input_blocker", "GameInput GetMouseState hook installed");
     return InstallState::Ready;
@@ -339,10 +506,34 @@ InstallState PollInstall(std::wstring& detail) noexcept {
 
 InstallState State() noexcept { return state.load(std::memory_order_acquire); }
 
+bool CanFilterButtons() noexcept { return buttonFilteringReady.load(std::memory_order_acquire); }
+
 void SetActive(bool value) noexcept { active.store(value, std::memory_order_release); }
+
+void SetReplayHotbar(bool enabled) noexcept { replayHotbar.store(enabled, std::memory_order_release); }
+
+bool ReplayHotbarCaptured() noexcept { return internalHookTarget != nullptr && originalMouseFeed != nullptr; }
+
+void SetLookCapture(bool capture) noexcept { lookCapture.store(capture, std::memory_order_release); }
+
+void SetMouseShaping(const MouseShaping& shaping) noexcept {
+    blockWheel.store(shaping.blockWheel, std::memory_order_relaxed);
+    const auto clampScale = [](float value) { return std::isfinite(value) ? std::clamp(value, 0.05F, 5.0F) : 1.0F; };
+    sensitivityX.store(clampScale(shaping.sensitivityX), std::memory_order_relaxed);
+    sensitivityY.store(clampScale(shaping.sensitivityY), std::memory_order_relaxed);
+}
+
+void TakeLookDelta(std::int64_t& deltaX, std::int64_t& deltaY) noexcept {
+    std::scoped_lock lock(transformMutex);
+    deltaX = capturedX;
+    deltaY = capturedY;
+    capturedX = 0;
+    capturedY = 0;
+}
 
 void Remove() noexcept {
     active.store(false, std::memory_order_release);
+    replayHotbar.store(false, std::memory_order_release);
     std::scoped_lock installLock(installMutex);
     state.store(InstallState::Unavailable, std::memory_order_release);
     if (hookTarget) (void)MH_DisableHook(hookTarget);
@@ -356,8 +547,23 @@ void Remove() noexcept {
     internalHookTarget = nullptr;
     originalGetMouseState = nullptr;
     originalMouseFeed = nullptr;
+    buttonFilteringReady.store(false, std::memory_order_release);
+    suppressedLeftRelease.store(false, std::memory_order_release);
+    suppressedRightRelease.store(false, std::memory_order_release);
+    forwardedLeftDown.store(false, std::memory_order_release);
+    forwardedRightDown.store(false, std::memory_order_release);
     internalWasActive.store(false, std::memory_order_release);
+    if (auto* modules = moduleManager.exchange(nullptr, std::memory_order_acq_rel)) {
+        try {
+            modules->SetCapability(Capability::InputFiltering,
+                {CapabilityState::Unavailable, L"Mouse input filtering was detached."});
+        } catch (...) {}
+    }
+    blockWheel.store(false, std::memory_order_relaxed);
+    sensitivityX.store(1.0F, std::memory_order_relaxed);
+    sensitivityY.store(1.0F, std::memory_order_relaxed);
     std::scoped_lock transformLock(transformMutex);
+    haveScaled = false;
     havePosition = false;
     wasActive = false;
     offsetX = 0;

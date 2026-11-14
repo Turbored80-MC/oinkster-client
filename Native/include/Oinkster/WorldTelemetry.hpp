@@ -1,5 +1,7 @@
 #pragma once
 
+#include "Oinkster/Events.hpp"
+#include <optional>
 #include <string>
 
 namespace Oinkster { class ModuleManager; }
@@ -24,5 +26,21 @@ namespace Oinkster::WorldTelemetry {
 // player's feet position (and in third-person view, from the player).
 [[nodiscard]] bool Install(ModuleManager& modules, std::wstring& detail) noexcept;
 void Remove() noexcept;
+
+// True while the hook is installed.
+[[nodiscard]] bool Attached() noexcept;
+// True when Minecraft prepared a level for rendering within `window` of
+// `now`, i.e. the player is in a world (the main menu renders no level).
+[[nodiscard]] bool LevelRenderedWithin(SteadyTime now, SteadyClock::duration window) noexcept;
+
+// The local camera as last read: eye position and, when the rotation
+// component validated, yaw/pitch (Bedrock convention, see PlayerTransform).
+struct View {
+    SteadyTime capturedAt{};
+    Vec3 eye{};
+    std::optional<float> yawDegrees;
+    std::optional<float> pitchDegrees;
+};
+[[nodiscard]] std::optional<View> LatestView() noexcept;
 
 }

@@ -218,4 +218,49 @@ std::string Escape(std::string_view text) {
     return output;
 }
 
+namespace {
+void AppendValue(std::string& output, const Value& value) {
+    if (value.IsNull()) { output += "null"; return; }
+    if (const auto* boolean = value.AsBool()) { output += *boolean ? "true" : "false"; return; }
+    if (const auto* number = value.AsNumber()) {
+        output += std::format("{:.17g}", *number);
+        return;
+    }
+    if (const auto* string = value.AsString()) {
+        output += '"';
+        output += Escape(*string);
+        output += '"';
+        return;
+    }
+    if (const auto* array = value.AsArray()) {
+        output += '[';
+        bool first = true;
+        for (const auto& item : *array) {
+            if (!first) output += ',';
+            first = false;
+            AppendValue(output, item);
+        }
+        output += ']';
+        return;
+    }
+    output += '{';
+    bool first = true;
+    for (const auto& [key, item] : *value.AsObject()) {
+        if (!first) output += ',';
+        first = false;
+        output += '"';
+        output += Escape(key);
+        output += "\":";
+        AppendValue(output, item);
+    }
+    output += '}';
+}
+}
+
+std::string Stringify(const Value& value) {
+    std::string output;
+    AppendValue(output, value);
+    return output;
+}
+
 }

@@ -1,6 +1,9 @@
+using System.ComponentModel;
+using System.Diagnostics;
 using Microsoft.UI;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
+using Microsoft.UI.Xaml.Input;
 using Microsoft.UI.Xaml.Media;
 using OinksterClient.Models;
 using OinksterClient.Services;
@@ -11,10 +14,15 @@ namespace OinksterClient;
 
 public sealed partial class MainPage : Page
 {
+    private enum KeyCaptureAction { Cancelled, Captured, Cleared }
+    private readonly record struct KeyCaptureResult(KeyCaptureAction Action, uint Key = 0);
+
     private readonly BedrockService bedrockService = new();
     private readonly LauncherSettingsService settingsService = new();
+    private readonly BedrockVsyncPreflightService vsyncPreflightService = new();
     private readonly IClientInjector clientInjector = new ReviewedClientInjector();
     private readonly NativeClientStatusService nativeStatusService = new();
+    private readonly MediaBrokerService mediaBrokerService = new();
     private readonly ModuleSettingsService moduleSettingsService = new();
     private readonly IClientUpdateService updateService = new GitHubClientUpdateService(
         new HttpClient { Timeout = TimeSpan.FromSeconds(15) },
@@ -22,6 +30,7 @@ public sealed partial class MainPage : Page
     private BedrockInstallation bedrockInstallation = BedrockInstallation.NotInstalled;
     private ClientUpdateResult? clientUpdate;
     private bool settingsLoaded;
+    private bool launcherUpdateStarted;
     private CancellationTokenSource? updateCheckCancellation;
     private IReadOnlyList<ModuleDefinition> moduleCatalog = [];
     private ModuleSettingsDocument moduleSettings = new();
@@ -30,11 +39,18 @@ public sealed partial class MainPage : Page
     private bool moduleUiLoading;
     private bool moduleRefreshInFlight;
     private readonly DispatcherTimer moduleRefreshTimer = new() { Interval = TimeSpan.FromMilliseconds(500) };
+    private static readonly TimeSpan StaleUpdateCheck = TimeSpan.FromMinutes(10);
+    private readonly DispatcherTimer updateCheckTimer = new() { Interval = TimeSpan.FromMinutes(30) };
+    private DateTimeOffset lastUpdateCheck;
+    // A download, update prompt or game launch is running.
+    private bool busy;
 
     public MainPage()
     {
         InitializeComponent();
+        AppVersionText.Text = $"Oinkster {AppVersion.Display}";
         moduleRefreshTimer.Tick += ModuleRefreshTimer_Tick;
+        updateCheckTimer.Tick += UpdateCheckTimer_Tick;
         // Deliberately NOT started here: the tick handler reads moduleCatalog
         // and moduleSettings, which Page_Loaded is what initialises. Starting
         // in the constructor let ticks run against an empty workspace.
@@ -48,6 +64,8 @@ public sealed partial class MainPage : Page
         // a continuation could touch torn-down XAML.
         moduleRefreshTimer.Stop();
         moduleRefreshTimer.Tick -= ModuleRefreshTimer_Tick;
+        updateCheckTimer.Stop();
+        updateCheckTimer.Tick -= UpdateCheckTimer_Tick;
         updateCheckCancellation?.Cancel();
     }
 
@@ -89,6 +107,15 @@ public sealed partial class MainPage : Page
         if (bedrockInstallation.IsInstalled && CheckForUpdatesToggle.IsOn)
         {
             await RefreshClientStatusAsync();
+            await ApplyUpdatesAsync();
+        }
+        else if (CheckForUpdatesToggle.IsOn)
+        {
+            // No Bedrock means no client status to show, but the launcher
+            // itself can still be out of date.
+            var result = await updateService.CheckAsync(SelectedChannel(), null);
+            lastUpdateCheck = DateTimeOffset.UtcNow;
+            await TryUpdateLauncherAsync(result.Launcher);
         }
         else if (bedrockInstallation.IsInstalled)
         {
@@ -99,6 +126,7 @@ public sealed partial class MainPage : Page
 
         // Safe to start polling only now that the workspace is populated.
         moduleRefreshTimer.Start();
+        updateCheckTimer.Start();
     });
 
     private void LoadSettings()
@@ -151,17 +179,7 @@ public sealed partial class MainPage : Page
 
     private async Task RefreshClientStatusAsync()
     {
-#if DEBUG
-        var developmentBuild = DevelopmentClientBuildService.TryLoad();
-        if (developmentBuild is not null)
-        {
-            clientUpdate = new ClientUpdateResult(UpdateStatus.Ready, null, developmentBuild, "Local reviewed Debug build.");
-            ClientBuildText.Text = $"Development build {developmentBuild.Version}";
-            PlayButtonText.Text = "Launch Oinkster";
-            PlayButton.IsEnabled = true;
-            return;
-        }
-#endif
+        var bundledBuild = DevelopmentClientBuildService.TryLoad();
         // Cancel the previous check but do NOT dispose it here: a still-running
         // CheckAsync holds its token, and disposing the source out from under
         // it can throw ObjectDisposedException. The superseded call disposes
@@ -170,7 +188,7 @@ public sealed partial class MainPage : Page
         var cancellation = new CancellationTokenSource();
         updateCheckCancellation = cancellation;
         var cancellationToken = cancellation.Token;
-        var channel = (UpdateChannelComboBox.SelectedItem as ComboBoxItem)?.Content?.ToString() ?? "Release";
+        var channel = SelectedChannel();
         ClientBuildText.Text = $"Checking {channel.ToLowerInvariant()} channel…";
 
         ClientUpdateResult result;
@@ -198,7 +216,51 @@ public sealed partial class MainPage : Page
 
         updateCheckCancellation = null;
         cancellation.Dispose();
-        clientUpdate = result;
+        clientUpdate = UseBundledClientWhenCompatible(result, bundledBuild, bedrockInstallation.Version);
+        lastUpdateCheck = DateTimeOffset.UtcNow;
+        ShowClientStatus();
+    }
+
+    private static ClientUpdateResult UseBundledClientWhenCompatible(
+        ClientUpdateResult result,
+        InstalledClientBuild? bundledBuild,
+        string? installedBedrockVersion)
+    {
+        if (bundledBuild is null
+            || !Version.TryParse(bundledBuild.Bedrock.ExactVersion, out var supported)
+            || !Version.TryParse(installedBedrockVersion, out var installed)
+            || supported != installed)
+        {
+            return result;
+        }
+
+        // A published release for an older Bedrock build must not disable the
+        // reviewed client shipped with this launcher. Preserve a genuinely
+        // newer compatible release as an update; otherwise launch the bundle.
+        if (result.Release is { } release
+            && Version.TryParse(release.Manifest.Version, out var availableVersion)
+            && Version.TryParse(bundledBuild.Version, out var bundledVersion)
+            && Version.TryParse(release.Manifest.Bedrock.ExactVersion, out var releaseBedrock)
+            && releaseBedrock == installed
+            && availableVersion > bundledVersion)
+        {
+            return result with { Status = UpdateStatus.UpdateAvailable, InstalledBuild = bundledBuild };
+        }
+
+        return new ClientUpdateResult(
+            UpdateStatus.Ready,
+            null,
+            bundledBuild,
+            "Using the reviewed client bundled with this launcher.",
+            result.Launcher);
+    }
+
+    private void ShowClientStatus()
+    {
+        if (clientUpdate is null)
+        {
+            return;
+        }
 
         switch (clientUpdate.Status)
         {
@@ -407,7 +469,9 @@ public sealed partial class MainPage : Page
         if (ReferenceEquals(left, right)) return true;
         if (left is null || right is null || left.State != right.State) return false;
         return DictionaryEqual(left.Capabilities, right.Capabilities)
-            && DictionaryEqual(left.CapabilityReasons, right.CapabilityReasons);
+            && DictionaryEqual(left.CapabilityReasons, right.CapabilityReasons)
+            && left.ServerNetwork == right.ServerNetwork
+            && DictionaryEqual(left.CompetitivePolicies, right.CompetitivePolicies);
     }
 
     private static bool DictionaryEqual(
@@ -425,16 +489,20 @@ public sealed partial class MainPage : Page
         selectedModule = definition;
         var settings = GetModuleSettings(definition.Id);
         var runtimeIssue = RuntimeIssue(definition);
+        var policyState = CompetitivePolicyState(definition);
         moduleUiLoading = true;
         InspectorCategoryText.Text = !definition.Available ? $"Roadmap · {definition.Category}"
             : runtimeIssue is not null ? $"Waiting · {definition.Category}" : definition.Category;
         InspectorNameText.Text = definition.Name;
         InspectorDescriptionText.Text = definition.Description;
-        ModuleEnabledToggle.IsEnabled = definition.Available;
+        ModuleEnabledToggle.IsEnabled = definition.Available && policyState != "blocked";
         ModuleEnabledToggle.IsOn = definition.Available && settings.Enabled;
         ModuleControlsPanel.Visibility = definition.Available ? Visibility.Visible : Visibility.Collapsed;
-        InspectorRoadmapText.Visibility = definition.Available && runtimeIssue is null ? Visibility.Collapsed : Visibility.Visible;
-        InspectorRoadmapText.Text = runtimeIssue ?? definition.UnavailableReason ?? "This module needs additional validated game integration.";
+        var policySummary = CompetitivePolicySummary(definition, policyState);
+        InspectorRoadmapText.Visibility = definition.Available && runtimeIssue is null && policySummary is null
+            ? Visibility.Collapsed : Visibility.Visible;
+        InspectorRoadmapText.Text = runtimeIssue ?? policySummary ?? definition.UnavailableReason
+            ?? "This module needs additional validated game integration.";
         ModuleKeybindButton.Content = settings.Keybind is null ? "Set keybind" : $"Keybind: {FormatKey(settings.Keybind.Value)}";
         ModuleScaleSlider.IsEnabled = definition.Hud;
         ModuleBackgroundToggle.IsEnabled = definition.Hud;
@@ -445,24 +513,38 @@ public sealed partial class MainPage : Page
         ModuleBackgroundColorBox.Text = settings.Hud.BackgroundColor;
         ModuleTextColorBox.Text = settings.Hud.TextColor;
         ModuleAccentColorBox.Text = settings.Hud.AccentColor;
-        var isCrosshair = definition.Id == "custom-crosshair";
+        HudAppearancePanel.Visibility = definition.Hud ? Visibility.Visible : Visibility.Collapsed;
+        var isCrosshair = definition.Id == CrosshairSettings.ModuleId;
         CrosshairControlsPanel.Visibility = isCrosshair ? Visibility.Visible : Visibility.Collapsed;
-        if (isCrosshair)
-        {
-            CrosshairSizeSlider.Value = ReadModuleNumber("custom-crosshair.size", 6);
-            CrosshairGapSlider.Value = ReadModuleNumber("custom-crosshair.gap", 3);
-            CrosshairThicknessSlider.Value = ReadModuleNumber("custom-crosshair.thickness", 2);
-            CrosshairOutlineToggle.IsOn = !moduleSettings.ModuleSettings.TryGetValue("custom-crosshair.outline", out var outline) || outline == "true";
-        }
+        if (isCrosshair) LoadCrosshairControls();
         moduleUiLoading = false;
+    }
+
+    private string? CompetitivePolicyState(ModuleDefinition definition)
+    {
+        if (definition.Id is not ("dc-prevent" or "cps-cap")) return null;
+        return moduleNativeStatus?.CompetitivePolicies?.TryGetValue(definition.Id, out var state) == true ? state : null;
+    }
+
+    private string? CompetitivePolicySummary(ModuleDefinition definition, string? state)
+    {
+        if (definition.Id is not ("dc-prevent" or "cps-cap") || state is null) return null;
+        var network = moduleNativeStatus?.ServerNetwork ?? "unknown-remote";
+        var label = network switch
+        {
+            "local" => "local or single-player sessions",
+            "unknown-remote" => "an unrecognized remote server",
+            _ => network
+        };
+        return $"Server policy: {state} on {label}. Rules last reviewed October 16, 2026.";
     }
 
     private void ModuleSetting_Changed(object sender, object e) => RunGuarded(async () =>
     {
         if (moduleUiLoading || selectedModule is null || !selectedModule.Available) return;
         var settings = GetModuleSettings(selectedModule.Id);
-        var invariant = System.Globalization.CultureInfo.InvariantCulture;
-        var isCrosshair = selectedModule.Id == "custom-crosshair";
+        var isCrosshair = selectedModule.Id == CrosshairSettings.ModuleId;
+        var stored = moduleSettings.ModuleSettings;
 
         // Write only the control that raised this event. Re-reading every
         // control on every change meant a LostFocus on one colour box also
@@ -488,22 +570,40 @@ public sealed partial class MainPage : Page
                 break;
             case var _ when ReferenceEquals(sender, ModuleTextColorBox):
                 if (!TryApplyColor(ModuleTextColorBox, value => settings.Hud.TextColor = value)) return;
-                if (isCrosshair) moduleSettings.ModuleSettings["custom-crosshair.color"] = settings.Hud.TextColor;
                 break;
             case var _ when ReferenceEquals(sender, ModuleAccentColorBox):
                 if (!TryApplyColor(ModuleAccentColorBox, value => settings.Hud.AccentColor = value)) return;
                 break;
-            case var _ when ReferenceEquals(sender, CrosshairSizeSlider) && isCrosshair:
-                moduleSettings.ModuleSettings["custom-crosshair.size"] = CrosshairSizeSlider.Value.ToString(invariant);
+            case var _ when ReferenceEquals(sender, CrosshairSourceComboBox) && isCrosshair:
+                if (SelectedTag(CrosshairSourceComboBox) is not { } source) return;
+                stored[CrosshairSettings.SourceKey] = source;
+                UpdateCrosshairSourceVisibility(source);
                 break;
-            case var _ when ReferenceEquals(sender, CrosshairGapSlider) && isCrosshair:
-                moduleSettings.ModuleSettings["custom-crosshair.gap"] = CrosshairGapSlider.Value.ToString(invariant);
+            case var _ when ReferenceEquals(sender, CrosshairPerspectiveComboBox) && isCrosshair:
+                if (SelectedTag(CrosshairPerspectiveComboBox) is not { } perspective) return;
+                stored[CrosshairSettings.PerspectiveKey] = perspective;
                 break;
-            case var _ when ReferenceEquals(sender, CrosshairThicknessSlider) && isCrosshair:
-                moduleSettings.ModuleSettings["custom-crosshair.thickness"] = CrosshairThicknessSlider.Value.ToString(invariant);
+            case var _ when ReferenceEquals(sender, CrosshairColorBox) && isCrosshair:
+                if (CrosshairSettings.NormalizeColor(CrosshairColorBox.Text) is not { } color)
+                {
+                    ShowError("Invalid color", "Use #AARRGGBB or #RRGGBB, for example #FFFFFFFF.");
+                    return;
+                }
+                ActionInfo.IsOpen = false;
+                CrosshairColorBox.Text = color;
+                stored[CrosshairSettings.ColorKey] = color;
+                break;
+            case var _ when isCrosshair && CrosshairNumberFor(sender) is { } number:
+                stored[number.Setting.Key] = CrosshairSettings.FormatNumber(number.Slider.Value);
                 break;
             case var _ when ReferenceEquals(sender, CrosshairOutlineToggle) && isCrosshair:
-                moduleSettings.ModuleSettings["custom-crosshair.outline"] = CrosshairOutlineToggle.IsOn ? "true" : "false";
+                stored[CrosshairSettings.Outline.Key] = CrosshairOutlineToggle.IsOn ? "true" : "false";
+                break;
+            case var _ when ReferenceEquals(sender, CrosshairCenterDotToggle) && isCrosshair:
+                stored[CrosshairSettings.CenterDot.Key] = CrosshairCenterDotToggle.IsOn ? "true" : "false";
+                break;
+            case var _ when ReferenceEquals(sender, CrosshairThirdPersonToggle) && isCrosshair:
+                stored[CrosshairSettings.ThirdPerson.Key] = CrosshairThirdPersonToggle.IsOn ? "true" : "false";
                 break;
             default:
                 return;
@@ -545,45 +645,126 @@ public sealed partial class MainPage : Page
     private void ModuleKeybindButton_Click(object sender, RoutedEventArgs e) => RunGuarded(async () =>
     {
         if (selectedModule is null) return;
-        var input = new TextBox { PlaceholderText = "A-Z, 0-9, or virtual-key number", MaxLength = 5 };
-        var dialog = new ContentDialog { XamlRoot = XamlRoot, Title = $"Bind {selectedModule.Name}", Content = input, PrimaryButtonText = "Save", SecondaryButtonText = "Clear", CloseButtonText = "Cancel", DefaultButton = ContentDialogButton.Primary };
-        var result = await dialog.ShowAsync();
-
-        // Cancel/Esc must change nothing. This used to fall through to
-        // SaveAsync on every outcome, so each cancel bumped Revision, rewrote
-        // settings.json and pushed a "set" over the control pipe. Resolving
-        // the outcome before touching GetModuleSettings also stops a cancel
-        // from silently inserting a default entry for the module.
-        if (result is not (ContentDialogResult.Primary or ContentDialogResult.Secondary)) return;
-
-        var settings = GetModuleSettings(selectedModule.Id);
-        if (result == ContentDialogResult.Secondary)
+        var moduleId = selectedModule.Id;
+        var moduleName = selectedModule.Name;
+        var currentKey = GetModuleSettings(moduleId).Keybind;
+        var result = await CaptureKeyAsync($"Bind {moduleName}", currentKey, true, key =>
         {
-            settings.Keybind = null;
-        }
-        else
-        {
-            if (!TryParseKey(input.Text, out var key))
-            {
-                ActionInfo.Title = "Key not recognised";
-                ActionInfo.Message = "Enter a single letter or digit, or a virtual-key number from 1 to 255.";
-                ActionInfo.Severity = InfoBarSeverity.Warning; ActionInfo.IsOpen = true; return;
-            }
             if (key == moduleSettings.MenuKey || key == moduleSettings.UnloadKey)
             {
-                ActionInfo.Title = "Key is reserved"; ActionInfo.Message = "Choose a key other than the menu or unload key."; ActionInfo.Severity = InfoBarSeverity.Warning; ActionInfo.IsOpen = true; return;
+                return "That key opens or unloads Oinkster. Press a different key.";
             }
-            settings.Keybind = key;
-        }
+
+            var conflict = moduleSettings.Modules.FirstOrDefault(pair =>
+                pair.Key != moduleId && pair.Value.Keybind == key);
+            if (conflict.Key is not null)
+            {
+                var conflictName = moduleCatalog.FirstOrDefault(item => item.Id == conflict.Key)?.Name ?? conflict.Key;
+                return $"{FormatKey(key)} is already assigned to {conflictName}.";
+            }
+
+            return null;
+        });
+        if (result.Action == KeyCaptureAction.Cancelled) return;
+
+        var settings = GetModuleSettings(moduleId);
+        settings.Keybind = result.Action == KeyCaptureAction.Cleared ? null : result.Key;
         if (!await SaveModuleSettingsAsync()) return;
-        SelectModule(selectedModule);
+        SelectModule(moduleCatalog.FirstOrDefault(item => item.Id == moduleId));
     });
 
-    private static bool TryParseKey(string value, out uint key)
+    private async Task<KeyCaptureResult> CaptureKeyAsync(
+        string title,
+        uint? currentKey,
+        bool allowClear,
+        Func<uint, string?> validate)
     {
-        value = value.Trim();
-        if (value.Length == 1 && char.IsLetterOrDigit(value[0])) { key = char.ToUpperInvariant(value[0]); return true; }
-        return uint.TryParse(value, out key) && key is > 0 and < 256;
+        var promptTitle = new TextBlock
+        {
+            Text = "Press a key",
+            HorizontalAlignment = HorizontalAlignment.Center,
+            Foreground = new SolidColorBrush(Windows.UI.Color.FromArgb(255, 247, 242, 245)),
+            FontSize = 18,
+            FontWeight = Microsoft.UI.Text.FontWeights.SemiBold
+        };
+        var promptDetail = new TextBlock
+        {
+            Text = currentKey is null ? "No key is assigned" : $"Currently {FormatKey(currentKey.Value)}",
+            HorizontalAlignment = HorizontalAlignment.Center,
+            Foreground = new SolidColorBrush(Windows.UI.Color.FromArgb(255, 155, 148, 156)),
+            FontSize = 12,
+            TextWrapping = TextWrapping.Wrap
+        };
+        var prompt = new Button
+        {
+            MinHeight = 112,
+            HorizontalAlignment = HorizontalAlignment.Stretch,
+            HorizontalContentAlignment = HorizontalAlignment.Center,
+            Padding = new Thickness(22),
+            Background = new SolidColorBrush(Windows.UI.Color.FromArgb(255, 41, 35, 42)),
+            BorderBrush = new SolidColorBrush(Windows.UI.Color.FromArgb(255, 255, 159, 194)),
+            BorderThickness = new Thickness(1),
+            CornerRadius = new CornerRadius(12),
+            Content = new StackPanel
+            {
+                Spacing = 6,
+                Children = { promptTitle, promptDetail }
+            }
+        };
+        var instruction = new TextBlock
+        {
+            Text = "Keyboard keys only. Escape cancels.",
+            Foreground = new SolidColorBrush(Windows.UI.Color.FromArgb(255, 119, 113, 121)),
+            FontSize = 12,
+            TextWrapping = TextWrapping.Wrap
+        };
+        var content = new StackPanel { Spacing = 12, Children = { prompt, instruction } };
+        var dialog = new ContentDialog
+        {
+            XamlRoot = XamlRoot,
+            Title = title,
+            Content = content,
+            PrimaryButtonText = allowClear ? "Clear binding" : string.Empty,
+            CloseButtonText = "Cancel",
+            DefaultButton = ContentDialogButton.None
+        };
+
+        uint? capturedKey = null;
+        void Prompt_KeyDown(object sender, KeyRoutedEventArgs args)
+        {
+            args.Handled = true;
+            if (args.Key == VirtualKey.Escape)
+            {
+                dialog.Hide();
+                return;
+            }
+
+            var key = (uint)args.Key;
+            var issue = validate(key);
+            if (issue is not null)
+            {
+                promptTitle.Text = "Choose another key";
+                promptDetail.Text = issue;
+                promptDetail.Foreground = new SolidColorBrush(Windows.UI.Color.FromArgb(255, 224, 173, 98));
+                return;
+            }
+
+            capturedKey = key;
+            dialog.Hide();
+        }
+
+        void Dialog_Opened(ContentDialog sender, ContentDialogOpenedEventArgs args) =>
+            prompt.Focus(FocusState.Programmatic);
+
+        prompt.KeyDown += Prompt_KeyDown;
+        dialog.Opened += Dialog_Opened;
+        var dialogResult = await dialog.ShowAsync();
+        prompt.KeyDown -= Prompt_KeyDown;
+        dialog.Opened -= Dialog_Opened;
+
+        if (capturedKey is uint key) return new KeyCaptureResult(KeyCaptureAction.Captured, key);
+        if (allowClear && dialogResult == ContentDialogResult.Primary) return new KeyCaptureResult(KeyCaptureAction.Cleared);
+        return new KeyCaptureResult(KeyCaptureAction.Cancelled);
     }
 
     // 0x30-0x5A is not a contiguous run of printable virtual keys: 0x3A-0x40
@@ -630,8 +811,68 @@ public sealed partial class MainPage : Page
         _ => $"VK {key}"
     };
     private static bool IsColor(string value) => value.Length == 9 && value[0] == '#' && value[1..].All(Uri.IsHexDigit);
-    private double ReadModuleNumber(string key, double fallback) => moduleSettings.ModuleSettings.TryGetValue(key, out var value)
-        && double.TryParse(value, System.Globalization.CultureInfo.InvariantCulture, out var parsed) ? parsed : fallback;
+
+    // Each slider and the native setting it writes. CrosshairSettings holds
+    // the same defaults and ranges as the native descriptors.
+    private IEnumerable<(Slider Slider, CrosshairSettings.NumberSetting Setting)> CrosshairNumbers()
+    {
+        yield return (CrosshairSizeSlider, CrosshairSettings.Size);
+        yield return (CrosshairGapSlider, CrosshairSettings.Gap);
+        yield return (CrosshairThicknessSlider, CrosshairSettings.Thickness);
+        yield return (CrosshairOpacitySlider, CrosshairSettings.Opacity);
+        yield return (CrosshairOutlineThicknessSlider, CrosshairSettings.OutlineThickness);
+        yield return (CrosshairDotSizeSlider, CrosshairSettings.DotSize);
+        yield return (CrosshairPixelScaleSlider, CrosshairSettings.PixelScale);
+        yield return (CrosshairGameScaleSlider, CrosshairSettings.GameScale);
+    }
+
+    private (Slider Slider, CrosshairSettings.NumberSetting Setting)? CrosshairNumberFor(object sender)
+    {
+        foreach (var number in CrosshairNumbers())
+        {
+            if (ReferenceEquals(number.Slider, sender)) return number;
+        }
+        return null;
+    }
+
+    private void LoadCrosshairControls()
+    {
+        var stored = moduleSettings.ModuleSettings;
+        var source = CrosshairSettings.ReadSource(stored);
+        SelectByTag(CrosshairSourceComboBox, source);
+        SelectByTag(CrosshairPerspectiveComboBox, CrosshairSettings.ReadPerspective(stored));
+        foreach (var (slider, setting) in CrosshairNumbers()) slider.Value = CrosshairSettings.ReadNumber(stored, setting);
+        CrosshairColorBox.Text = CrosshairSettings.ReadColor(stored);
+        CrosshairOutlineToggle.IsOn = CrosshairSettings.ReadBool(stored, CrosshairSettings.Outline);
+        CrosshairCenterDotToggle.IsOn = CrosshairSettings.ReadBool(stored, CrosshairSettings.CenterDot);
+        CrosshairThirdPersonToggle.IsOn = CrosshairSettings.ReadBool(stored, CrosshairSettings.ThirdPerson);
+        UpdateCrosshairSourceVisibility(source);
+    }
+
+    private void UpdateCrosshairSourceVisibility(string source)
+    {
+        static Visibility VisibleWhen(bool shown) => shown ? Visibility.Visible : Visibility.Collapsed;
+        var game = source == CrosshairSettings.SourceGame;
+        var drawn = source == CrosshairSettings.SourceDrawn;
+        CrosshairGamePanel.Visibility = VisibleWhen(game);
+        CrosshairOwnPanel.Visibility = VisibleWhen(!game);
+        CrosshairDrawnPanel.Visibility = VisibleWhen(drawn);
+        CrosshairLinePanel.Visibility = VisibleWhen(!drawn);
+        CrosshairDotPanel.Visibility = VisibleWhen(!drawn);
+        CrosshairSourceHelpText.Text = source switch
+        {
+            CrosshairSettings.SourceGame =>
+                "The game's own crosshair (or your texture pack's) stays as it is. Bedrock hides it in 3rd person; Oinkster can redraw it there.",
+            CrosshairSettings.SourceDrawn =>
+                "Draw it pixel by pixel in game: open the menu, then Custom crosshair. Oinkster draws it on top of the game's own.",
+            _ => "Oinkster draws this crosshair on top of the game's own."
+        };
+    }
+
+    private static string? SelectedTag(ComboBox box) => (box.SelectedItem as ComboBoxItem)?.Tag as string;
+
+    private static void SelectByTag(ComboBox box, string tag) =>
+        box.SelectedItem = box.Items.OfType<ComboBoxItem>().FirstOrDefault(item => item.Tag as string == tag) ?? box.Items[0];
 
     private void UpdateControlKeyLabels()
     {
@@ -644,16 +885,20 @@ public sealed partial class MainPage : Page
 
     private async Task ChangeControlKeyAsync(bool menu)
     {
-        var input = new TextBox { PlaceholderText = "A-Z, 0-9, or virtual-key number", MaxLength = 5 };
-        var dialog = new ContentDialog { XamlRoot = XamlRoot, Title = menu ? "Rebind menu" : "Rebind unload", Content = input, PrimaryButtonText = "Save", CloseButtonText = "Cancel", DefaultButton = ContentDialogButton.Primary };
-        if (await dialog.ShowAsync() != ContentDialogResult.Primary || !TryParseKey(input.Text, out var key)) return;
-        var other = menu ? moduleSettings.UnloadKey : moduleSettings.MenuKey;
-        if (key == other || moduleSettings.Modules.Values.Any(value => value.Keybind == key))
+        var current = menu ? moduleSettings.MenuKey : moduleSettings.UnloadKey;
+        var result = await CaptureKeyAsync(menu ? "Rebind menu" : "Rebind unload", current, false, key =>
         {
-            ActionInfo.Title = "Key is already reserved";
-            ActionInfo.Message = "System keys must be distinct and cannot overlap a module keybind.";
-            ActionInfo.Severity = InfoBarSeverity.Warning; ActionInfo.IsOpen = true; return;
-        }
+            var other = menu ? moduleSettings.UnloadKey : moduleSettings.MenuKey;
+            if (key == other) return "The menu and unload actions need different keys.";
+
+            var conflict = moduleSettings.Modules.FirstOrDefault(pair => pair.Value.Keybind == key);
+            if (conflict.Key is null) return null;
+            var conflictName = moduleCatalog.FirstOrDefault(item => item.Id == conflict.Key)?.Name ?? conflict.Key;
+            return $"{FormatKey(key)} is already assigned to {conflictName}.";
+        });
+        if (result.Action != KeyCaptureAction.Captured) return;
+
+        var key = result.Key;
         if (menu) moduleSettings.MenuKey = key; else moduleSettings.UnloadKey = key;
         if (!await SaveModuleSettingsAsync()) return;
         UpdateControlKeyLabels();
@@ -669,6 +914,18 @@ public sealed partial class MainPage : Page
             return;
         }
 
+        // Launch the newest client, not whatever was current when the
+        // launcher opened. A check that installs a client update leaves the
+        // status Ready, so the launch below carries on with it.
+        if (CheckForUpdatesToggle.IsOn && DateTimeOffset.UtcNow - lastUpdateCheck > StaleUpdateCheck)
+        {
+            await CheckAndApplyUpdatesAsync();
+            if (launcherUpdateStarted)
+            {
+                return;
+            }
+        }
+
         if (clientUpdate?.Status is UpdateStatus.NotInstalled or UpdateStatus.UpdateAvailable)
         {
             await ConfirmAndInstallUpdateAsync(clientUpdate.Release!);
@@ -682,6 +939,7 @@ public sealed partial class MainPage : Page
         }
 
         PlayButton.IsEnabled = false;
+        busy = true;
         // From here on the button is disabled, so restoring it has to happen in
         // a finally: an exception escaping this stretch used to leave Play
         // permanently dead for the rest of the session.
@@ -692,6 +950,7 @@ public sealed partial class MainPage : Page
         }
         finally
         {
+            busy = false;
             // Skipped when the window is closing - touching XAML then is
             // pointless and the controls may already be torn down.
             if (!closingAfterLaunch)
@@ -708,6 +967,12 @@ public sealed partial class MainPage : Page
     {
         var processId = bedrockService.TryGetRunningProcessId();
         var launched = processId is not null;
+        // Starting every launcher-created game with VSync forced off left the
+        // live session uncapped when native activation failed, even though the
+        // options file was restored afterward. Only alter startup presentation
+        // when the player explicitly enabled Oinkster's Disable VSync option.
+        var disableVsyncRequested = BedrockVsyncPreflightService.IsRequested(moduleSettings.ModuleSettings);
+        using var vsyncPreflight = processId is null && disableVsyncRequested ? vsyncPreflightService.Prepare() : null;
         if (!launched)
         {
             PlayButtonText.Text = "Starting Bedrock…";
@@ -725,6 +990,10 @@ public sealed partial class MainPage : Page
 
         PlayButtonText.Text = "Activating Oinkster…";
         processId ??= await bedrockService.WaitForProcessAsync(TimeSpan.FromSeconds(45));
+        if (processId is not null)
+        {
+            mediaBrokerService.TryStart(processId.Value);
+        }
         var existingStatus = await nativeStatusService.QueryAsync();
         var injection = existingStatus?.State == "ready" && existingStatus.HooksInstalled == true
             ? new InjectionResult(InjectionStatus.Success, $"Oinkster is already active. Press {FormatKey(moduleSettings.MenuKey)} in-game to open it.")
@@ -739,7 +1008,9 @@ public sealed partial class MainPage : Page
             {
                 injection = new InjectionResult(
                     InjectionStatus.SecurityValidationFailed,
-                    "The DLL loaded, but its graphics adapter did not report ready.");
+                    nativeStatus?.StartupError is { Length: > 0 } startupError
+                        ? startupError
+                        : "The DLL loaded, but its graphics adapter did not report ready. Update the graphics driver and close other overlays, then restart Minecraft.");
             }
         }
         // The native client reports the Bedrock build it was compiled against.
@@ -779,7 +1050,9 @@ public sealed partial class MainPage : Page
         for (var attempt = 0; attempt < 48; attempt++)
         {
             var status = await nativeStatusService.QueryAsync();
-            if (status is not null && string.Equals(status.State, "ready", StringComparison.OrdinalIgnoreCase))
+            if (status is not null && (string.Equals(status.State, "ready", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(status.State, "error", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(status.State, "review-required", StringComparison.OrdinalIgnoreCase)))
             {
                 return status;
             }
@@ -788,6 +1061,88 @@ public sealed partial class MainPage : Page
         }
 
         return null;
+    }
+
+    private string SelectedChannel() =>
+        (UpdateChannelComboBox.SelectedItem as ComboBoxItem)?.Content?.ToString() ?? "Release";
+
+    // Installed copies of the launcher come from the Inno Setup installer,
+    // which leaves its uninstaller beside the exe. Development builds never
+    // replace themselves.
+    private static bool CanUpdateLauncher =>
+#if DEBUG
+        false;
+#else
+        File.Exists(Path.Combine(AppContext.BaseDirectory, "unins000.exe"));
+#endif
+
+    // Runs after each update check. A newer launcher installs itself and
+    // restarts the app (it then picks up any client update on its own first
+    // check); otherwise a client DLL update downloads without asking.
+    private async Task ApplyUpdatesAsync()
+    {
+        if (clientUpdate is null || await TryUpdateLauncherAsync(clientUpdate.Launcher))
+        {
+            return;
+        }
+
+        if (clientUpdate.Status is UpdateStatus.NotInstalled or UpdateStatus.UpdateAvailable && clientUpdate.Release is not null)
+        {
+            await InstallClientAsync(clientUpdate.Release);
+        }
+    }
+
+    private async Task<bool> TryUpdateLauncherAsync(LauncherUpdate? update)
+    {
+        if (update is null || launcherUpdateStarted || !CanUpdateLauncher)
+        {
+            return false;
+        }
+
+        launcherUpdateStarted = true;
+        PlayButton.IsEnabled = false;
+        ActionInfo.Title = "Updating Oinkster";
+        ActionInfo.Message = $"Downloading launcher {update.Installer.Version}. Oinkster restarts by itself when it's done.";
+        ActionInfo.Severity = InfoBarSeverity.Informational;
+        ActionInfo.IsOpen = true;
+        var progress = new Progress<DownloadProgress>(value =>
+        {
+            PlayButtonText.Text = $"Updating {value.Percentage:F0}%";
+        });
+
+        try
+        {
+            PlayButtonText.Text = "Updating 0%";
+            var installerPath = await updateService.DownloadLauncherAsync(update, progress);
+            // The installer closes this process if it is still running, swaps
+            // the files and starts the new launcher (its silent-mode [Run]).
+            Process.Start(new ProcessStartInfo(installerPath, "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART")
+            {
+                UseShellExecute = true
+            });
+            App.Window.Close();
+            return true;
+        }
+        catch (Exception exception) when (exception is HttpRequestException or IOException
+            or UnauthorizedAccessException or InvalidDataException or TaskCanceledException or Win32Exception)
+        {
+            App.Log("launcher_update_failed", exception.ToString());
+            launcherUpdateStarted = false;
+            ShowError("Launcher update failed", exception is TaskCanceledException
+                ? "The download timed out. Oinkster will try again next time it opens."
+                : $"{exception.Message} Oinkster will try again next time it opens.");
+            if (clientUpdate is null)
+            {
+                PlayButton.IsEnabled = bedrockInstallation.IsInstalled;
+                PlayButtonText.Text = bedrockInstallation.IsInstalled ? "Launch Oinkster" : "Bedrock required";
+            }
+            else
+            {
+                ShowClientStatus();
+            }
+
+            return false;
+        }
     }
 
     private async Task ConfirmAndInstallUpdateAsync(ClientRelease release)
@@ -803,12 +1158,31 @@ public sealed partial class MainPage : Page
             DefaultButton = ContentDialogButton.Primary
         };
 
-        if (await dialog.ShowAsync() != ContentDialogResult.Primary)
+        // Busy while the prompt is up too, so a timed check can't install the
+        // same update underneath it.
+        busy = true;
+        ContentDialogResult choice;
+        try
+        {
+            choice = await dialog.ShowAsync();
+        }
+        finally
+        {
+            busy = false;
+        }
+
+        if (choice != ContentDialogResult.Primary)
         {
             return;
         }
 
+        await InstallClientAsync(release);
+    }
+
+    private async Task InstallClientAsync(ClientRelease release)
+    {
         PlayButton.IsEnabled = false;
+        busy = true;
         var progress = new Progress<DownloadProgress>(value =>
         {
             PlayButtonText.Text = $"Downloading {value.Percentage:F0}%";
@@ -820,7 +1194,10 @@ public sealed partial class MainPage : Page
             var installed = await updateService.InstallAsync(release, progress);
             ClientBuildText.Text = $"Build {installed.Version}";
             ActionInfo.Title = "Oinkster updated";
-            ActionInfo.Message = $"Version {installed.Version} was downloaded and verified.";
+            // A running game keeps the client it already loaded until restart.
+            ActionInfo.Message = bedrockService.TryGetRunningProcessId() is null
+                ? $"Version {installed.Version} was downloaded and verified."
+                : $"Version {installed.Version} was downloaded and verified. Restart Minecraft to load it.";
             ActionInfo.Severity = InfoBarSeverity.Success;
             ActionInfo.IsOpen = true;
             await RefreshClientStatusAsync();
@@ -840,6 +1217,10 @@ public sealed partial class MainPage : Page
             ActionInfo.Severity = InfoBarSeverity.Error;
             ActionInfo.IsOpen = true;
             await RefreshClientStatusAsync();
+        }
+        finally
+        {
+            busy = false;
         }
     }
 
@@ -861,18 +1242,39 @@ public sealed partial class MainPage : Page
         }
     }
 
-    private void CheckForUpdatesButton_Click(object sender, RoutedEventArgs e) => RunGuarded(async () =>
+    private void CheckForUpdatesButton_Click(object sender, RoutedEventArgs e) => RunGuarded(CheckAndApplyUpdatesAsync);
+
+    // The launcher usually stays open while people play, so checking only at
+    // startup would miss a release for days - including the one that follows
+    // a Minecraft update. Skipped while a download, prompt or launch is
+    // running so it never lands in the middle of one.
+    private void UpdateCheckTimer_Tick(object? sender, object e)
     {
-        if (!bedrockInstallation.IsInstalled)
+        if (busy || launcherUpdateStarted || !CheckForUpdatesToggle.IsOn)
         {
-            await RefreshBedrockStatusAsync();
+            return;
         }
 
+        RunGuarded(CheckAndApplyUpdatesAsync);
+    }
+
+    private async Task CheckAndApplyUpdatesAsync()
+    {
+        // Re-detected each time: Minecraft may have updated since the last
+        // check, and compatibility is judged against its current version.
+        await RefreshBedrockStatusAsync();
         if (bedrockInstallation.IsInstalled)
         {
             await RefreshClientStatusAsync();
+            await ApplyUpdatesAsync();
         }
-    });
+        else
+        {
+            var result = await updateService.CheckAsync(SelectedChannel(), null);
+            lastUpdateCheck = DateTimeOffset.UtcNow;
+            await TryUpdateLauncherAsync(result.Launcher);
+        }
+    }
 
     private void OpenFolderButton_Click(object sender, RoutedEventArgs e) => RunGuarded(async () =>
     {

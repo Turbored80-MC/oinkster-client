@@ -11,6 +11,8 @@ using Modules::ModuleFactory;
 struct Definition {
     CatalogEntry entry;
     ModuleFactory factory;
+    EventPriority priority{EventPriority::Normal};
+    bool defaultEnabled{};
 };
 
 const std::vector<Definition>& Definitions() {
@@ -24,11 +26,14 @@ const std::vector<Definition>& Definitions() {
         {{"cps", L"CPS", L"Local left and right clicks per second.", ModuleCategory::Input, true, {LocalInput}}, &Modules::MakeCps},
         {{"keystrokes", L"Keystrokes", L"Shows local movement, jump, and mouse-button state.", ModuleCategory::Input, true, {LocalInput}}, &Modules::MakeKeystrokes},
         {{"input-latency", L"Input latency", L"Time from an input message to the next rendered frame.", ModuleCategory::Input, true, {LocalInput, RenderMetrics}}, &Modules::MakeInputLatency},
+        {{"dc-prevent", L"DC Prevent", L"Discards accidental repeat clicks inside a configurable debounce interval.", ModuleCategory::Input, true, {InputFiltering, DcPreventPolicy}}, &Modules::MakeDcPrevent, EventPriority::Immediate},
+        {{"cps-cap", L"CPS Cap", L"Discards physical clicks above separate left and right CPS limits.", ModuleCategory::Input, true, {InputFiltering, CpsCapPolicy}}, &Modules::MakeCpsCap, EventPriority::Immediate},
         {{"ping", L"Ping", L"Current connection latency.", ModuleCategory::Telemetry, true, {NetworkMetrics}}, &Modules::MakePing},
         {{"coordinates", L"Coordinates", L"Current player (camera) coordinates.", ModuleCategory::Telemetry, true, {LocalPlayerPosition}}, &Modules::MakeCoordinates},
         {{"direction", L"Direction", L"Facing direction and yaw.", ModuleCategory::Telemetry, true, {LocalPlayerRotation}}, &Modules::MakeDirection},
         {{"movement-speed", L"Movement speed", L"Observed player movement speed.", ModuleCategory::Telemetry, true, {LocalPlayerPosition}}, &Modules::MakeMovementSpeed},
         {{"clock", L"Clock", L"Local system time.", ModuleCategory::Status, true, {}}, &Modules::MakeClock},
+        {{"now-playing", L"Now playing", L"Shows and controls the current Windows media session.", ModuleCategory::Status, true, {}}, &Modules::MakeNowPlaying},
         {{"stopwatch", L"Stopwatch", L"A local stopwatch with start, pause, and reset.", ModuleCategory::Status, true, {}}, &Modules::MakeStopwatch},
         {{"session-statistics", L"Session statistics", L"Session duration, input totals, and distance travelled.", ModuleCategory::Status, true, {LocalInput}}, &Modules::MakeSessionStatistics},
         {{"armor-status", L"Armor status", L"Per-slot armor durability.", ModuleCategory::Status, true, {Equipment}}, &Modules::MakeArmorStatus},
@@ -36,21 +41,52 @@ const std::vector<Definition>& Definitions() {
         {{"item-counter", L"Item counter", L"Count of the selected item.", ModuleCategory::Status, true, {Inventory}}, &Modules::MakeItemCounter},
         {{"potion-effects", L"Potion effects", L"Active effect names, levels, and durations.", ModuleCategory::Status, true, {Effects}}, &Modules::MakePotionEffects},
         {{"server-display", L"Server display", L"Current server or world name.", ModuleCategory::Status, true, {ServerState}}, &Modules::MakeServerDisplay},
-        {{"resource-pack-display", L"Resource pack display", L"Active resource-pack names.", ModuleCategory::Status, true, {ResourcePacks}}, &Modules::MakeResourcePackDisplay},
+        {{"resource-pack-display", L"Resource pack display", L"Your active global resource packs, with their icons.", ModuleCategory::Status, true, {}}, &Modules::MakeResourcePackDisplay},
+        {{"replay-mod", L"Replay Mod", L"Records the worlds you join so you can watch them back from the Replays menu.", ModuleCategory::Status, false, {PacketCapture}}, &Modules::MakeReplayMod},
+        {{"screenshot", L"Screenshot", L"Saves a PNG of the game, optionally including the Oinkster HUD.", ModuleCategory::Status, false, {FrameComposition}}, &Modules::MakeScreenshot},
+        {{"saturation-hud", L"Saturation HUD", L"Shows hunger and hidden food saturation from validated attribute packets.", ModuleCategory::Status, true, {PacketCapture}}, &Modules::MakeSaturationHud},
+        {{"scoreboard", L"Scoreboard", L"A movable sidebar scoreboard decoded from server packets.", ModuleCategory::Status, true, {PacketCapture}}, &Modules::MakeScoreboard},
+        {{"attack-indicator", L"Attack indicator", L"A visual local attack-recovery timer with confirmed-hit feedback.", ModuleCategory::PvpFeedback, true, {LocalInput}}, &Modules::MakeAttackIndicator},
         {{"combo-counter", L"Combo counter", L"Confirmed consecutive hits.", ModuleCategory::PvpFeedback, true, {CombatEvents}}, &Modules::MakeComboCounter},
         {{"hit-distance", L"Hit distance", L"Distance of the last confirmed hit.", ModuleCategory::PvpFeedback, true, {CombatEvents}}, &Modules::MakeHitDistance},
         {{"equipment-warnings", L"Equipment warnings", L"Warns about low equipment durability.", ModuleCategory::PvpFeedback, true, {Equipment}}, &Modules::MakeEquipmentWarnings},
         {{"potion-counter", L"Potion counter", L"Counts potions in the visible inventory snapshot.", ModuleCategory::PvpFeedback, true, {Inventory}}, &Modules::MakePotionCounter},
-        {{"custom-crosshair", L"Custom crosshair", L"A configurable local crosshair.", ModuleCategory::Visual, false, {FrameComposition}}, &Modules::MakeCustomCrosshair},
+        {{"custom-crosshair", L"Custom crosshair", L"A configurable local crosshair, or keep the game default.", ModuleCategory::Visual, false, {FrameComposition}}, &Modules::MakeCustomCrosshair},
         {{"block-outline", L"Block outline", L"Customizes the selected block outline.", ModuleCategory::Visual, false, {SelectedBlockRender}}, &Modules::MakeBlockOutline},
         {{"hurt-color", L"Hurt color", L"Customizes the local damage tint.", ModuleCategory::Visual, false, {DamageRender}}, &Modules::MakeHurtColor},
         {{"motion-blur", L"Motion blur", L"Blends the previous frame for a cosmetic motion blur.", ModuleCategory::Visual, false, {FrameComposition}}, &Modules::MakeMotionBlur},
         {{"fov-profiles", L"FOV profiles", L"Switches between local field-of-view presets.", ModuleCategory::Visual, false, {CameraPresentation}}, &Modules::MakeFovProfiles},
         {{"view-bobbing", L"View bobbing", L"Reduces view bobbing for accessibility.", ModuleCategory::Visual, false, {CameraPresentation}}, &Modules::MakeViewBobbing},
         {{"hand-view", L"Hand view", L"Adjusts local first-person hand presentation.", ModuleCategory::Visual, false, {HandPresentation}}, &Modules::MakeHandView},
+        {{"zoom", L"Zoom", L"Temporarily narrows the local camera field of view.", ModuleCategory::Visual, false, {CameraPresentation}}, &Modules::MakeZoom},
+        {{"freelook", L"Freelook", L"Looks around locally without changing the player's facing direction.", ModuleCategory::Visual, false, {CameraRotation}}, &Modules::MakeFreelook},
+        {{"cinematic-camera", L"Cinematic camera", L"Smooths local camera rotation for cinematic movement.", ModuleCategory::Visual, false, {CameraMotion}}, &Modules::MakeCinematicCamera},
+        {{"third-person-distance", L"Third-person distance", L"Adjusts the local front and rear third-person camera distance.", ModuleCategory::Visual, false, {ThirdPersonPresentation}}, &Modules::MakeThirdPersonDistance},
+        {{"fullbright", L"Fullbright", L"Boosts local scene brightness without changing world lighting.", ModuleCategory::Visual, false, {LightingPresentation}}, &Modules::MakeFullbright},
+        {{"time-changer", L"Time changer", L"Freezes the locally rendered time of day.", ModuleCategory::Visual, false, {TimePresentation}}, &Modules::MakeTimeChanger},
+        {{"weather-suppression", L"Weather suppression", L"Reduces locally rendered rain, snow, and thunder.", ModuleCategory::Visual, false, {WeatherPresentation}}, &Modules::MakeWeatherSuppression},
+        {{"screen-overlay-suppression", L"Screen overlay suppression", L"Controls local fire, snow, portal, pumpkin, vignette, and nausea overlays.", ModuleCategory::Visual, false, {ScreenEffectsPresentation}}, &Modules::MakeScreenOverlaySuppression},
+        {{"hurt-camera", L"Hurt camera", L"Reduces local camera shake when taking damage.", ModuleCategory::Accessibility, false, {CameraMotion}}, &Modules::MakeHurtCamera},
         {{"subtitles", L"Subtitles", L"Shows directional sound captions.", ModuleCategory::Accessibility, true, {SoundEvents, LocalPlayerPosition, LocalPlayerRotation}}, &Modules::MakeSubtitles},
         {{"chat-tools", L"Chat tools", L"A local chat view with timestamps, formatting cleanup, and nickname hiding.", ModuleCategory::Accessibility, true, {ChatEvents}}, &Modules::MakeChatTools},
         {{"toggle-sprint-dynamic-fps", L"Toggle sprint and dynamic FPS", L"Holds sprint while moving forward and caps the frame rate in the background.", ModuleCategory::Accessibility, false, {RenderMetrics, LocalInput, InputSynthesis}}, &Modules::MakeToggleSprintDynamicFps},
+        {{"toggle-sneak", L"Toggle sneak", L"Holds the configured sneak key and shows a Java-style toggled indicator.", ModuleCategory::Accessibility, true, {LocalInput, InputSynthesis}}, &Modules::MakeToggleSneak},
+        {{"scroll-wheel-disabler", L"Scroll wheel disabler", L"Stops the mouse wheel from changing the hotbar slot.", ModuleCategory::Input, false, {InputFiltering}}, &Modules::MakeScrollWheelDisabler},
+        {{"sensitivity-multiplier", L"Sensitivity multiplier", L"Scales local look sensitivity per axis, optionally only while a key is held.", ModuleCategory::Input, false, {InputFiltering}}, &Modules::MakeSensitivityMultiplier},
+        {{"null-movement", L"Null movement", L"Of two opposing movement keys, only the one pressed last counts.", ModuleCategory::Input, false, {LocalInput, InputSynthesis}}, &Modules::MakeNullMovement},
+        {{"modern-keyboard-handling", L"Modern keyboard handling", L"Keeps held movement keys working after closing the inventory, chat, or pause screen.", ModuleCategory::Input, false, {LocalInput, InputSynthesis}}, &Modules::MakeModernKeyboardHandling},
+        {{"snap-look", L"Snap look", L"Hold a key to look behind you without changing your perspective setting.", ModuleCategory::Visual, false, {PerspectivePresentation}}, &Modules::MakeSnapLook},
+        {{"chunk-borders", L"Chunk borders", L"Draws Java-style chunk borders around you.", ModuleCategory::Visual, false, {CameraPresentation, LocalPlayerPosition}}, &Modules::MakeChunkBorders},
+        {{"post-processing", L"Post processing", L"Local colour grading: saturation, contrast, brightness, sharpen, tint, and vignette.", ModuleCategory::Visual, false, {FrameComposition}}, &Modules::MakePostProcessing},
+        {{"menu-blur", L"Menu blur", L"Blurs and dims the game behind in-game screens.", ModuleCategory::Visual, false, {FrameComposition}}, &Modules::MakeMenuBlur},
+        {{"waypoints", L"Waypoints", L"Persistent world markers with distance and edge indicators.", ModuleCategory::Visual, true, {CameraPresentation, LocalPlayerPosition}}, &Modules::MakeWaypoints},
+        {{"debug-menu", L"Debug menu", L"A Java-style F3 overlay with coordinates, chunk, facing, targeted block, and performance.", ModuleCategory::Telemetry, false, {LocalPlayerPosition}}, &Modules::MakeDebugMenu, EventPriority::Normal, true},
+        {{"player-list", L"Player list", L"A Java-style tab list of everyone on the server, with their heads.", ModuleCategory::Status, false, {PacketCapture}}, &Modules::MakePlayerList},
+        {{"hive-utils", L"Hive utils", L"The Hive helpers: auto re-queue, party and friend invites, map votes, and join codes.", ModuleCategory::Status, true, {PacketCapture, PacketSend, ServerState}}, &Modules::MakeHiveUtils},
+        {{"skin-grabber", L"Skin grabber", L"Saves the skin of the player you look at, or wears it yourself.", ModuleCategory::Status, false, {PacketCapture, PacketSend}}, &Modules::MakeSkinGrabber},
+        {{"fps-boost", L"FPS Boost", L"Gives Minecraft more CPU time: higher process priority, no power throttling, and a 1 ms timer.", ModuleCategory::Performance, false, {}}, &Modules::MakeFpsBoost},
+        {{"moveable-chat", L"Moveable chat", L"Replaces the game chat with a draggable one; the Java preset grows upward from the bottom-left and fades.", ModuleCategory::Accessibility, true, {PacketCapture}}, &Modules::MakeMoveableChat},
+        {{"low-fire", L"Low Fire", L"Lowers the first-person fire overlay so burning covers less of the screen.", ModuleCategory::Visual, false, {FireOverlayPresentation}}, &Modules::MakeLowFire},
     };
     return definitions;
 }
@@ -106,7 +142,7 @@ std::vector<std::unique_ptr<IModule>> CreateModuleCatalog(Modules::SharedService
     for (const auto& definition : Definitions()) {
         const auto& entry = definition.entry;
         ModuleMetadata metadata{std::string(entry.id), std::wstring(entry.name), std::wstring(entry.description), entry.category,
-            false, true, EventPriority::Normal, {}, entry.hud, entry.capabilities};
+            definition.defaultEnabled, true, definition.priority, {}, entry.hud, entry.capabilities};
         HudLayout layout{};
         if (entry.hud) {
             const float column = static_cast<float>(hudIndex % 2);

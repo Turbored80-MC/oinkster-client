@@ -16,7 +16,7 @@
 
         <TitleBar x:Name="AppTitleBar" Title="Oinkster Client" Background="#FF0B0A0D" Foreground="#FFF7F2F5">
             <TitleBar.IconSource>
-                <ImageIconSource ImageSource="Assets/AppIcon.ico" />
+                <ImageIconSource ImageSource="ms-appx:///Assets/OinksterAppIcon.targetsize-32_altform-unplated.png" />
             </TitleBar.IconSource>
         </TitleBar>
 

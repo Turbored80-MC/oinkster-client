@@ -4,6 +4,7 @@
 #include <bitset>
 #include <chrono>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -39,6 +40,9 @@ struct RenderEvent {
     // Minecraft reads gameplay input through raw input / GameInput, so window
     // messages alone miss presses while the cursor is captured.
     std::optional<std::bitset<256>> keysDown;
+    // True only while the normal in-world HUD is visible. Kept at the end so
+    // older aggregate initializers retain their field ordering.
+    bool gameplayVisible{};
 };
 
 struct TickEvent { SteadyClock::duration elapsed{}; };
@@ -47,7 +51,8 @@ struct KeyboardEvent {
     std::uint32_t key{};
     bool pressed{};
     bool repeated{};
-    // True when the ClickGUI owns input (the event never reaches gameplay).
+    // True when gameplay does not own the keyboard: the ClickGUI is open (the
+    // event never reaches the game) or a game screen such as chat is up.
     bool uiCaptured{};
     SteadyTime occurredAt{SteadyClock::now()};
     mutable bool cancelled{};
@@ -136,12 +141,28 @@ struct NetworkMetrics {
 
 enum class SessionKind : std::uint8_t { None, Singleplayer, Lan, Realm, Server };
 
+// Privacy-preserving server identity. Session telemetry maps a connection
+// hostname to this enum inside the native client; the hostname/address is
+// never published, logged, or persisted.
+enum class ServerNetwork : std::uint8_t {
+    Local,
+    Zeqa,
+    Hive,
+    CubeCraft,
+    Galaxite,
+    Lifeboat,
+    NetherGames,
+    Mineville,
+    UnknownRemote
+};
+
 // Identity only - an adapter must never put an address, port, or credential
 // here. ServerDisplay additionally masks anything address-shaped.
 struct ServerState {
     SteadyTime capturedAt{};
     SessionKind kind{SessionKind::None};
     std::wstring displayName;
+    ServerNetwork network{ServerNetwork::Local};
 };
 
 struct ResourcePackInfo {
@@ -185,6 +206,81 @@ struct ChatEvent {
     std::wstring message;
     std::wstring sender;
     std::chrono::system_clock::time_point receivedAt{};
+};
+
+// One decoded game packet the server sent to this client (header varint and
+// body, exactly as the game's own decoder reads it), for Replay Mod and for
+// modules that observe specific packets (IPacketObserverModule). Only
+// server->client traffic is ever published; nothing the client sends (login
+// identity included) is captured.
+struct ReplayPacketEvent {
+    SteadyTime capturedAt{};
+    // Increments for every new server connection (each world join).
+    std::uint32_t session{};
+    // First packet of a new session. joinedFromStart is false when Oinkster
+    // was injected mid-session, so the join sequence was already missed.
+    bool sessionStart{};
+    bool joinedFromStart{};
+    std::uint32_t packetId{};
+    std::string bytes;
+};
+
+// Which camera the local player is viewing the world through.
+//
+// Published by CameraTelemetry from the game's own perspective option.
+// Consumers must treat Unknown as "no information" and pick a safe fallback
+// rather than guessing (e.g. from camera-vs-eye distance). The adapter
+// publishes whenever the perspective changes and again every few frames,
+// and publishes Unknown before it detaches.
+enum class CameraPerspective : std::uint8_t { Unknown, FirstPerson, ThirdPersonBack, ThirdPersonFront };
+
+struct CameraPerspectiveEvent {
+    SteadyTime capturedAt{};
+    CameraPerspective perspective{CameraPerspective::Unknown};
+};
+
+// A decoded image, row-major, 0xAARRGGBB, top row first.
+struct ArgbImage {
+    std::uint32_t width{};
+    std::uint32_t height{};
+    std::vector<std::uint32_t> pixels;
+    [[nodiscard]] bool Valid() const noexcept {
+        return width != 0 && height != 0 && pixels.size() == static_cast<std::size_t>(width) * height;
+    }
+};
+
+// The crosshair texture the game is currently using (textures/ui/cross_hair
+// from the highest-priority resource pack that has one, else vanilla).
+// Republished periodically; a null image means it is not known.
+struct GameCrosshairEvent {
+    SteadyTime capturedAt{};
+    std::shared_ptr<const ArgbImage> image;
+};
+
+// The block the local player is looking at (the game's own hit result) and
+// the camera this frame renders from, after any presentation overrides.
+// Published by the presentation adapter every rendered frame while a module
+// asks for it.
+enum class BlockFace : std::int8_t { Unknown = -1, Down, Up, North, South, West, East };
+
+struct BlockSelectionEvent {
+    SteadyTime capturedAt{};
+    bool hasBlock{};
+    std::array<std::int32_t, 3> block{};
+    BlockFace face{BlockFace::Unknown};
+    std::array<float, 3> cameraPosition{};
+    std::array<float, 4> cameraRotation{0.0F, 0.0F, 0.0F, 1.0F};  // camera-to-world quaternion x, y, z, w
+    float verticalFov{};                                            // radians
+};
+
+// The camera this frame renders from (after presentation overrides), for
+// modules that draw world-space geometry over the frame. Published by the
+// presentation adapter every rendered frame while a module asks for it.
+struct CameraPoseEvent {
+    SteadyTime capturedAt{};
+    std::array<float, 3> position{};
+    std::array<float, 4> rotation{0.0F, 0.0F, 0.0F, 1.0F};  // camera-to-world quaternion x, y, z, w
+    float verticalFov{};                                    // radians
 };
 
 }

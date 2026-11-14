@@ -2,12 +2,24 @@
 #include "Oinkster/Modules/HudFormat.hpp"
 #include "Oinkster/Modules/StatusLogic.hpp"
 #include "Oinkster/Modules/TelemetryLogic.hpp"
+#include "Oinkster/Modules/PacketLogic.hpp"
+#include "Oinkster/Modules/HiveLogic.hpp"
+#include "Oinkster/Diagnostics.hpp"
+#include "Oinkster/ReplayCapture.hpp"
+#include "Oinkster/ReplayFile.hpp"
+#include "Oinkster/ReplayInjector.hpp"
+#include "Oinkster/SupportedBuild.hpp"
+#include "Oinkster/ScreenshotCapture.hpp"
+#include <Windows.h>
+#include <shellapi.h>
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <ctime>
 #include <cwctype>
 #include <format>
+#include <filesystem>
+#include <unordered_map>
 
 namespace Oinkster::Modules {
 
@@ -244,7 +256,230 @@ std::string_view SessionKindName(SessionKind kind) noexcept {
     return "Menu";
 }
 
+std::size_t RotationIndex(std::size_t count, SteadyClock::duration elapsed, SteadyClock::duration interval) noexcept {
+    if (count == 0 || interval <= SteadyClock::duration::zero() || elapsed < SteadyClock::duration::zero()) return 0;
+    return static_cast<std::size_t>(elapsed / interval) % count;
+}
+
 namespace {
+
+class ScreenshotModule final : public ModuleBase<IModule>, public INoticeModule, public IOverlayModule {
+public:
+    ScreenshotModule(ModuleMetadata metadata, HudLayout, SharedServices&)
+        : ModuleBase<IModule>(std::move(metadata), {
+            KeySetting("capture-key", "Screenshot key", VK_F2, "Captures one PNG without changing Minecraft's own screenshot binding."),
+            BoolSetting("include-hud", "Include Oinkster HUD", true)}) {}
+
+    void OnSettingsChanged(const SettingsReader& settings) override {
+        std::scoped_lock lock(mutex_);
+        key_ = settings.Key("capture-key");
+        includeHud_ = settings.Bool("include-hud");
+    }
+    void OnKeyboard(const KeyboardEvent& event) override {
+        if (!event.pressed || event.repeated || event.uiCaptured) return;
+        bool capture{};
+        { std::scoped_lock lock(mutex_); capture = key_ != 0 && event.key == key_; }
+        if (capture) QueueCapture();
+    }
+    void OnRender(const RenderEvent&) override {
+        const auto result = ScreenshotCapture::CurrentResult();
+        std::scoped_lock lock(mutex_);
+        if (result.revision == 0 || result.revision <= resultRevision_) return;
+        resultRevision_ = result.revision;
+        notices_.push_back(result.error.empty()
+            ? "Screenshot saved: " + result.file.filename().string()
+            : "Screenshot failed: " + result.error);
+    }
+    [[nodiscard]] std::vector<ModuleAction> Actions() const override {
+        return {{"capture", "Take screenshot"}, {"folder", "Open screenshots folder"}};
+    }
+    bool InvokeAction(std::string_view action, SteadyTime) override {
+        if (action == "capture") { QueueCapture(); return true; }
+        if (action == "folder") {
+            const auto directory = ScreenshotCapture::ScreenshotDirectory();
+            try { std::filesystem::create_directories(directory); } catch (...) { return false; }
+            return reinterpret_cast<std::intptr_t>(ShellExecuteW(nullptr, L"open", directory.c_str(), nullptr, nullptr, SW_SHOWNORMAL)) > 32;
+        }
+        return false;
+    }
+    [[nodiscard]] std::vector<std::string> TakeNotices() override {
+        std::scoped_lock lock(mutex_);
+        auto notices = std::move(notices_);
+        notices_.clear();
+        return notices;
+    }
+    [[nodiscard]] OverlayPrimitives Primitives(float, float) const override { return {}; }
+
+private:
+    void QueueCapture() {
+        bool includeHud{};
+        { std::scoped_lock lock(mutex_); includeHud = includeHud_; }
+        std::string error;
+        if (!ScreenshotCapture::Request(ScreenshotCapture::NextScreenshotFile(), includeHud, error)) {
+            std::scoped_lock lock(mutex_);
+            notices_.push_back("Screenshot failed: " + error);
+        }
+    }
+    std::uint32_t key_{VK_F2};
+    bool includeHud_{true};
+    std::uint64_t resultRevision_{};
+    std::vector<std::string> notices_;
+};
+
+class SaturationHudModule final : public HudModuleBase<IPacketObserverModule> {
+public:
+    SaturationHudModule(ModuleMetadata metadata, HudLayout layout, SharedServices&)
+        : HudModuleBase(std::move(metadata), {
+            ChoiceSetting("display", "Display", "both", {{"saturation", "Saturation"}, {"hunger", "Hunger"}, {"both", "Hunger and saturation"}}),
+            FloatSetting("warning", "Low saturation warning", 3.0, 0.0, 10.0, "%.1f")}, layout) {}
+    void OnSettingsChanged(const SettingsReader& settings) override {
+        std::scoped_lock lock(mutex_);
+        display_ = settings.Choice("display");
+        warning_ = settings.Float("warning");
+    }
+    [[nodiscard]] bool WantsPacket(std::uint32_t packetId) const noexcept override {
+        return packetId == GamePacket::UpdateAttributes;
+    }
+    void OnReplayPacket(const ReplayPacketEvent& packet) override {
+        if (packet.sessionStart) { std::scoped_lock lock(mutex_); food_.reset(); }
+        if (packet.packetId != GamePacket::UpdateAttributes) return;
+        const auto view = SplitPacket(std::span(reinterpret_cast<const std::uint8_t*>(packet.bytes.data()), packet.bytes.size()));
+        if (!view || view->id != GamePacket::UpdateAttributes) return;
+        const auto food = ParseFoodAttributes(view->body);
+        if (!food) return;
+        std::scoped_lock lock(mutex_);
+        if (!food_) food_ = FoodAttributes{};
+        if (food->hunger) food_->hunger = food->hunger;
+        if (food->saturation) food_->saturation = food->saturation;
+        if (food->exhaustion) food_->exhaustion = food->exhaustion;
+    }
+    void OnDisable() override { std::scoped_lock lock(mutex_); food_.reset(); }
+    [[nodiscard]] HudContent Content() const override {
+        std::scoped_lock lock(mutex_);
+        if (!food_) return {{{"Food  --", HudTone::Muted}}, {}, {}};
+        HudContent content;
+        if ((display_ == "hunger" || display_ == "both") && food_->hunger) {
+            content.lines.push_back({std::format("Hunger  {:.0f}/20", *food_->hunger),
+                *food_->hunger <= 6.0F ? HudTone::Warning : HudTone::Normal});
+        }
+        if ((display_ == "saturation" || display_ == "both") && food_->saturation) {
+            content.lines.push_back({std::format("Saturation  {:.1f}", *food_->saturation),
+                *food_->saturation <= warning_ ? HudTone::Warning : HudTone::Accent});
+        }
+        if (content.lines.empty()) content.lines.push_back({"Food  waiting", HudTone::Muted});
+        return content;
+    }
+
+private:
+    std::optional<FoodAttributes> food_;
+    std::string display_{"both"};
+    float warning_{3.0F};
+};
+
+class ScoreboardModule final : public HudModuleBase<IPacketObserverModule> {
+public:
+    ScoreboardModule(ModuleMetadata metadata, HudLayout layout, SharedServices&)
+        : HudModuleBase(std::move(metadata), {
+            IntSetting("max-lines", "Maximum lines", 15, 1, 30),
+            BoolSetting("show-scores", "Show scores", true),
+            BoolSetting("strip-formatting", "Strip formatting codes", false)}, layout) {}
+    void OnSettingsChanged(const SettingsReader& settings) override {
+        std::scoped_lock lock(mutex_);
+        maxLines_ = settings.Int("max-lines");
+        showScores_ = settings.Bool("show-scores");
+        stripFormatting_ = settings.Bool("strip-formatting");
+    }
+    [[nodiscard]] bool WantsPacket(std::uint32_t id) const noexcept override {
+        return id == GamePacket::RemoveObjective || id == GamePacket::SetDisplayObjective || id == GamePacket::SetScore
+            || id == GamePacket::SetScoreboardIdentity || id == GamePacket::PlayerList;
+    }
+    void OnReplayPacket(const ReplayPacketEvent& packet) override {
+        std::scoped_lock lock(mutex_);
+        if (packet.sessionStart) Reset();
+        const auto view = SplitPacket(std::span(reinterpret_cast<const std::uint8_t*>(packet.bytes.data()), packet.bytes.size()));
+        if (!view) return;
+        if (view->id == GamePacket::PlayerList) {
+            if (auto update = ParsePlayerList(view->body)) roster_.Apply(std::move(*update));
+            return;
+        }
+        if (view->id == GamePacket::SetDisplayObjective) {
+            if (auto display = ParseDisplayObjective(view->body); display && display->slot == "sidebar") {
+                objective_ = std::move(display->objective);
+                title_ = std::move(display->displayName);
+                descending_ = display->descending;
+            }
+            return;
+        }
+        if (view->id == GamePacket::RemoveObjective) {
+            if (auto objective = ParseRemoveObjective(view->body); objective && *objective == objective_) ResetObjective();
+            return;
+        }
+        if (view->id == GamePacket::SetScoreboardIdentity) {
+            if (auto update = ParseScoreIdentityUpdate(view->body)) {
+                for (const auto& identity : update->entries) {
+                    if (update->remove) identities_.erase(identity.scoreId);
+                    else identities_[identity.scoreId] = identity.entityId;
+                }
+            }
+            return;
+        }
+        if (view->id == GamePacket::SetScore) {
+            if (auto update = ParseScoreUpdate(view->body)) {
+                for (auto& entry : update->entries) {
+                    if (update->remove) { rows_.erase(entry.id); continue; }
+                    if (entry.objective != objective_) continue;
+                    if (entry.displayName.empty()) {
+                        const auto identity = entry.entityId ? entry.entityId : [&]() -> std::optional<std::int64_t> {
+                            const auto found = identities_.find(entry.id);
+                            return found == identities_.end() ? std::nullopt : std::optional(found->second);
+                        }();
+                        if (identity) {
+                            if (const auto* player = roster_.FindByUniqueId(*identity)) entry.displayName = ReplayInjector::CleanPlayerName(player->name);
+                        }
+                    }
+                    if (entry.displayName.empty()) entry.displayName = std::format("Player {}", entry.id);
+                    rows_[entry.id] = {entry.score, std::move(entry.displayName)};
+                }
+            }
+        }
+    }
+    void OnDisable() override { std::scoped_lock lock(mutex_); Reset(); }
+    [[nodiscard]] HudContent Content() const override {
+        std::scoped_lock lock(mutex_);
+        if (objective_.empty()) return {};
+        HudContent content;
+        content.lines.push_back({Clean(title_), HudTone::Accent});
+        std::vector<std::pair<std::int32_t, std::string>> ordered;
+        for (const auto& [id, row] : rows_) { (void)id; ordered.push_back(row); }
+        std::ranges::sort(ordered, [this](const auto& left, const auto& right) {
+            return descending_ ? left.first > right.first : left.first < right.first;
+        });
+        const std::size_t begin = ordered.size() > static_cast<std::size_t>(maxLines_) ? ordered.size() - maxLines_ : 0;
+        for (std::size_t index = begin; index < ordered.size(); ++index) {
+            const auto& [score, name] = ordered[index];
+            content.lines.push_back({showScores_ ? std::format("{}  {}", Clean(name), score) : Clean(name), HudTone::Normal});
+        }
+        return content;
+    }
+
+private:
+    std::string Clean(std::string value) const {
+        if (stripFormatting_) value = StripFormatting(value);
+        return Ellipsize(value, 48);
+    }
+    void ResetObjective() { objective_.clear(); title_.clear(); rows_.clear(); identities_.clear(); }
+    void Reset() { ResetObjective(); roster_.Clear(); descending_ = true; }
+    PlayerRoster roster_;
+    std::string objective_;
+    std::string title_;
+    std::unordered_map<std::int64_t, std::pair<std::int32_t, std::string>> rows_;
+    std::unordered_map<std::int64_t, std::int64_t> identities_;
+    int maxLines_{15};
+    bool showScores_{true};
+    bool stripFormatting_{};
+    bool descending_{true};
+};
+
 std::string ItemName(const ItemStack& item) {
     std::string name = item.displayName.empty() ? ReadableItemId(item.itemId) : ToUtf8(item.displayName);
     return Ellipsize(name, 28);
@@ -298,6 +533,78 @@ private:
     bool use24_{};
     bool showSeconds_{};
     bool showLabel_{true};
+};
+
+class NowPlayingModule final : public HudModuleBase<> {
+public:
+    NowPlayingModule(ModuleMetadata metadata, HudLayout layout, SharedServices& services)
+        : HudModuleBase(std::move(metadata), {
+            BoolSetting("show-artist", "Show artist", true),
+            BoolSetting("show-source", "Show media app", false),
+            KeySetting("previous-key", "Previous track key", 0),
+            KeySetting("toggle-key", "Play / pause key", 0),
+            KeySetting("next-key", "Next track key", 0)}, layout), media_(services.media) {}
+
+    void OnSettingsChanged(const SettingsReader& settings) override {
+        std::scoped_lock lock(mutex_);
+        showArtist_ = settings.Bool("show-artist");
+        showSource_ = settings.Bool("show-source");
+        previousKey_ = settings.Key("previous-key");
+        toggleKey_ = settings.Key("toggle-key");
+        nextKey_ = settings.Key("next-key");
+    }
+
+    void OnKeyboard(const KeyboardEvent& event) override {
+        if (event.uiCaptured || !event.pressed || event.repeated) return;
+        std::string_view command;
+        {
+            std::scoped_lock lock(mutex_);
+            if (previousKey_ != 0 && event.key == previousKey_) command = "previous";
+            else if (toggleKey_ != 0 && event.key == toggleKey_) command = "toggle-play-pause";
+            else if (nextKey_ != 0 && event.key == nextKey_) command = "next";
+        }
+        if (!command.empty()) media_->Queue(command);
+    }
+
+    [[nodiscard]] std::vector<ModuleAction> Actions() const override {
+        const auto status = media_->Snapshot();
+        return {{"previous", "Previous"},
+            {"toggle-play-pause", status.playbackStatus == "playing" ? "Pause" : "Play"},
+            {"next", "Next"}};
+    }
+
+    bool InvokeAction(std::string_view action, SteadyTime) override {
+        if (action != "previous" && action != "toggle-play-pause" && action != "next") return false;
+        media_->Queue(action);
+        return true;
+    }
+
+    [[nodiscard]] HudContent Content() const override {
+        bool artist{}, source{};
+        {
+            std::scoped_lock lock(mutex_);
+            artist = showArtist_;
+            source = showSource_;
+        }
+        const auto status = media_->Snapshot();
+        if (!status.brokerConnected) return {{{"Media controls unavailable", HudTone::Warning}}, {}, {}};
+        if (!status.available) return {{{"Nothing playing", HudTone::Muted}}, {}, {}};
+
+        HudContent content;
+        const auto title = status.title.empty() ? std::string("Unknown track") : Ellipsize(status.title, 42);
+        content.lines.push_back({title, status.playbackStatus == "playing" ? HudTone::Accent : HudTone::Muted});
+        if (artist && !status.artist.empty()) content.lines.push_back({Ellipsize(status.artist, 42), HudTone::Normal});
+        if (source && !status.sourceAppId.empty()) content.lines.push_back({Ellipsize(status.sourceAppId, 42), HudTone::Muted});
+        return content;
+    }
+
+private:
+    std::shared_ptr<IMediaControlService> media_;
+    bool showArtist_{true};
+    bool showSource_{};
+    std::uint32_t previousKey_{};
+    std::uint32_t toggleKey_{};
+    std::uint32_t nextKey_{};
 };
 
 class StopwatchModule final : public HudModuleBase<> {
@@ -617,44 +924,389 @@ private:
     bool showAddresses_{};
 };
 
+// The player's own global resource packs (never world or server packs), one
+// at a time with its icon, rotating when several are on. Every installed pack
+// has a toggle (keyed by pack uuid, so it survives renames and reordering) to
+// leave it out of the rotation; only the toggles of the packs loaded right now
+// are listed.
 class ResourcePackDisplayModule final : public HudModuleBase<> {
 public:
-    ResourcePackDisplayModule(ModuleMetadata metadata, HudLayout layout, SharedServices&)
-        : HudModuleBase(std::move(metadata), {
-            IntSetting("max-shown", "Packs shown", 1, 1, 6, "%d", "Highest-priority pack first."),
-            BoolSetting("show-version", "Show pack version", false)}, layout) {}
+    ResourcePackDisplayModule(ModuleMetadata metadata, HudLayout layout, SharedServices& services)
+        : HudModuleBase(std::move(metadata), Descriptors(services.installedPacks()), layout),
+          activePacks_(services.activePacks), watchPacks_(services.watchPacks) {}
     void OnSettingsChanged(const SettingsReader& settings) override {
         std::scoped_lock lock(mutex_);
-        maxShown_ = static_cast<std::size_t>(settings.Int("max-shown"));
+        rotateEvery_ = std::chrono::seconds(settings.Int("rotate-seconds"));
+        showIcon_ = settings.Bool("show-icon");
         showVersion_ = settings.Bool("show-version");
-    }
-    void OnDisable() override { std::scoped_lock lock(mutex_); state_.reset(); }
-    void OnResourcePacks(const ResourcePackState& state) override { std::scoped_lock lock(mutex_); state_ = state; }
-    [[nodiscard]] HudContent Content() const override {
-        std::scoped_lock lock(mutex_);
-        if (!state_) return {{{"Pack  --", HudTone::Muted}}, {}, {}};
-        if (state_->activePacks.empty()) return {{{"Pack  Default", HudTone::Normal}}, {}, {}};
-        HudContent content;
-        for (const auto& pack : state_->activePacks) {
-            if (content.lines.size() >= maxShown_) {
-                content.lines.push_back({std::format("+{} more", state_->activePacks.size() - maxShown_), HudTone::Muted});
-                break;
+        showAuthor_ = settings.Bool("show-author");
+        hidden_.clear();
+        for (const auto& descriptor : Settings()) {
+            if (descriptor.key.starts_with(PackKeyPrefix) && !settings.Bool(descriptor.key)) {
+                hidden_.push_back(descriptor.key.substr(PackKeyPrefix.size()));
             }
-            std::string text = (content.lines.empty() ? "Pack  " : "      ") + Ellipsize(ToUtf8(pack.name), 36);
-            if (showVersion_ && !pack.version.empty()) text += "  " + Ellipsize(ToUtf8(pack.version), 12);
-            content.lines.push_back({text, HudTone::Normal});
         }
+    }
+    void OnEnable() override { watchPacks_(true); }
+    void OnDisable() override { watchPacks_(false); }
+    [[nodiscard]] bool IsSettingRelevant(std::string_view key) const override {
+        if (!key.starts_with(PackKeyPrefix)) return true;
+        // Before the first read (or while the module is off) nothing says
+        // which packs are loaded, so every toggle stays reachable.
+        const auto packs = activePacks_();
+        if (!packs) return true;
+        const auto uuid = key.substr(PackKeyPrefix.size());
+        return std::ranges::any_of(*packs, [&](const UserResourcePacks::Pack& pack) { return pack.uuid == uuid; });
+    }
+    void OnRender(const RenderEvent& event) override { std::scoped_lock lock(mutex_); NoteRender(event); }
+    [[nodiscard]] HudContent Content() const override {
+        const auto packs = activePacks_();
+        std::scoped_lock lock(mutex_);
+        if (!packs) return {{{"Resource packs  --", HudTone::Muted}}, {}, {}};
+        std::vector<const UserResourcePacks::Pack*> shown;
+        for (const auto& pack : *packs) {
+            if (std::ranges::find(hidden_, pack.uuid) == hidden_.end()) shown.push_back(&pack);
+        }
+        if (shown.empty()) return {{{"No resource packs", HudTone::Muted}}, {}, {}};
+        const auto& pack = *shown[RotationIndex(shown.size(), RenderNow().time_since_epoch(), rotateEvery_)];
+        HudContent content;
+        content.lines.push_back({Ellipsize(ToUtf8(pack.name), 40), HudTone::Normal});
+        // Author and version share one quieter line under the name.
+        std::string details;
+        if (showAuthor_ && !pack.author.empty()) details = "by " + Ellipsize(ToUtf8(pack.author), 32);
+        if (showVersion_ && !pack.version.empty()) details += (details.empty() ? "v" : "  v") + Ellipsize(ToUtf8(pack.version), 16);
+        if (!details.empty()) content.lines.push_back({std::move(details), HudTone::Muted});
+        if (showIcon_) content.icon = pack.icon;
         return content;
     }
 
 private:
-    std::optional<ResourcePackState> state_;
-    std::size_t maxShown_{1};
+    static constexpr std::string_view PackKeyPrefix = "pack-";
+
+    static std::vector<SettingDescriptor> Descriptors(const std::vector<UserResourcePacks::Pack>& installed) {
+        std::vector<SettingDescriptor> settings{
+            IntSetting("rotate-seconds", "Rotate every", 5, 1, 60, "%d s", "How long each pack shows when several are on."),
+            BoolSetting("show-icon", "Show pack icon", true),
+            BoolSetting("show-author", "Show who made it", true, "From the pack's authors, or a \"by ...\" credit in its description."),
+            BoolSetting("show-version", "Show pack version", false)};
+        for (const auto& pack : installed) {
+            settings.push_back(BoolSetting(std::string(PackKeyPrefix) + pack.uuid, "Show " + Ellipsize(ToUtf8(pack.name), 40), true,
+                "Include this pack while it is turned on in Global Resources."));
+        }
+        return settings;
+    }
+
+    std::function<std::shared_ptr<const std::vector<UserResourcePacks::Pack>>()> activePacks_;
+    std::function<void(bool)> watchPacks_;
+    SteadyClock::duration rotateEvery_{std::chrono::seconds(5)};
+    bool showIcon_{true};
     bool showVersion_{};
+    bool showAuthor_{true};
+    std::vector<std::string> hidden_;
+};
+
+// Records replays of world sessions. A replay cannot be rebuilt from the
+// middle of a session (the world itself arrives in the join sequence), so
+// while Replay Mod is on, every server packet from the moment a world is
+// joined is captured into a hidden session file, along with camera samples
+// for the recording player's own movement. Start/Finish cut a clip out of
+// that session: the published replay is the session up to Finish plus the
+// clip's markers, and playback skips ahead to the clip's start. Any number of
+// clips can be taken per session. The session file is deleted on leave.
+class ReplayModModule final : public ModuleBase<IModule>, public IReplayControlModule {
+public:
+    ReplayModModule(ModuleMetadata metadata, HudLayout, SharedServices&)
+        : ModuleBase(std::move(metadata), {
+            BoolSetting("auto-record", "Start recording when you join a world", false,
+                "Off: press Start in the Esc menu or the Replays page to record.")}) {}
+
+    void OnSettingsChanged(const SettingsReader& settings) override {
+        std::scoped_lock lock(mutex_);
+        autoRecord_ = settings.Bool("auto-record");
+    }
+
+    void OnEnable() override {
+        // Session files left behind by a crash are never replays on their own.
+        std::error_code ignored;
+        std::filesystem::remove_all(SessionDirectory(), ignored);
+    }
+
+    void OnDisable() override {
+        std::scoped_lock lock(mutex_);
+        EndSessionLocked(SteadyClock::now(), "Replay Mod was turned off");
+    }
+
+    void OnReplayPacket(const ReplayPacketEvent& packet) override {
+        std::scoped_lock lock(mutex_);
+        if (packet.sessionStart) {
+            EndSessionLocked(packet.capturedAt, "joined another world");
+            if (!packet.joinedFromStart) {
+                detail_ = "Rejoin this world to record it (Oinkster loaded after you joined).";
+                return;
+            }
+            OpenSessionLocked(packet.capturedAt, packet.session);
+        }
+        if (!sessionOpen_ || packet.session != session_) return;
+        const auto bytes = std::span(reinterpret_cast<const std::uint8_t*>(packet.bytes.data()), packet.bytes.size());
+        std::string error;
+        if (!writer_.Append(Replay::RecordKind::IncomingPacket, TimestampMicros(packet.capturedAt), bytes, error)) {
+            (void)Fail(error);
+            return;
+        }
+        if (packet.packetId == ReplayCapture::PacketId::StartGame) sawStartGame_ = true;
+        if (packet.packetId == ReplayCapture::PacketId::Disconnect) EndSessionLocked(packet.capturedAt, "disconnected");
+    }
+
+    // The server never tells a client which hotbar slot it holds, so the
+    // recording keeps it beside each camera sample for the replayed player.
+    void OnInventory(const InventorySnapshot& inventory) override {
+        std::scoped_lock lock(mutex_);
+        if (inventory.selectedHotbarSlot >= 0 && inventory.selectedHotbarSlot <= 8) hotbarSlot_ = inventory.selectedHotbarSlot;
+    }
+
+    void OnPlayerTransform(const PlayerTransform& transform) override {
+        std::scoped_lock lock(mutex_);
+        lastTransformAt_ = transform.capturedAt;
+        if (!sessionOpen_) return;
+        if (lastCameraAt_ != SteadyTime{} && transform.capturedAt - lastCameraAt_ < std::chrono::milliseconds(50)) return;
+        lastCameraAt_ = transform.capturedAt;
+        const auto payload = std::format(
+            "{{\"x\":{:.6f},\"y\":{:.6f},\"z\":{:.6f},\"yaw\":{},\"pitch\":{},\"dimension\":{},\"slot\":{}}}",
+            transform.position.x, transform.position.y, transform.position.z,
+            transform.yawDegrees ? std::format("{:.3f}", *transform.yawDegrees) : "null",
+            transform.pitchDegrees ? std::format("{:.3f}", *transform.pitchDegrees) : "null",
+            transform.dimension ? std::to_string(*transform.dimension) : "null",
+            hotbarSlot_ ? std::to_string(*hotbarSlot_) : "null");
+        std::string error;
+        const auto bytes = std::span(reinterpret_cast<const std::uint8_t*>(payload.data()), payload.size());
+        if (!writer_.Append(Replay::RecordKind::Camera, TimestampMicros(transform.capturedAt), bytes, error)) (void)Fail(error);
+    }
+
+    void OnRender(const RenderEvent& event) override {
+        // Singleplayer sends no Disconnect when a world is closed; the world
+        // no longer rendering is the fallback "left" signal.
+        std::scoped_lock lock(mutex_);
+        if (sessionOpen_ && lastTransformAt_ > openedAt_ && event.presentedAt - lastTransformAt_ > LeftWorldAfter) {
+            EndSessionLocked(event.presentedAt, "left the world");
+            Diagnostics::LogLine("info", "replay_auto_finish", "no world telemetry for 15 s; session closed");
+        }
+    }
+
+    [[nodiscard]] ReplayControlSnapshot ReplaySnapshot(SteadyTime now) const override {
+        std::scoped_lock lock(mutex_);
+        auto elapsed = accumulated_;
+        if (state_ == ReplayControlState::Recording && now > runningSince_) elapsed += now - runningSince_;
+        const bool canStart = sessionOpen_ && state_ != ReplayControlState::Recording && state_ != ReplayControlState::Paused;
+        return {state_, std::chrono::duration_cast<std::chrono::milliseconds>(elapsed), clipMarks_, detail_, canStart};
+    }
+
+    bool StartReplay(SteadyTime now) override {
+        std::scoped_lock lock(mutex_);
+        if (!sessionOpen_) {
+            detail_ = "Recording needs a world joined while Replay Mod is on. Rejoin to record.";
+            return false;
+        }
+        if (state_ == ReplayControlState::Recording || state_ == ReplayControlState::Paused) return false;
+        BeginClipLocked(now);
+        return true;
+    }
+
+    bool ToggleReplayPause(SteadyTime now) override {
+        std::scoped_lock lock(mutex_);
+        if (state_ == ReplayControlState::Recording) {
+            if (now > runningSince_) accumulated_ += now - runningSince_;
+            AddClipMarkerLocked(now, "pause");
+            state_ = ReplayControlState::Paused;
+            detail_ = "Paused. Resume to keep recording this clip.";
+            return true;
+        }
+        if (state_ == ReplayControlState::Paused) {
+            AddClipMarkerLocked(now, "resume");
+            runningSince_ = now;
+            state_ = ReplayControlState::Recording;
+            detail_ = "Recording.";
+            return true;
+        }
+        return false;
+    }
+
+    bool MarkReplay(SteadyTime now) override {
+        std::scoped_lock lock(mutex_);
+        if (state_ != ReplayControlState::Recording && state_ != ReplayControlState::Paused) return false;
+        ++clipMarks_;
+        AddClipMarkerLocked(now, std::format("mark {}", clipMarks_));
+        detail_ = std::format("Marked highlight {}.", clipMarks_);
+        return true;
+    }
+
+    bool FinishReplay(SteadyTime now) override {
+        std::scoped_lock lock(mutex_);
+        if (state_ != ReplayControlState::Recording && state_ != ReplayControlState::Paused) return false;
+        return SaveClipLocked(now, {});
+    }
+
+    bool DiscardReplay() override {
+        std::scoped_lock lock(mutex_);
+        if (state_ != ReplayControlState::Recording && state_ != ReplayControlState::Paused
+            && state_ != ReplayControlState::Error) return false;
+        ResetClipLocked();
+        state_ = ReplayControlState::Idle;
+        detail_ = sessionOpen_ ? "Recording discarded. Press Start to record again." : "Recording discarded.";
+        return true;
+    }
+
+private:
+    // Singleplayer pauses still render the level, so 15 s without it means
+    // the world was closed (or is stuck loading for an unusually long time).
+    static constexpr auto LeftWorldAfter = std::chrono::seconds(15);
+
+    [[nodiscard]] static std::filesystem::path ReplayDirectory() {
+        wchar_t localAppData[32768]{};
+        const auto length = GetEnvironmentVariableW(L"LOCALAPPDATA", localAppData,
+            static_cast<DWORD>(std::size(localAppData)));
+        if (length > 0 && length < std::size(localAppData)) {
+            return std::filesystem::path(localAppData) / L"Oinkster" / L"Client" / L"replays";
+        }
+        return std::filesystem::temp_directory_path() / L"Oinkster" / L"replays";
+    }
+    // Hidden from the Replays page, which lists only the replays folder itself.
+    [[nodiscard]] static std::filesystem::path SessionDirectory() { return ReplayDirectory() / L".session"; }
+
+    void OpenSessionLocked(SteadyTime now, std::uint32_t session) {
+        writer_.Close();
+        std::error_code errorCode;
+        std::filesystem::create_directories(SessionDirectory(), errorCode);
+        if (errorCode) {
+            (void)Fail("Could not create the replay folder.");
+            return;
+        }
+        sessionStartedUnixMillis_ = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+        const auto path = SessionDirectory() / std::format(L"session-{}.oinksession", sessionStartedUnixMillis_);
+        std::string error;
+        if (!writer_.Open(path, sessionStartedUnixMillis_, error)) {
+            (void)Fail(error);
+            return;
+        }
+        std::string build;
+        for (const auto character : SupportedBuild::DisplayVersion) build.push_back(static_cast<char>(character));
+        if (!writer_.AppendMetadata(std::format(
+                R"({{"format":"oinkster-replay","capture":"packets","minecraft":"{}"}})", build), error)) {
+            (void)Fail(error);
+            return;
+        }
+        sessionOpen_ = true;
+        session_ = session;
+        openedAt_ = now;
+        lastCameraAt_ = {};
+        sawStartGame_ = false;
+        ResetClipLocked();
+        state_ = ReplayControlState::Idle;
+        if (autoRecord_) BeginClipLocked(now);
+        else detail_ = "Ready. Press Start to record.";
+    }
+
+    void BeginClipLocked(SteadyTime now) {
+        ResetClipLocked();
+        clipStart_ = TimestampMicros(now);
+        state_ = ReplayControlState::Recording;
+        runningSince_ = now;
+        detail_ = "Recording.";
+    }
+
+    void ResetClipLocked() {
+        clipMarkers_.clear();
+        clipMarks_ = 0;
+        accumulated_ = {};
+    }
+
+    void AddClipMarkerLocked(SteadyTime now, std::string label) {
+        clipMarkers_.push_back({Replay::RecordKind::Marker, TimestampMicros(now),
+            std::vector<std::uint8_t>(label.begin(), label.end())});
+    }
+
+    // Publishes the session so far as a replay that starts at the clip.
+    bool SaveClipLocked(SteadyTime now, std::string_view reason) {
+        if (state_ == ReplayControlState::Recording && now > runningSince_) accumulated_ += now - runningSince_;
+        const std::string start = "clip-start";
+        std::vector<Replay::Record> extra{{Replay::RecordKind::Marker, clipStart_,
+            std::vector<std::uint8_t>(start.begin(), start.end())}};
+        extra.insert(extra.end(), clipMarkers_.begin(), clipMarkers_.end());
+        auto destination = ReplayDirectory() / std::format(L"replay-{}.oinkreplay",
+            sessionStartedUnixMillis_ + clipStart_ / 1000);
+        std::error_code ignored;
+        for (int suffix = 2; std::filesystem::exists(destination, ignored); ++suffix) {
+            destination = ReplayDirectory() / std::format(L"replay-{}-{}.oinkreplay",
+                sessionStartedUnixMillis_ + clipStart_ / 1000, suffix);
+        }
+        std::string error;
+        if (!Replay::ExportClip(writer_.PartialPath(), writer_.BytesWritten(), destination, extra, TimestampMicros(now), error)) {
+            state_ = ReplayControlState::Error;
+            detail_ = error.empty() ? "The replay could not be saved." : error;
+            return false;
+        }
+        ResetClipLocked();
+        state_ = ReplayControlState::Idle;
+        detail_ = "Saved " + destination.filename().string();
+        if (!sawStartGame_) detail_ += " (no world data - it may not play back)";
+        if (!reason.empty()) detail_ += std::format(" ({})", reason);
+        Diagnostics::LogLine("info", "replay_saved", std::format("bytes={} startGame={}", writer_.BytesWritten(), sawStartGame_));
+        return true;
+    }
+
+    // Saves a running clip, then drops the session capture.
+    void EndSessionLocked(SteadyTime now, std::string_view reason) {
+        if (!sessionOpen_) return;
+        const bool clipRunning = state_ == ReplayControlState::Recording || state_ == ReplayControlState::Paused;
+        if (clipRunning) (void)SaveClipLocked(now, reason);
+        else detail_ = "Ready. Recording needs a world joined while Replay Mod is on.";
+        const auto partial = writer_.PartialPath();
+        writer_.Close();
+        std::error_code ignored;
+        if (!partial.empty()) std::filesystem::remove(partial, ignored);
+        sessionOpen_ = false;
+        if (state_ != ReplayControlState::Error) state_ = ReplayControlState::Idle;
+    }
+
+    [[nodiscard]] std::uint64_t TimestampMicros(SteadyTime now) const noexcept {
+        if (now <= openedAt_) return 0;
+        return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(now - openedAt_).count());
+    }
+
+    bool Fail(std::string error) {
+        const auto partial = writer_.PartialPath();
+        writer_.Close();
+        std::error_code ignored;
+        if (!partial.empty()) std::filesystem::remove(partial, ignored);
+        sessionOpen_ = false;
+        ResetClipLocked();
+        state_ = ReplayControlState::Error;
+        detail_ = error.empty() ? "Replay recording failed." : std::move(error);
+        return false;
+    }
+
+    Replay::Writer writer_;
+    ReplayControlState state_{ReplayControlState::Idle};
+    bool autoRecord_{};
+    bool sessionOpen_{};
+    bool sawStartGame_{};
+    std::uint32_t session_{};
+    std::uint64_t sessionStartedUnixMillis_{};
+    std::uint64_t clipStart_{};
+    std::vector<Replay::Record> clipMarkers_;
+    std::size_t clipMarks_{};
+    SteadyTime openedAt_{};
+    SteadyTime runningSince_{};
+    SteadyTime lastCameraAt_{};
+    std::optional<int> hotbarSlot_;
+    SteadyTime lastTransformAt_{};
+    SteadyClock::duration accumulated_{};
+    std::string detail_{"Ready. Recording needs a world joined while Replay Mod is on."};
 };
 }
 
 std::unique_ptr<IModule> MakeClock(ModuleMetadata m, HudLayout l, SharedServices& s) { return std::make_unique<ClockModule>(std::move(m), l, s); }
+std::unique_ptr<IModule> MakeNowPlaying(ModuleMetadata m, HudLayout l, SharedServices& s) { return std::make_unique<NowPlayingModule>(std::move(m), l, s); }
 std::unique_ptr<IModule> MakeStopwatch(ModuleMetadata m, HudLayout l, SharedServices& s) { return std::make_unique<StopwatchModule>(std::move(m), l, s); }
 std::unique_ptr<IModule> MakeSessionStatistics(ModuleMetadata m, HudLayout l, SharedServices& s) { return std::make_unique<SessionStatisticsModule>(std::move(m), l, s); }
 std::unique_ptr<IModule> MakeArmorStatus(ModuleMetadata m, HudLayout l, SharedServices& s) { return std::make_unique<ArmorStatusModule>(std::move(m), l, s); }
@@ -663,5 +1315,9 @@ std::unique_ptr<IModule> MakeItemCounter(ModuleMetadata m, HudLayout l, SharedSe
 std::unique_ptr<IModule> MakePotionEffects(ModuleMetadata m, HudLayout l, SharedServices& s) { return std::make_unique<PotionEffectsModule>(std::move(m), l, s); }
 std::unique_ptr<IModule> MakeServerDisplay(ModuleMetadata m, HudLayout l, SharedServices& s) { return std::make_unique<ServerDisplayModule>(std::move(m), l, s); }
 std::unique_ptr<IModule> MakeResourcePackDisplay(ModuleMetadata m, HudLayout l, SharedServices& s) { return std::make_unique<ResourcePackDisplayModule>(std::move(m), l, s); }
+std::unique_ptr<IModule> MakeReplayMod(ModuleMetadata m, HudLayout l, SharedServices& s) { return std::make_unique<ReplayModModule>(std::move(m), l, s); }
+std::unique_ptr<IModule> MakeScreenshot(ModuleMetadata m, HudLayout l, SharedServices& s) { return std::make_unique<ScreenshotModule>(std::move(m), l, s); }
+std::unique_ptr<IModule> MakeSaturationHud(ModuleMetadata m, HudLayout l, SharedServices& s) { return std::make_unique<SaturationHudModule>(std::move(m), l, s); }
+std::unique_ptr<IModule> MakeScoreboard(ModuleMetadata m, HudLayout l, SharedServices& s) { return std::make_unique<ScoreboardModule>(std::move(m), l, s); }
 
 }

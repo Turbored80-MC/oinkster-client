@@ -5,6 +5,7 @@
 #include "ModuleSettings.hpp"
 #include <chrono>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -53,6 +54,8 @@ enum class HudTone : std::uint8_t { Normal, Accent, Muted, Warning, Good };
 struct HudLine {
     std::string text;  // UTF-8
     HudTone tone{HudTone::Normal};
+    // Multiplies the line's text (and backdrop) opacity, e.g. fading chat.
+    float alpha{1.0F};
 };
 
 struct HudGraph {
@@ -79,6 +82,33 @@ struct HudContent {
     std::vector<std::vector<HudKey>> keyRows;
     // Draw without the HUD window's background panel (key grids supply their own tiles).
     bool bare{};
+    // Drawn to the left of the lines, about two lines tall.
+    std::shared_ptr<const ArgbImage> icon;
+    // Java-chat style: the layout's Y is the widget's bottom edge, so new
+    // lines push older ones upward.
+    bool anchorBottom{};
+    // Lines wrap at this width (unscaled pixels) and, with lineBackdrops,
+    // each gets its own backdrop of that width instead of one shared panel.
+    float wrapWidth{};
+    bool lineBackdrops{};
+    // Still drawn while a game screen (chat, inventory) owns the cursor,
+    // where the HUD is otherwise hidden.
+    bool overGameScreens{};
+};
+
+// Java-style debug information is anchored to both screen edges instead of
+// participating in the draggable HUD layout. Groups create the small vertical
+// gaps used by Minecraft's F3 overlay; rendering stays in OverlayUi so modules
+// remain independent of ImGui.
+struct DebugOverlayGroup {
+    std::vector<HudLine> lines;
+};
+
+struct DebugOverlayContent {
+    bool visible{};
+    float scale{1.0F};
+    std::vector<DebugOverlayGroup> left;
+    std::vector<DebugOverlayGroup> right;
 };
 
 struct ModuleAction {
@@ -96,6 +126,11 @@ public:
     // these and calls OnSettingsChanged with a fresh reader on every change
     // (and once, with defaults, at registration).
     [[nodiscard]] virtual std::span<const SettingDescriptor> Settings() const noexcept { return {}; }
+    // Whether a settings UI should list `key` right now, for settings that
+    // only matter in some runtime state (e.g. one toggle per resource pack,
+    // shown only while that pack is loaded). The value still applies and
+    // persists while unlisted.
+    [[nodiscard]] virtual bool IsSettingRelevant(std::string_view) const { return true; }
     virtual void OnSettingsChanged(const SettingsReader&) {}
 
     // One-shot commands surfaced as buttons in the ClickGUI (e.g. stopwatch
@@ -119,6 +154,11 @@ public:
     virtual void OnCombat(const CombatEvent&) {}
     virtual void OnSound(const SoundEvent&) {}
     virtual void OnChat(const ChatEvent&) {}
+    virtual void OnCameraPerspective(const CameraPerspectiveEvent&) {}
+    virtual void OnGameCrosshair(const GameCrosshairEvent&) {}
+    virtual void OnBlockSelection(const BlockSelectionEvent&) {}
+    virtual void OnCameraPose(const CameraPoseEvent&) {}
+    virtual void OnReplayPacket(const ReplayPacketEvent&) {}
 };
 
 class IHudModule : public IModule {
@@ -139,12 +179,15 @@ public:
 struct OverlayLine { float x1{}, y1{}, x2{}, y2{}; std::uint32_t argb{}; float thickness{1.0F}; };
 struct OverlayRect { float x1{}, y1{}, x2{}, y2{}; std::uint32_t argb{}; bool filled{true}; float thickness{1.0F}; };
 struct OverlayCircle { float x{}, y{}, radius{}; std::uint32_t argb{}; bool filled{true}; float thickness{1.0F}; };
+// A filled convex quad, corners in order.
+struct OverlayQuad { std::array<float, 4> x{}; std::array<float, 4> y{}; std::uint32_t argb{}; };
 
 struct OverlayPrimitives {
     std::vector<OverlayRect> rects;
     std::vector<OverlayLine> lines;
     std::vector<OverlayCircle> circles;
-    [[nodiscard]] bool Empty() const noexcept { return rects.empty() && lines.empty() && circles.empty(); }
+    std::vector<OverlayQuad> quads;
+    [[nodiscard]] bool Empty() const noexcept { return rects.empty() && lines.empty() && circles.empty() && quads.empty(); }
 };
 
 // Draws simple screen-space geometry under the HUD while gameplay is visible.
@@ -152,6 +195,21 @@ class IOverlayModule {
 public:
     virtual ~IOverlayModule() = default;
     [[nodiscard]] virtual OverlayPrimitives Primitives(float width, float height) const = 0;
+};
+
+class IDebugOverlayModule {
+public:
+    virtual ~IDebugOverlayModule() = default;
+    [[nodiscard]] virtual DebugOverlayContent DebugOverlay() const = 0;
+};
+
+// Takes over the game's own chat display: while an enabled module reports
+// true, Text packets that would reach chat are held back from the game
+// (ReplayPacketBridge); popups and tips still pass.
+class IChatReplacementModule {
+public:
+    virtual ~IChatReplacementModule() = default;
+    [[nodiscard]] virtual bool ReplacesVanillaChat() const = 0;
 };
 
 // Throttles presentation while the game is in the background.
@@ -182,6 +240,22 @@ public:
     [[nodiscard]] virtual std::uint32_t SneakKey() const noexcept = 0;
 };
 
+struct HeldKeyInputs {
+    bool gameplayHasCursor{};
+    bool menuVisible{};
+    bool focused{};
+};
+
+// Requests one ordinary game key be held on the player's behalf. The DX12
+// integration owns the actual key-up bookkeeping, so disabling a module,
+// opening a screen, losing focus, or unloading can never strand a key down.
+class IKeyHoldAssistModule {
+public:
+    virtual ~IKeyHoldAssistModule() = default;
+    [[nodiscard]] virtual std::uint32_t DesiredHeldKey(const HeldKeyInputs& inputs) = 0;
+    virtual void ResetHeldKeyState() noexcept = 0;
+};
+
 // Cosmetic blend of the previous presented frame over the current one.
 class IFrameBlendModule {
 public:
@@ -190,6 +264,138 @@ public:
     [[nodiscard]] virtual float BlendStrength() const noexcept = 0;
 };
 
+enum class ReplayControlState : std::uint8_t { Idle, Recording, Paused, Error };
+
+struct ReplayControlSnapshot {
+    ReplayControlState state{ReplayControlState::Idle};
+    std::chrono::milliseconds elapsed{};
+    std::size_t markers{};
+    std::string detail;
+    // Start is only possible while a world session is being captured from
+    // its join; replays cannot be built from mid-session.
+    bool canStart{};
+};
+
+// Supplies the recorder controls shown beside Minecraft's pause menu and on
+// the ClickGUI Replays page. The module owns recording and file lifetime; the
+// overlay only renders commands.
+class IReplayControlModule {
+public:
+    virtual ~IReplayControlModule() = default;
+    [[nodiscard]] virtual ReplayControlSnapshot ReplaySnapshot(SteadyTime now) const = 0;
+    virtual bool StartReplay(SteadyTime now) = 0;
+    virtual bool ToggleReplayPause(SteadyTime now) = 0;
+    virtual bool MarkReplay(SteadyTime now) = 0;
+    virtual bool FinishReplay(SteadyTime now) = 0;
+    virtual bool DiscardReplay() = 0;
+};
+
 inline constexpr float MaxFrameBlendStrength = 0.85F;
+
+// Reads specific server->client packets (the player list, chat, forms).
+// ReplayPacketBridge copies a packet into a ReplayPacketEvent only when an
+// enabled module asks for its id, so ordinary play costs nothing.
+class IPacketObserverModule {
+public:
+    virtual ~IPacketObserverModule() = default;
+    [[nodiscard]] virtual bool WantsPacket(std::uint32_t packetId) const noexcept = 0;
+};
+
+// A Java-style tab list: the server's player list while a key is held.
+struct PlayerListRow {
+    std::string name;                     // UTF-8, colour codes removed
+    std::array<std::uint32_t, 64> face{};  // 8x8 ARGB head front
+    bool hasFace{};
+};
+
+struct PlayerListView {
+    bool visible{};
+    std::string title;   // server or world name, may be empty
+    std::vector<PlayerListRow> rows;
+    bool heads{true};
+    int columns{};       // 0 = automatic
+    float scale{1.0F};
+};
+
+// Short confirmations ("Requeued SkyWars", "Saved Steve's skin") shown as a
+// toast at the top of the screen. Drained once per frame.
+class INoticeModule {
+public:
+    virtual ~INoticeModule() = default;
+    [[nodiscard]] virtual std::vector<std::string> TakeNotices() = 0;
+};
+
+class IPlayerListModule {
+public:
+    virtual ~IPlayerListModule() = default;
+    [[nodiscard]] virtual PlayerListView PlayerList() const = 0;
+};
+
+// How the local mouse reaches gameplay. Applied by MouseInputBlocker on the
+// game's own GameInput reading and MouseDevice::feed, so it never touches
+// the system cursor or other applications.
+struct MouseShaping {
+    bool blockWheel{};          // swallow wheel notches while gameplay owns the mouse
+    float sensitivityX{1.0F};   // multiplier on horizontal look movement
+    float sensitivityY{1.0F};
+};
+
+class IMouseShapingModule {
+public:
+    virtual ~IMouseShapingModule() = default;
+    // Called once per presented frame; the module adjusts what it owns.
+    virtual void ShapeMouse(MouseShaping& shaping, bool gameplayHasCursor) const = 0;
+};
+
+// One key message to hand to the game in place of a physical one.
+struct KeyMessage {
+    std::uint32_t key{};
+    bool pressed{};
+};
+
+// Rewrites the game's keyboard stream on the window thread (e.g. Null
+// Movement: of two opposing keys only the newest stays down). Only ordinary
+// key-down/key-up messages are emitted, never more keys than are physically
+// held.
+class IKeyTransformModule {
+public:
+    virtual ~IKeyTransformModule() = default;
+    // Returns true when the module took the message; `out` then replaces it
+    // (possibly empty). `physical` is the real held state (GetAsyncKeyState).
+    [[nodiscard]] virtual bool TransformKey(std::uint32_t key, bool pressed, bool repeated,
+        const std::array<bool, 256>& physical, std::vector<KeyMessage>& out) = 0;
+    // Gameplay lost the keyboard (menu, game screen, focus): forget state.
+    virtual void ResetKeyTransform() noexcept = 0;
+};
+
+// Re-presses keys the player is still physically holding when a game screen
+// (inventory, chat, pause) closes, since Bedrock drops them.
+class IHeldKeyRestoreModule {
+public:
+    virtual ~IHeldKeyRestoreModule() = default;
+    [[nodiscard]] virtual std::vector<std::uint32_t> KeysToRestore() const = 0;
+};
+
+// A cosmetic colour grade drawn over the presented frame.
+struct PostProcessSettings {
+    float saturation{1.0F};    // 0 = greyscale, 1 = unchanged, 2 = vivid
+    float contrast{1.0F};
+    float brightness{};        // -0.5 .. 0.5 added to every channel
+    float vignette{};          // 0 .. 1 corner darkening
+    float sharpen{};           // 0 .. 1 unsharp mask
+    float blur{};              // 0 .. 1 screen-space blur radius
+    std::uint32_t tint{0xFFFFFFFFU};
+    float tintStrength{};      // 0 .. 1
+    [[nodiscard]] bool Identity() const noexcept {
+        return saturation == 1.0F && contrast == 1.0F && brightness == 0.0F && vignette == 0.0F
+            && sharpen == 0.0F && blur == 0.0F && tintStrength == 0.0F;
+    }
+};
+
+class IPostProcessModule {
+public:
+    virtual ~IPostProcessModule() = default;
+    [[nodiscard]] virtual PostProcessSettings PostProcess() const = 0;
+};
 
 }

@@ -4,27 +4,49 @@
 #include "Oinkster/SignatureScan.hpp"
 #include "Oinkster/SkinHead.hpp"
 #include "Oinkster/PlayerSkinLayout.hpp"
+#include "Oinkster/RakNet.hpp"
+#include "Oinkster/ReplayBlockPack.hpp"
+#include "Oinkster/ReplayCameraPath.hpp"
+#include "Oinkster/ReplayCapture.hpp"
+#include "Oinkster/ReplayFile.hpp"
+#include "Oinkster/ReplayPlayback.hpp"
+#include "Oinkster/ReplayInjector.hpp"
+#include "Oinkster/ReplayTimeline.hpp"
+#include "Oinkster/ReplayWorld.hpp"
 #include "Oinkster/ClickGui.hpp"
+#include "Oinkster/CrosshairTexture.hpp"
+#include "Oinkster/UserResourcePacks.hpp"
 #include "Oinkster/Dx12Overlay.hpp"
 #include "Oinkster/EnttRegistry.hpp"
 #include "Oinkster/GameItems.hpp"
 #include "Oinkster/InputState.hpp"
 #include "Oinkster/Json.hpp"
+#include "Oinkster/PostProcess.hpp"
 #include "Oinkster/StatusPipe.hpp"
+#include "Oinkster/ServerPolicy.hpp"
 #include "Oinkster/UnloadGuard.hpp"
+#include "Oinkster/VideoRecorder.hpp"
 #include "Oinkster/WorldTelemetry.hpp"
+#include "Oinkster/Modules/PerformanceLogic.hpp"
 #include "Oinkster/Modules/AccessibilityLogic.hpp"
 #include "Oinkster/Modules/FrameStatistics.hpp"
 #include "Oinkster/Modules/HudFormat.hpp"
 #include "Oinkster/Modules/InputLogic.hpp"
+#include "Oinkster/Modules/PacketLogic.hpp"
+#include "Oinkster/Modules/HiveLogic.hpp"
+#include "Oinkster/PacketSender.hpp"
 #include "Oinkster/Modules/PvpLogic.hpp"
+#include "Oinkster/Modules/CameraMath.hpp"
 #include "Oinkster/Modules/StatusLogic.hpp"
 #include "Oinkster/Modules/TelemetryLogic.hpp"
 #include "Oinkster/Modules/VisualLogic.hpp"
+#include <WinSock2.h>
 #include <Windows.h>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <bitset>
+#include <format>
 #include <chrono>
 #include <algorithm>
 #include <cmath>
@@ -33,6 +55,7 @@
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <limits>
 #include <set>
 #include <span>
 #include <sstream>
@@ -65,6 +88,14 @@ public:
 private:
     Oinkster::ModuleMetadata metadata_{"cancelling", L"Cancelling", L"Test input cancellation",
         Oinkster::ModuleCategory::Accessibility, false, true, Oinkster::EventPriority::Immediate};
+};
+
+class FakeMediaControlService final : public Oinkster::IMediaControlService {
+public:
+    Oinkster::MediaStatusSnapshot snapshot;
+    std::vector<std::string> commands;
+    [[nodiscard]] Oinkster::MediaStatusSnapshot Snapshot() const override { return snapshot; }
+    void Queue(std::string_view command) override { commands.emplace_back(command); }
 };
 
 void Require(bool condition, const char* message) { if (!condition) throw std::runtime_error(message); }
@@ -108,8 +139,9 @@ std::string Narrow(std::wstring_view value) { return M::ToUtf8(value); }
 
 void CatalogIdsAreUniqueAndWellFormed() {
     Catalog catalog;
-    Require(catalog.manager.Size() == 36, "Catalog must contain 36 modules");
+    Require(catalog.manager.Size() == 70, "Catalog must contain 70 modules");
     std::unordered_set<std::string> ids;
+    std::vector<std::string> defaultEnabled;
     for (const auto& entry : Oinkster::CatalogEntries()) {
         const std::string id(entry.id);
         Require(ids.insert(id).second, "Catalog ids must be unique");
@@ -117,7 +149,9 @@ void CatalogIdsAreUniqueAndWellFormed() {
             "Catalog ids must be lowercase kebab-case");
         Require(catalog.manager.FindModule(id) != nullptr, "Every catalog entry must be registered");
         Require((catalog.manager.FindHudModule(id) != nullptr) == entry.hud, "The HUD flag must match the module's interface");
+        if (catalog.manager.FindModule(id)->Metadata().defaultEnabled) defaultEnabled.push_back(id);
     }
+    Require(defaultEnabled == std::vector<std::string>{"debug-menu"}, "Only the debug menu is enabled by default");
     bool duplicateRejected{};
     try {
         auto duplicate = Oinkster::CreateModuleCatalog();
@@ -164,6 +198,24 @@ void NativeCatalogMatchesLauncherJson() {
             throw std::runtime_error("Catalog unavailableReason drift" + where);
         }
     }
+}
+
+void NowPlayingUsesCachedMediaAndQueuesActions() {
+    M::SharedServices services;
+    auto media = std::make_shared<FakeMediaControlService>();
+    services.media = media;
+    Oinkster::ModuleManager manager;
+    for (auto& module : Oinkster::CreateModuleCatalog(services)) manager.Register(std::move(module));
+    const auto* hud = manager.FindHudModule("now-playing");
+    Require(hud != nullptr, "Now playing is a HUD module");
+    Require(hud->DisplayText() == "Media controls unavailable", "A missing broker has a useful empty state");
+
+    media->snapshot = {true, false};
+    Require(hud->DisplayText() == "Nothing playing", "A connected broker with no session has a distinct empty state");
+    media->snapshot = {true, true, "Spotify.exe", "Hoppipolla", "Sigur Ros", "playing", true, true, true};
+    Require(hud->DisplayText() == "Hoppipolla\nSigur Ros", "Track and artist use the cached broker snapshot");
+    Require(manager.InvokeAction("now-playing", "next", At(1)), "The next action is recognized");
+    Require(media->commands == std::vector<std::string>{"next"}, "Actions are queued without blocking the render thread");
 }
 
 // ------------------------------------------------------------------ availability
@@ -242,6 +294,63 @@ void ModuleLifecycleIsIsolated() {
         "The crosshair alone keeps the overlay render path alive");
     manager.DisableAll();
     Require(manager.SetEnabled("motion-blur", true) && manager.HasEnabledOverlayModules(), "Frame blending keeps the overlay render path alive");
+}
+
+void ClickFiltersAreDeterministicAndFailSafe() {
+    M::ClickDebouncer debounce;
+    debounce.Configure(20ms, 30ms, false);
+    Require(debounce.Allow(1, At(1.000)), "The first left click is accepted");
+    Require(!debounce.Allow(1, At(1.019)), "A left click inside the debounce interval is discarded");
+    Require(debounce.Allow(1, At(1.020)), "A click exactly on the debounce boundary is accepted");
+    Require(debounce.Allow(2, At(1.000)), "Buttons have independent debounce histories");
+    Require(!debounce.Allow(2, At(1.029)), "The right button uses its own interval");
+    Require(debounce.Allow(2, At(0.500)), "A backwards timestamp resets safely instead of locking input");
+    debounce.Configure(25ms, 100ms, true);
+    debounce.Clear();
+    Require(debounce.Allow(2, At(2.000)) && !debounce.Allow(2, At(2.024)) && debounce.Allow(2, At(2.025)),
+        "Linked debounce uses the left interval for both buttons");
+
+    M::CpsLimiter limiter;
+    limiter.Configure(2, 1);
+    Require(limiter.Allow(1, At(3.000)) && limiter.Allow(1, At(3.100)), "Clicks through the left cap are accepted");
+    Require(!limiter.Allow(1, At(3.200)), "The first click above the rolling cap is discarded");
+    Require(limiter.Allow(1, At(4.000)), "An event exactly one second old leaves the rolling window");
+    Require(limiter.Allow(2, At(3.000)) && !limiter.Allow(2, At(3.500)), "Right CPS has an independent limit");
+    Require(limiter.Allow(2, At(2.000)), "A backwards timestamp clears the CPS window safely");
+}
+
+void CompetitiveServerPolicyFailsClosed() {
+    Catalog catalog;
+    auto& manager = catalog.manager;
+    manager.SetCapability(Capability::InputFiltering, {CapabilityState::Available, {}});
+
+    Oinkster::ServerPolicy::Apply(manager, Oinkster::SessionKind::None, Oinkster::ServerNetwork::Local);
+    Require(!manager.Availability("dc-prevent").available && !manager.Availability("cps-cap").available,
+        "An unclassified or stale session must fail closed even without a remote address");
+
+    Oinkster::ServerPolicy::Apply(manager, Oinkster::SessionKind::Singleplayer, Oinkster::ServerNetwork::Local);
+    Require(manager.Availability("dc-prevent").available && manager.Availability("cps-cap").available,
+        "Both click filters are permitted in singleplayer");
+
+    Oinkster::ServerPolicy::Apply(manager, Oinkster::SessionKind::Server, Oinkster::ServerNetwork::Zeqa);
+    Require(manager.Availability("dc-prevent").available, "Zeqa explicitly permits its DC Prevent behavior");
+    Require(!manager.Availability("cps-cap").available, "Zeqa CPS Cap remains blocked without explicit approval");
+
+    for (const auto network : {Oinkster::ServerNetwork::Hive, Oinkster::ServerNetwork::CubeCraft,
+        Oinkster::ServerNetwork::Galaxite, Oinkster::ServerNetwork::Lifeboat,
+        Oinkster::ServerNetwork::NetherGames, Oinkster::ServerNetwork::Mineville,
+        Oinkster::ServerNetwork::UnknownRemote}) {
+        Oinkster::ServerPolicy::Apply(manager, Oinkster::SessionKind::Server, network);
+        Require(!manager.Availability("dc-prevent").available && !manager.Availability("cps-cap").available,
+            "Unapproved remote networks must block both filters");
+    }
+
+    Require(Oinkster::ServerPolicy::ClassifyHostname(L"na.zeqa.net.") == Oinkster::ServerNetwork::Zeqa,
+        "Canonical subdomains and a trailing DNS dot classify without exposing the hostname");
+    Require(Oinkster::ServerPolicy::ClassifyHostname("geo.hivebedrock.network") == Oinkster::ServerNetwork::Hive,
+        "Known featured-server hostnames classify");
+    Require(Oinkster::ServerPolicy::ClassifyHostname("notzeqa.net.example") == Oinkster::ServerNetwork::UnknownRemote,
+        "Suffix lookalikes fail closed");
 }
 
 void ClickGuiViewsAndFavorites() {
@@ -401,7 +510,43 @@ void SettingsDocumentRoundTripsAndMigrates() {
     std::filesystem::remove_all(directory, ignored);
 }
 
+void SettingsProfilesSaveSwitchAndRemove() {
+    const auto directory = std::filesystem::current_path() / "test-artifacts" / "OinksterProfiles";
+    std::error_code ignored;
+    std::filesystem::remove_all(directory, ignored);
+    Oinkster::SettingsProfileStore profiles(directory);
+    Require(Oinkster::SettingsProfileStore::IsValidName("Bedwars")
+        && Oinkster::SettingsProfileStore::IsValidName("Low end PC"), "Ordinary profile names are accepted");
+    Require(!Oinkster::SettingsProfileStore::IsValidName("../escape")
+        && !Oinkster::SettingsProfileStore::IsValidName("CON"), "Unsafe profile filenames are rejected");
+
+    Oinkster::ClientSettings settings;
+    settings.moduleStates["fps"] = true;
+    profiles.Save("Bedwars", settings);
+    settings.moduleStates["fps"] = false;
+    profiles.Save("Creative", settings);
+    profiles.SetActive("Bedwars");
+
+    Require(profiles.List() == std::vector<std::string>({"Bedwars", "Creative"}),
+        "Profiles are listed alphabetically");
+    Require(profiles.Active() == "Bedwars" && profiles.Load("Bedwars")->moduleStates.at("fps"),
+        "The active profile and its complete settings round-trip");
+    Require(profiles.Remove("Creative") && !profiles.Load("Creative"), "A saved profile can be removed");
+    profiles.SetActive({});
+    Require(profiles.Active().empty(), "The active profile can be cleared");
+    std::filesystem::remove_all(directory, ignored);
+}
+
 void SettingsApplyAndCapturePreserveDeferredModules() {
+    Catalog defaults;
+    defaults.manager.SetCapability(Capability::LocalPlayerPosition, {CapabilityState::Available, {}});
+    Oinkster::ClientSettings noPersistedState;
+    Oinkster::ApplySettings(defaults.manager, noPersistedState);
+    Require(defaults.manager.IsEnabled("debug-menu"), "A missing persisted state uses the debug menu's enabled default");
+    noPersistedState.moduleStates["debug-menu"] = false;
+    Oinkster::ApplySettings(defaults.manager, noPersistedState);
+    Require(!defaults.manager.IsEnabled("debug-menu"), "An explicit disabled state wins over the catalog default");
+
     Catalog source;
     Require(source.manager.SetEnabled("fps", true), "FPS enables");
     source.manager.RestoreEnabled("armor-status", true);
@@ -1133,6 +1278,376 @@ void EquipmentWarningsAreNotSpammy() {
 
 // ------------------------------------------------------------------ visual
 
+void CrosshairSourceAndPerspective() {
+    using Oinkster::CameraPerspective;
+    using M::CrosshairPerspectiveFilter;
+    using M::CrosshairSource;
+    constexpr std::array perspectives{CameraPerspective::Unknown, CameraPerspective::FirstPerson,
+        CameraPerspective::ThirdPersonBack, CameraPerspective::ThirdPersonFront};
+    for (const auto perspective : perspectives) {
+        for (const auto filter : {CrosshairPerspectiveFilter::FirstPersonOnly, CrosshairPerspectiveFilter::AllPerspectives}) {
+            Require(!M::ShouldDrawCustomCrosshair(CrosshairSource::Game, filter, perspective),
+                "The game-default source never draws a custom crosshair");
+        }
+        Require(M::ShouldDrawCustomCrosshair(CrosshairSource::Custom, CrosshairPerspectiveFilter::AllPerspectives, perspective),
+            "All perspectives draws in every perspective");
+    }
+    Require(M::ShouldDrawCustomCrosshair(CrosshairSource::Custom, CrosshairPerspectiveFilter::FirstPersonOnly, CameraPerspective::FirstPerson),
+        "First-person-only draws in first person");
+    Require(M::ShouldDrawCustomCrosshair(CrosshairSource::Custom, CrosshairPerspectiveFilter::FirstPersonOnly, CameraPerspective::Unknown),
+        "First-person-only falls back to drawing while the perspective is unknown");
+    Require(!M::ShouldDrawCustomCrosshair(CrosshairSource::Custom, CrosshairPerspectiveFilter::FirstPersonOnly, CameraPerspective::ThirdPersonBack)
+        && !M::ShouldDrawCustomCrosshair(CrosshairSource::Custom, CrosshairPerspectiveFilter::FirstPersonOnly, CameraPerspective::ThirdPersonFront),
+        "First-person-only suppresses a known third-person perspective");
+    Require(M::ParseCrosshairSource("game") == CrosshairSource::Game && M::ParseCrosshairSource("custom") == CrosshairSource::Custom
+        && M::ParseCrosshairSource("") == CrosshairSource::Custom && M::ParseCrosshairSource("vanilla") == CrosshairSource::Custom,
+        "Crosshair source parses, defaulting to custom");
+    Require(M::ParseCrosshairPerspective("all") == CrosshairPerspectiveFilter::AllPerspectives
+        && M::ParseCrosshairPerspective("") == CrosshairPerspectiveFilter::FirstPersonOnly,
+        "Crosshair perspective parses, defaulting to first person only");
+
+    M::CrosshairConfig config;
+    Require(M::BuildCrosshairFrame(config, CameraPerspective::Unknown, 1920, 1080).rects.size() == 8,
+        "Default config draws four outlined arms");
+    config.source = CrosshairSource::Game;
+    Require(M::BuildCrosshairFrame(config, CameraPerspective::FirstPerson, 1920, 1080).Empty(),
+        "Game default produces no primitives");
+
+    // The live module: an older settings file has neither new key.
+    Catalog catalog;
+    auto& manager = catalog.manager;
+    Require(manager.SettingsFor("custom-crosshair").Choice("source") == "custom"
+        && manager.SettingsFor("custom-crosshair").Choice("perspective") == "first-person",
+        "Existing configurations load as a first-person custom crosshair");
+    Require(manager.SetEnabled("custom-crosshair", true), "Crosshair enables");
+    const auto overlay = [&manager] {
+        const auto modules = manager.EnabledModulesOf<Oinkster::IOverlayModule>();
+        return modules.empty() ? Oinkster::OverlayPrimitives{} : modules[0]->Primitives(1920, 1080);
+    };
+    Require(manager.EnabledModulesOf<Oinkster::IOverlayModule>().size() == 1, "Exactly one crosshair overlay is active");
+    const auto centered = overlay();
+    Require(centered.rects.size() == 8, "Custom draws the configured crosshair");
+    const auto& top = centered.rects[6];
+    RequireNear((top.x1 + top.x2) * 0.5, 960, 1e-6, "Vertical arms are centered horizontally");
+    RequireNear(top.y2, 540 - 3, 1e-6, "The top arm ends at the gap above center");
+
+    manager.SetModuleSetting("custom-crosshair.source", "game");
+    Require(overlay().Empty(), "Selecting the game default stops custom primitives");
+    manager.SetModuleSetting("custom-crosshair.source", "bogus");
+    Require(manager.ModuleSetting("custom-crosshair.source", "") == "custom" && !overlay().Empty(),
+        "An unknown source normalizes back to custom");
+
+    manager.Publish(Oinkster::CameraPerspectiveEvent{At(1), CameraPerspective::ThirdPersonBack});
+    Require(overlay().Empty(), "First-person-only suppresses the crosshair in third person");
+    manager.SetModuleSetting("custom-crosshair.perspective", "all");
+    Require(!overlay().Empty(), "All perspectives draws in third person");
+    manager.SetModuleSetting("custom-crosshair.perspective", "first-person");
+    manager.Publish(Oinkster::CameraPerspectiveEvent{At(2), CameraPerspective::FirstPerson});
+    Require(!overlay().Empty(), "Returning to first person draws again");
+    manager.Publish(Oinkster::CameraPerspectiveEvent{At(3), CameraPerspective::ThirdPersonFront});
+
+    Require(manager.SetEnabled("custom-crosshair", false) && manager.EnabledModulesOf<Oinkster::IOverlayModule>().empty(),
+        "Disabling the module removes it from the overlay path immediately");
+    Require(overlay().Empty(), "A disabled crosshair produces no primitives");
+    Require(manager.SetEnabled("custom-crosshair", true) && !overlay().Empty(),
+        "Re-enabling forgets the stale third-person state");
+    manager.SetModuleSetting("custom-crosshair.opacity", "0.5");
+    manager.SetModuleSetting("custom-crosshair.center-dot", "true");
+    Require((overlay().rects.back().argb >> 24U) == 128 && overlay().circles.size() == 2,
+        "Customization still reaches the geometry");
+}
+
+void CrosshairDrawnAndGameCopy() {
+    using Oinkster::CameraPerspective;
+    using M::CrosshairSource;
+
+    // Pixel-grid settings round-trip and normalize.
+    const auto plus = M::DefaultCrosshairPixels();
+    const auto text = Oinkster::FormatPixelGrid(plus);
+    Require(text.size() == 64 && Oinkster::ParsePixelGrid(text) == plus, "A pixel grid round-trips as 64 hex digits");
+    Require(text.substr(0, 4) == "0000" && text.substr(7 * 4, 4) == "1FF8" && text.substr(3 * 4, 4) == "0180",
+        "The default plus is ten cells long and two thick");
+    Require(!Oinkster::ParsePixelGrid("XYZ") && !Oinkster::ParsePixelGrid(std::string(63, '0')), "Malformed grids are refused");
+    const auto pixelSetting = M::PixelSetting("pixels", "Draw", plus);
+    Require(Oinkster::NormalizeSetting(pixelSetting, "garbage") == text, "A malformed grid falls back to the default");
+    Require(Oinkster::NormalizeSetting(pixelSetting, std::string(64, 'f')) == std::string(64, 'F'), "Grids normalize to uppercase");
+    Oinkster::PixelGrid left{};
+    Oinkster::SetPixel(left, 0, 0, true);
+    Require(Oinkster::PixelAt(Oinkster::MirrorPixelsHorizontally(left), 15, 0)
+        && Oinkster::PixelAt(Oinkster::MirrorPixelsVertically(left), 0, 15), "Mirroring copies the first half onto the second");
+
+    // Drawn geometry: one rect per run, centred, outlines first.
+    M::PixelCrosshairStyle style;
+    style.pixels = plus;
+    style.scale = 2;
+    style.outline = false;
+    const auto drawn = M::BuildPixelCrosshair(style, 1920, 1080);
+    Require(drawn.rects.size() == 10, "Runs merge: one rect per row of the plus");
+    const auto& row7 = drawn.rects[7 - 3];
+    RequireNear(row7.x1, 960 - 10, 1e-6, "The grid centre sits on the screen centre");
+    RequireNear(row7.x2, 960 + 10, 1e-6, "A ten-cell run is twenty pixels at scale 2");
+    style.outline = true;
+    const auto outlined = M::BuildPixelCrosshair(style, 1920, 1080);
+    Require(outlined.rects.size() == 20 && (outlined.rects.front().argb & 0x00FFFFFFU) == 0, "Outlines precede fills");
+    style.pixels = {};
+    Require(M::BuildPixelCrosshair(style, 1920, 1080).Empty(), "An empty grid draws nothing");
+
+    // The game texture redrawn: transparent texels skipped, equal runs merged.
+    Oinkster::ArgbImage image{4, 2, {0, 0xFFFFFFFFU, 0xFFFFFFFFU, 0, 0x80FF0000U, 0, 0, 0}};
+    const auto copy = M::BuildImageCrosshair(image, 2, 1, 100, 100);
+    Require(copy.rects.size() == 2, "One rect per opaque run");
+    RequireNear(copy.rects[0].x1, 50 - 4 + 2, 1e-6, "The texture is centred");
+    Require(copy.rects[1].argb == 0x80FF0000U, "Texel colors are kept");
+    Oinkster::ArgbImage large{256, 256, std::vector<std::uint32_t>(256 * 256, 0xFFFFFFFFU)};
+    const auto sampled = M::BuildImageCrosshair(large, 1, 1, 1920, 1080);
+    Require(sampled.rects.size() == 64, "Large textures are sampled down to 64 per side");
+    Require(M::BuildImageCrosshair(Oinkster::ArgbImage{2, 2, {1}}, 1, 1, 100, 100).Empty(), "A malformed image draws nothing");
+
+    // Only a known third-person camera redraws the game's crosshair.
+    for (const auto perspective : {CameraPerspective::Unknown, CameraPerspective::FirstPerson}) {
+        Require(!M::ShouldDrawGameCrosshairCopy(CrosshairSource::Game, true, perspective),
+            "The game's own crosshair is never doubled in first person or when unknown");
+    }
+    Require(M::ShouldDrawGameCrosshairCopy(CrosshairSource::Game, true, CameraPerspective::ThirdPersonBack)
+        && M::ShouldDrawGameCrosshairCopy(CrosshairSource::Game, true, CameraPerspective::ThirdPersonFront),
+        "Third person redraws the game's crosshair");
+    Require(!M::ShouldDrawGameCrosshairCopy(CrosshairSource::Game, false, CameraPerspective::ThirdPersonBack)
+        && !M::ShouldDrawGameCrosshairCopy(CrosshairSource::Drawn, true, CameraPerspective::ThirdPersonBack),
+        "Only the enabled game source redraws it");
+
+    // The live module.
+    Catalog catalog;
+    auto& manager = catalog.manager;
+    Require(manager.SetEnabled("custom-crosshair", true), "Crosshair enables");
+    const auto overlay = [&manager] {
+        const auto modules = manager.EnabledModulesOf<Oinkster::IOverlayModule>();
+        return modules.empty() ? Oinkster::OverlayPrimitives{} : modules[0]->Primitives(1920, 1080);
+    };
+    manager.SetModuleSetting("custom-crosshair.source", "drawn");
+    Require(manager.ModuleSetting("custom-crosshair.source", "") == "drawn" && overlay().rects.size() == 20,
+        "Drawn shows the default plus with an outline");
+    manager.SetModuleSetting("custom-crosshair.pixels", std::string(64, '0'));
+    Require(overlay().Empty(), "A cleared drawing draws nothing");
+
+    manager.SetModuleSetting("custom-crosshair.source", "game");
+    const auto texture = std::make_shared<const Oinkster::ArgbImage>(image);
+    manager.Publish(Oinkster::GameCrosshairEvent{At(1), texture});
+    Require(overlay().Empty(), "Game source draws nothing while the perspective is unknown");
+    manager.Publish(Oinkster::CameraPerspectiveEvent{At(2), CameraPerspective::ThirdPersonBack});
+    Require(overlay().rects.size() == 2, "Third person redraws the pack's crosshair");
+    manager.SetModuleSetting("custom-crosshair.third-person", "false");
+    Require(overlay().Empty(), "Turning the third-person copy off stops it");
+    manager.SetModuleSetting("custom-crosshair.third-person", "true");
+    manager.Publish(Oinkster::CameraPerspectiveEvent{At(3), CameraPerspective::FirstPerson});
+    Require(overlay().Empty(), "First person leaves the game's crosshair alone");
+    manager.Publish(Oinkster::CameraPerspectiveEvent{At(4), CameraPerspective::ThirdPersonFront});
+    manager.Publish(Oinkster::GameCrosshairEvent{At(5), nullptr});
+    Require(overlay().Empty(), "An unknown texture draws nothing");
+
+    // Settings shown for each source.
+    const auto* module = manager.FindModule("custom-crosshair");
+    const auto visible = [&](std::string_view key) {
+        const auto reader = manager.SettingsFor("custom-crosshair");
+        for (const auto& descriptor : module->Settings()) {
+            if (descriptor.key == key) return Oinkster::IsSettingVisible(descriptor, reader);
+        }
+        return false;
+    };
+    Require(visible("source") && visible("third-person") && !visible("pixels") && !visible("color"),
+        "Game shows only its own settings");
+    manager.SetModuleSetting("custom-crosshair.source", "drawn");
+    Require(visible("pixels") && visible("color") && !visible("gap") && !visible("third-person"), "Drawn shows the grid and colors");
+    manager.SetModuleSetting("custom-crosshair.source", "custom");
+    Require(visible("gap") && visible("color") && !visible("pixels"), "Custom shows the line settings");
+}
+
+void GameCrosshairTextureSource() {
+    namespace T = Oinkster::CrosshairTexture;
+
+    // A two-entry archive in Bedrock's .brarchive layout.
+    const std::string first = "first.png";
+    const std::string second = "cross_hair.png";
+    std::vector<std::uint8_t> archive{0x7D, 0x27, 0x25, 0xB1, 0xA0, 0x52, 0x70, 0x26, 2, 0, 0, 0, 1, 0, 0, 0};
+    const auto addEntry = [&archive](const std::string& name, std::uint32_t offset, std::uint32_t size) {
+        std::vector<std::uint8_t> entry(256, 0);
+        entry[0] = static_cast<std::uint8_t>(name.size());
+        std::copy(name.begin(), name.end(), entry.begin() + 1);
+        std::memcpy(entry.data() + 248, &offset, 4);
+        std::memcpy(entry.data() + 252, &size, 4);
+        archive.insert(archive.end(), entry.begin(), entry.end());
+    };
+    addEntry(first, 0, 3);
+    addEntry(second, 3, 2);
+    archive.insert(archive.end(), {'a', 'b', 'c', 'X', 'Y'});
+    const auto found = T::FindBrarchiveEntry(archive, "cross_hair.png");
+    Require(found && found->size() == 2 && (*found)[0] == 'X' && (*found)[1] == 'Y', "A named brarchive entry is found");
+    Require(!T::FindBrarchiveEntry(archive, "missing.png"), "A missing entry is not found");
+    auto truncated = archive;
+    truncated.resize(truncated.size() - 1);
+    Require(!T::FindBrarchiveEntry(truncated, "cross_hair.png"), "An entry past the end of the archive is refused");
+    archive[0] = 0;
+    Require(!T::FindBrarchiveEntry(archive, "first.png"), "A wrong magic is refused");
+
+    Require(T::FormatPackUuid(0x0123456789ABCDEFULL, 0xFEDCBA9876543210ULL) == "01234567-89ab-cdef-fedc-ba9876543210",
+        "Pack uuids format like the game's own");
+    Require(T::ManifestHeaderUuid(R"({ // comment
+        "format_version": 2, /* block */ "header": {"name": "Pack // not a comment", "uuid": "AAAAAAAA-0000-1111-2222-333333333333"}})")
+            == std::optional<std::string>("aaaaaaaa-0000-1111-2222-333333333333"),
+        "Manifest uuids are read past comments and lowercased");
+    Require(!T::ManifestHeaderUuid(R"({"header": {"uuid": "short"}})") && !T::ManifestHeaderUuid("not json"),
+        "Malformed manifests have no uuid");
+
+    constexpr std::array<std::uint8_t, 72> png{0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+        0x44, 0x52, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0xF4, 0x22, 0x7F, 0x8A, 0x00, 0x00,
+        0x00, 0x0F, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0xF8, 0xCF, 0xC0, 0xF0, 0x1F, 0x08, 0x1B, 0x00, 0x10, 0x79, 0x03, 0x7E,
+        0x7D, 0x63, 0xCE, 0xD7, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82};
+    const auto decoded = T::DecodePng(png);
+    Require(decoded && decoded->width == 2 && decoded->height == 1 && decoded->pixels[0] == 0xFFFF0000U
+        && decoded->pixels[1] == 0x8000FF00U, "PNGs decode to ARGB");
+    Require(!T::DecodePng(std::span<const std::uint8_t>(png.data(), 20)) && !T::DecodePng(std::span<const std::uint8_t>(archive)),
+        "Truncated and non-PNG data does not decode");
+}
+
+void UserResourcePackParsing() {
+    namespace U = Oinkster::UserResourcePacks;
+    const auto ids = U::ParseGlobalPackList(R"([ // comment
+        {"pack_id": "88BC79D5-FD23-44CE-BC49-1459934A5FF2", "subpack": "16xsword", "version": [1, 10, 1]},
+        {"pack_id": "short"},
+        {"pack_id": "1e3894be-03ea-4355-80c1-27d33bcf0628", "version": [1, 0, 0]},
+        {"pack_id": "88bc79d5-fd23-44ce-bc49-1459934a5ff2"}])");
+    Require(ids == std::vector<std::string>{"88bc79d5-fd23-44ce-bc49-1459934a5ff2", "1e3894be-03ea-4355-80c1-27d33bcf0628"},
+        "Global pack ids keep file order, lowercased, without malformed ids or duplicates");
+    Require(U::ParseGlobalPackList("not json").empty() && U::ParseGlobalPackList("{}").empty(), "A malformed list has no packs");
+
+    const auto header = U::ParseManifestHeader(R"({"header": {"name": "\u00a76Taj \u00a7l4k", "uuid": "AAAAAAAA-0000-1111-2222-333333333333",
+        "version": [1, 10, 1]}})");
+    Require(header && header->uuid == "aaaaaaaa-0000-1111-2222-333333333333" && header->name == "\xC2\xA7" "6Taj \xC2\xA7l4k"
+        && header->version == "1.10.1", "Manifest headers give uuid, raw name and dotted version");
+    const auto textVersion = U::ParseManifestHeader(R"({"header": {"uuid": "aaaaaaaa-0000-1111-2222-333333333333", "version": "2.0.0"}})");
+    Require(textVersion && textVersion->version == "2.0.0" && textVersion->name.empty(), "Format 3 string versions are kept");
+    Require(!U::ParseManifestHeader(R"({"header": {"uuid": "short"}})"), "A manifest without a full uuid is refused");
+
+    const std::string lang = "## header\r\npack.description=Nice\r\npack.name=Taj 4k Edition\t## the name\r\n";
+    Require(U::LookupLangValue(lang, "pack.name") == std::optional<std::string>("Taj 4k Edition"), "Lang values drop CRLF and comments");
+    Require(!U::LookupLangValue(lang, "pack.nam") && !U::LookupLangValue(lang, "missing"), "Only whole keys match");
+    Require(U::DisplayName("pack.name", lang, L"Folder") == L"Taj 4k Edition", "Lang-key names resolve through the lang file");
+    Require(U::DisplayName("pack.name", "other=x", L"Folder") == L"Folder", "An unresolved lang key falls back to the folder");
+    Require(U::DisplayName("\xC2\xA7" "6Foxy's\xC2\xA7r  ", "", L"Folder") == L"Foxy's", "Formatting codes and padding are removed");
+    Require(U::DisplayName("", "", L"Folder") == L"Folder", "An empty name falls back to the folder");
+
+    const auto withAuthors = U::ParseManifestHeader(R"({"header": {"uuid": "aaaaaaaa-0000-1111-2222-333333333333",
+        "description": "pack.description"}, "metadata": {"authors": ["ya_rifat", "EchoRif", 7]}})");
+    Require(withAuthors && withAuthors->description == "pack.description"
+        && withAuthors->authors == std::vector<std::string>{"ya_rifat", "EchoRif"}, "Manifests give their description and authors");
+    Require(U::PackAuthor({"ya_rifat", "EchoRif"}, "Made by someone else", "") == L"ya_rifat, EchoRif", "Listed authors win");
+    Require(U::PackAuthor({}, "Mashed Pack by Zoo", "") == L"Zoo", "A trailing credit is found");
+    Require(U::PackAuthor({}, "Reverts the Pause Screen to be how it was before 1.21.120.\nMade by Jzen.", "") == L"Jzen",
+        "Made-by credits drop the sentence's period");
+    Require(U::PackAuthor({}, "Pack By \xC2\xA7" "6FoxyNoTail\xC2\xA7r | Blur when wearing a pumpkin", "") == L"FoxyNoTail",
+        "Credits stop at a separator and lose formatting codes");
+    Require(U::PackAuthor({}, "edit of Toggle Emissive ESP by @T1M0THYYT", "") == L"T1M0THYYT", "A leading @ is dropped");
+    Require(U::PackAuthor({}, "Skins + Capes", "Skins + Capes (Mobile Cape OAUQ) by MCTools") == L"MCTools",
+        "The name is the last place a credit is looked for");
+    Require(U::PackAuthor({}, "Nearby blocks glow", "Standby").empty()
+        && U::PackAuthor({}, "Made by the people who wanted a much better pause screen", "").empty(),
+        "Words containing 'by' and sentence-length credits are not authors");
+
+    using namespace std::chrono_literals;
+    Require(M::RotationIndex(3, 0s, 5s) == 0 && M::RotationIndex(3, 4999ms, 5s) == 0 && M::RotationIndex(3, 5s, 5s) == 1
+        && M::RotationIndex(3, 16s, 5s) == 0, "The rotation advances every interval and wraps");
+    Require(M::RotationIndex(0, 10s, 5s) == 0 && M::RotationIndex(4, 10s, 0s) == 0, "Empty lists and zero intervals stay on 0");
+}
+
+void ResourcePackEntriesRoundTripUnknownFields() {
+    namespace U = Oinkster::UserResourcePacks;
+    const auto entries = U::ParseGlobalPackEntries(R"([{"pack_id":"aaaaaaaa-0000-1111-2222-333333333333",
+        "version":[1,10,1],"subpack":"short","future":{"enabled":true}}])");
+    Require(entries && entries->size() == 1 && entries->front().version == "1.10.1"
+        && entries->front().subpack == "short", "Editable pack entries expose version and subpack");
+    const auto serialized = U::SerializeGlobalPackEntries(*entries);
+    const auto reparsed = Oinkster::Json::Parse(serialized);
+    const auto* array = reparsed ? reparsed->AsArray() : nullptr;
+    const auto* future = array && !array->empty() ? array->front().Find("future") : nullptr;
+    const auto* enabled = future ? future->Find("enabled") : nullptr;
+    Require(enabled && enabled->AsBool() && *enabled->AsBool(), "Unknown pack entry fields survive a round trip");
+    Require(!U::ParseGlobalPackEntries(R"([{"pack_id":"aaaaaaaa-0000-1111-2222-333333333333","version":[1,0,0]},
+        {"pack_id":"AAAAAAAA-0000-1111-2222-333333333333","version":[1,0,0]}])"),
+        "Editable pack stacks reject duplicate UUIDs");
+    Require(!U::ParseGlobalPackEntries(R"([{"pack_id":"not-a-uuid","version":[1,0,0]}])"),
+        "Editable pack stacks reject malformed UUIDs");
+}
+
+void VsyncPolicyUsesOnlyLegalTearingPresents() {
+    using namespace Oinkster;
+    constexpr std::uint32_t AllowTearing = 0x200;
+    constexpr std::uint32_t Test = 0x1;
+    auto decision = DecideVsyncPresent({true, true, true, false, false, 1, 0}, AllowTearing);
+    Require(decision.state == VsyncState::Disabled && decision.interval == 0
+        && (decision.flags & AllowTearing) != 0, "A tearing-capable windowed chain disables VSync legally");
+    decision = DecideVsyncPresent({true, true, false, false, false, 1, 0}, AllowTearing);
+    Require(decision.state == VsyncState::RestartRequired && decision.interval == 1 && decision.flags == 0,
+        "Late injection never sends tearing flags to an incompatible chain");
+    decision = DecideVsyncPresent({true, false, false, false, false, 1, 0}, AllowTearing);
+    Require(decision.state == VsyncState::Unsupported && decision.interval == 1, "Unsupported tearing fails closed");
+    decision = DecideVsyncPresent({true, true, true, true, false, 1, 0}, AllowTearing);
+    Require(decision.state == VsyncState::Disabled && decision.interval == 0 && decision.flags == 0,
+        "Exclusive fullscreen uses interval zero without ALLOW_TEARING");
+    decision = DecideVsyncPresent({true, true, true, false, true, 1, Test}, AllowTearing);
+    Require(decision.interval == 1 && decision.flags == Test, "DXGI_PRESENT_TEST is never changed");
+    decision = DecideVsyncPresent({false, true, true, false, false, 2, AllowTearing}, AllowTearing);
+    Require(decision.state == VsyncState::Enabled && decision.interval == 2 && decision.flags == AllowTearing,
+        "Enabled leaves Bedrock's synchronized presentation arguments unchanged");
+}
+
+void ResourcePackDisplayRotatesUserPacks() {
+    namespace U = Oinkster::UserResourcePacks;
+    M::SharedServices services;
+    const auto pack = [](std::string uuid, std::wstring name) {
+        return U::Pack{std::move(uuid), std::move(name), L"1.0.0", L"Zoo", std::make_shared<const Oinkster::ArgbImage>(
+            Oinkster::ArgbImage{1, 1, {0xFF00FF00U}})};
+    };
+    std::vector<U::Pack> installed{pack("aaaaaaaa-0000-0000-0000-000000000001", L"Alpha"),
+        pack("aaaaaaaa-0000-0000-0000-000000000002", L"Beta"), pack("aaaaaaaa-0000-0000-0000-000000000003", L"Gamma")};
+    std::shared_ptr<const std::vector<U::Pack>> active;
+    bool watching{};
+    services.installedPacks = [&] { return installed; };
+    services.activePacks = [&] { return active; };
+    services.watchPacks = [&](bool on) { watching = on; };
+    Oinkster::ModuleManager manager;
+    for (auto& module : Oinkster::CreateModuleCatalog(services)) manager.Register(std::move(module));
+    auto* hud = manager.FindHudModule("resource-pack-display");
+    Require(hud != nullptr, "The resource pack display is a HUD module");
+    Require(std::ranges::count_if(hud->Settings(), [](const auto& d) { return d.key.starts_with("pack-"); }) == 3,
+        "Every installed pack gets its own toggle");
+    Require(manager.SetEnabled("resource-pack-display", true) && watching, "Enabling starts the pack watcher");
+    Require(hud->Content().lines.front().text == "Resource packs  --", "Nothing is shown before the first read");
+    active = std::make_shared<const std::vector<U::Pack>>(std::vector<U::Pack>{installed[0], installed[2]});
+    Require(hud->IsSettingRelevant("rotate-seconds") && hud->IsSettingRelevant("pack-aaaaaaaa-0000-0000-0000-000000000001")
+        && !hud->IsSettingRelevant("pack-aaaaaaaa-0000-0000-0000-000000000002")
+        && hud->IsSettingRelevant("pack-aaaaaaaa-0000-0000-0000-000000000003"), "Only the loaded packs' toggles are listed");
+    manager.Publish(Frame(1, 0.0, 0.016F));
+    auto content = hud->Content();
+    Require(content.lines.size() == 2 && content.lines[1].text == "by Zoo" && content.icon, "One pack with its icon and author at a time");
+    const auto firstName = content.lines.front().text;
+    manager.Publish(Frame(2, 5.0, 0.016F));
+    const auto secondName = hud->Content().lines.front().text;
+    Require(firstName != secondName && (firstName == "Alpha" || firstName == "Gamma") && (secondName == "Alpha" || secondName == "Gamma"),
+        "Several active packs rotate");
+    manager.SetModuleSetting("resource-pack-display.pack-aaaaaaaa-0000-0000-0000-000000000001", "false");
+    Require(hud->Content().lines.front().text == "Gamma", "A hidden pack leaves the rotation");
+    manager.Publish(Frame(3, 10.0, 0.016F));
+    Require(hud->Content().lines.front().text == "Gamma", "One visible pack stays put");
+    manager.SetModuleSetting("resource-pack-display.show-icon", "false");
+    manager.SetModuleSetting("resource-pack-display.show-version", "true");
+    content = hud->Content();
+    Require(!content.icon && content.lines.size() == 2 && content.lines[1].text == "by Zoo  v1.0.0", "Icon and version follow their settings");
+    manager.SetModuleSetting("resource-pack-display.show-author", "false");
+    Require(hud->Content().lines[1].text == "v1.0.0", "The author can be turned off");
+    manager.SetModuleSetting("resource-pack-display.pack-aaaaaaaa-0000-0000-0000-000000000003", "false");
+    Require(hud->Content().lines.front().text == "No resource packs", "Hiding every pack says so");
+    Require(manager.SetEnabled("resource-pack-display", false) && !watching, "Disabling stops the pack watcher");
+}
+
 void CrosshairGeometryAndPresentation() {
     M::CrosshairStyle style;
     style.length = 6;
@@ -1170,6 +1685,132 @@ void CrosshairGeometryAndPresentation() {
     Require(profile.fov && profile.fov->profile == 1 && profile.fov->fieldOfView == M::MaximumFov,
         "FOV presets cycle and clamp to the vanilla slider range");
     Require(M::NextFovProfile(2, 3) == 0 && M::NextFovProfile(0, 0) == 0, "Cycling wraps");
+}
+
+void CameraMathMatchesGameConvention() {
+    namespace CM = M::CameraMath;
+    const CM::Quat identity{};
+    const auto forward = CM::Forward(identity);
+    Require(forward.z == -1.0F && forward.x == 0.0F && forward.y == 0.0F, "An identity camera looks down -Z");
+
+    // Yaw 30 degrees left, pitch 20 degrees up, then a 15 degree roll.
+    const auto yawPitch = CM::OffsetYawPitch(identity, 30.0F * CM::Pi / 180.0F, 20.0F * CM::Pi / 180.0F);
+    RequireNear(CM::Pitch(yawPitch) * 180.0F / CM::Pi, 20.0, 1e-3, "Pitch offset looks up");
+    RequireNear(CM::Forward(yawPitch).x, -std::sin(30.0F * CM::Pi / 180.0F) * std::cos(20.0F * CM::Pi / 180.0F), 1e-4,
+        "Positive yaw turns left");
+    const auto rolled = CM::Multiply(yawPitch, CM::AxisAngle({0.0F, 0.0F, 1.0F}, 15.0F * CM::Pi / 180.0F));
+    RequireNear(CM::Right(rolled).y, std::sin(15.0F * CM::Pi / 180.0F) * std::cos(20.0F * CM::Pi / 180.0F), 1e-4, "Roll tilts the right axis");
+
+    const auto level = CM::RollFree(rolled);
+    RequireNear(CM::Right(level).y, 0.0, 1e-4, "RollFree levels the right axis");
+    RequireNear(CM::Dot(CM::Forward(level), CM::Forward(rolled)), 1.0, 1e-4, "RollFree keeps the view direction");
+    RequireNear(std::abs(CM::Dot(CM::ScaleRoll(rolled, 1.0F), rolled)), 1.0, 1e-5, "Full roll strength is vanilla");
+    RequireNear(CM::Right(CM::ScaleRoll(rolled, 0.5F)).y, std::sin(7.5F * CM::Pi / 180.0F) * std::cos(20.0F * CM::Pi / 180.0F), 2e-3, "Half strength halves the roll");
+
+    const auto clamped = CM::OffsetYawPitch(identity, 0.0F, 3.0F);
+    RequireNear(CM::Pitch(clamped), CM::MaxPitchRadians, 1e-3, "Freelook pitch stops short of straight up");
+    RequireNear(std::abs(CM::Dot(CM::Slerp(identity, yawPitch, 0.0F), identity)), 1.0, 1e-6, "Slerp starts at its origin");
+    RequireNear(std::abs(CM::Dot(CM::Slerp(identity, yawPitch, 1.0F), yawPitch)), 1.0, 1e-6, "Slerp ends at its target");
+    RequireNear(CM::DistanceAlongView({0.0F, 0.0F, 4.0F}, {0.0F, 0.0F, -1.0F}, {0.5F, 0.2F, 0.0F}), 4.0, 1e-6,
+        "Distance along the view ignores sideways offset");
+
+    // Looking straight at the south face of block (0, 0, 0) from 2.5 blocks away.
+    Oinkster::BlockSelectionEvent selection;
+    selection.capturedAt = At(0);
+    selection.hasBlock = true;
+    selection.face = Oinkster::BlockFace::South;
+    selection.cameraPosition = {0.5F, 0.5F, 3.5F};
+    selection.verticalFov = 70.0F * CM::Pi / 180.0F;
+    const M::BlockOutlineRequest style{0xFFFF0000U, 2.0F, 0.25F};
+    const auto outline = M::BuildBlockOutline(style, selection, 1920.0F, 1080.0F);
+    Require(outline.lines.size() == 4, "Only the edges of the face toward the camera are drawn");
+    Require(outline.quads.size() == 1 && ((outline.quads[0].argb >> 24U) == 63 || (outline.quads[0].argb >> 24U) == 64), "The looked-at face is filled at the fill opacity");
+    float centerX = 0.0F;
+    for (const float x : outline.quads[0].x) centerX += x / 4.0F;
+    RequireNear(centerX, 960.0, 0.5, "A block straight ahead projects to the screen center");
+    selection.hasBlock = false;
+    Require(M::BuildBlockOutline(style, selection, 1920.0F, 1080.0F).Empty(), "No hit block draws nothing");
+}
+
+void VisualPresentationModulesCompose() {
+    Catalog catalog;
+    for (const auto capability : {Capability::CameraPresentation, Capability::CameraRotation, Capability::CameraMotion,
+        Capability::ThirdPersonPresentation, Capability::LightingPresentation, Capability::TimePresentation,
+        Capability::WeatherPresentation, Capability::ScreenEffectsPresentation, Capability::HandPresentation}) {
+        catalog.manager.SetCapability(capability, {CapabilityState::Available, {}});
+    }
+    for (const auto* id : {"fov-profiles", "zoom", "freelook", "cinematic-camera", "third-person-distance",
+        "fullbright", "time-changer", "weather-suppression", "screen-overlay-suppression", "hurt-camera", "hand-view"}) {
+        Require(catalog.manager.SetEnabled(id, true), "Presentation module enables once its capability validates");
+    }
+
+    catalog.manager.SetModuleSetting("fov-profiles.profile-1", "90");
+    catalog.manager.SetModuleSetting("zoom.fov", "1");
+    catalog.manager.SetModuleSetting("third-person-distance.distance", "999");
+    catalog.manager.SetModuleSetting("fullbright.multiplier", "999");
+    catalog.manager.SetModuleSetting("time-changer.ticks", "99999");
+    catalog.manager.SetModuleSetting("weather-suppression.rain", "25");
+    catalog.manager.SetModuleSetting("screen-overlay-suppression.portal-opacity", "40");
+
+    auto profile = M::CollectPresentationProfile(catalog.manager);
+    RequireNear(M::EffectiveFov(profile, 80), 90, 1e-6, "FOV profile applies while zoom is idle");
+    Require(profile.cameraRotation && !profile.cameraRotation->active && profile.cinematicCamera,
+        "Freelook state and cinematic smoothing compose independently");
+    Require(profile.thirdPersonDistance && profile.thirdPersonDistance->distance == 20.0F,
+        "Third-person distance is normalized");
+    RequireNear(M::EffectiveThirdPersonDistance(profile, Oinkster::CameraPerspective::ThirdPersonBack, 4.0F), 20.0F,
+        1e-6, "Third-person distance applies to an enabled known perspective");
+    RequireNear(M::EffectiveThirdPersonDistance(profile, Oinkster::CameraPerspective::FirstPerson, 4.0F), 4.0F,
+        1e-6, "Third-person distance never applies in first person");
+    RequireNear(M::EffectiveThirdPersonDistance(profile, Oinkster::CameraPerspective::Unknown, 4.0F), 4.0F,
+        1e-6, "Third-person distance fails closed while perspective is unknown");
+    Require(profile.lighting && profile.lighting->multiplier == 10.0F && profile.time && profile.time->ticks == 23999,
+        "Lighting and time settings clamp to their maximums");
+    Require(profile.weather && profile.weather->rain == 0.25F && profile.screenEffects && profile.screenEffects->portal == 0.4F,
+        "Weather and screen-effect channels stay independent");
+    Require(profile.hurtCamera && profile.hurtCamera->strength == 0.0F && profile.handView,
+        "Hurt-camera and hand presentation contribute their defaults");
+
+    (void)catalog.manager.PublishInput(Oinkster::KeyboardEvent{'C', true, false});
+    (void)catalog.manager.PublishInput(Oinkster::KeyboardEvent{0x12, true, false});
+    profile = M::CollectPresentationProfile(catalog.manager);
+    Require(profile.zoom && M::EffectiveFov(profile, 80) == M::MinimumZoomFov,
+        "Active zoom overrides FOV profiles and supports the requested deep-zoom minimum");
+    Require(profile.cameraRotation && profile.cameraRotation->active, "Freelook activation reaches the presentation profile");
+    (void)catalog.manager.PublishInput(Oinkster::KeyboardEvent{'C', false, false});
+    (void)catalog.manager.PublishInput(Oinkster::KeyboardEvent{0x12, false, false});
+    profile = M::CollectPresentationProfile(catalog.manager);
+    Require(!profile.zoom && profile.cameraRotation && !profile.cameraRotation->active,
+        "Hold-mode camera requests restore their vanilla path on key-up");
+    Require(catalog.manager.SetEnabled("fov-profiles", false), "FOV profiles disable cleanly");
+    RequireNear(M::EffectiveFov(M::CollectPresentationProfile(catalog.manager), 82.0F), 82.0F, 1e-6,
+        "Disabling the final FOV contributor restores vanilla immediately");
+    catalog.manager.SetCapability(Capability::ThirdPersonPresentation,
+        {CapabilityState::Unavailable, L"test capability loss"});
+    Require(!M::CollectPresentationProfile(catalog.manager).thirdPersonDistance,
+        "Losing a capability removes its presentation contribution immediately");
+}
+
+void ToggleSneakResetsOutsideGameplay() {
+    Catalog catalog;
+    Require(catalog.manager.SetEnabled("toggle-sneak", true), "Toggle sneak uses already-reviewed local input synthesis");
+    auto* assist = catalog.manager.EnabledModulesOf<Oinkster::IKeyHoldAssistModule>().front();
+    auto* hud = dynamic_cast<Oinkster::IHudModule*>(assist);
+    Require(hud && hud->Content().lines.empty(), "Toggle sneak is a HUD module hidden while released");
+    const Oinkster::HeldKeyInputs gameplay{true, false, true};
+    Require(assist->DesiredHeldKey(gameplay) == 0, "Toggle sneak starts released");
+    (void)catalog.manager.PublishInput(Oinkster::KeyboardEvent{'X', true, false});
+    Require(assist->DesiredHeldKey(gameplay) == VK_SHIFT, "Toggle sneak requests the configured game key");
+    Require(hud->Content().bare && hud->Content().lines.size() == 1
+        && hud->Content().lines.front().text == "[Sneaking (Toggled)]",
+        "Toggle sneak shows the Java-style active indicator without a panel");
+    Require(assist->DesiredHeldKey({false, true, true}) == 0, "A game screen releases and resets toggle sneak");
+    Require(assist->DesiredHeldKey(gameplay) == 0, "Toggle sneak stays reset after gameplay resumes");
+    Require(hud->Content().lines.empty(), "The indicator disappears when gameplay resets the latch");
+    (void)catalog.manager.PublishInput(Oinkster::KeyboardEvent{'X', true, false});
+    Require(assist->DesiredHeldKey(gameplay) == VK_SHIFT, "Toggle sneak can latch again");
+    Require(catalog.manager.SetEnabled("toggle-sneak", false), "Toggle sneak disables");
+    Require(assist->DesiredHeldKey(gameplay) == 0, "Disabling the module resets its held state");
 }
 
 // ------------------------------------------------------------------ accessibility
@@ -1225,6 +1866,82 @@ void ChatPresentationTransforms() {
     options.hideNicknames = false;
     options.stripFormatting = false;
     Require(M::PresentChatLine(event, options, 9, 5) == L"<Steve> hi \u00A7aAlex", "Every transform can be turned off");
+}
+
+void MoveableChatFadesAndFollowsTheChatScreen() {
+    using namespace std::chrono_literals;
+    Require(M::ChatLineAlpha(0s, 10.0F) == 1.0F && M::ChatLineAlpha(8s, 10.0F) == 1.0F, "Lines stay opaque for most of their life");
+    const float fading = M::ChatLineAlpha(9500ms, 10.0F);
+    Require(fading > 0.0F && fading < 1.0F, "The last tenth of a line's life fades");
+    Require(M::ChatLineAlpha(10s, 10.0F) == 0.0F && M::ChatLineAlpha(30s, 10.0F) == 0.0F, "Expired lines are invisible");
+    Require(M::ChatLineAlpha(1s, 0.0F) == 0.0F, "A zero lifetime never shows a line");
+
+    M::ChatScreenTracker tracker;
+    tracker.Update(false, At(1));
+    Require(!tracker.Open(), "A screen opened without the chat key (inventory) is not chat");
+    tracker.Update(true, At(2));
+    tracker.OnChatKey(At(3));
+    tracker.Update(true, At(3.05));
+    Require(!tracker.Open(), "Gameplay is still visible just after the key");
+    tracker.Update(false, At(3.2));
+    Require(tracker.Open(), "The HUD hiding right after the chat key means chat opened");
+    tracker.Update(false, At(10));
+    Require(tracker.Open(), "Chat stays open until gameplay returns");
+    tracker.Update(true, At(11));
+    Require(!tracker.Open(), "Gameplay returning closes chat");
+    tracker.OnChatKey(At(12));
+    tracker.Update(true, At(13));
+    tracker.Update(false, At(13.1));
+    Require(!tracker.Open(), "A stale chat key does not count");
+
+    Catalog catalog;
+    catalog.manager.SetCapability(Oinkster::Capability::PacketCapture, {Oinkster::CapabilityState::Available, {}});
+    Require(catalog.manager.SetEnabled("moveable-chat", true), "Moveable chat enables once packet capture validates");
+    const auto replacements = catalog.manager.EnabledModulesOf<Oinkster::IChatReplacementModule>();
+    Require(replacements.size() == 1 && replacements.front()->ReplacesVanillaChat(), "Vanilla chat is replaced by default");
+    const auto observers = catalog.manager.EnabledModulesOf<Oinkster::IPacketObserverModule>();
+    Require(observers.size() == 1 && observers.front()->WantsPacket(M::GamePacket::Text), "It reads the server's Text packets");
+    const auto textPacket = [](std::string_view source, std::string_view message, std::uint8_t type = 1) {
+        Oinkster::ReplayPacketEvent event;
+        event.packetId = M::GamePacket::Text;
+        event.bytes.push_back(static_cast<char>(M::GamePacket::Text));
+        event.bytes += std::string{'\0', static_cast<char>(source.empty() ? 0 : 1), static_cast<char>(type)};
+        if (!source.empty()) {
+            event.bytes.push_back(static_cast<char>(source.size()));
+            event.bytes += source;
+        }
+        event.bytes.push_back(static_cast<char>(message.size()));
+        event.bytes += message;
+        event.bytes += std::string{'\0', '\0'};
+        return event;
+    };
+    catalog.manager.Publish(textPacket("Steve", "\xC2\xA7" "aone"));
+    catalog.manager.Publish(textPacket("", "Saved", 5));
+    catalog.manager.Publish(textPacket("Alex", "two"));
+    const auto* chat = catalog.manager.FindHudModule("moveable-chat");
+    const auto content = chat->Content();
+    Require(content.anchorBottom && content.lineBackdrops && content.wrapWidth > 0.0F, "The Java preset grows upward with per-line backdrops");
+    Require(chat->DisplayText() == "<Steve> one\n<Alex> two", "Oldest first, newest at the bottom, tips skipped, formatting stripped");
+    catalog.manager.SetModuleSetting("moveable-chat.preset", "bedrock");
+    Require(!chat->Content().anchorBottom && chat->Layout().normalizedY < 0.2F, "The Bedrock preset moves the chat to the top-left");
+    catalog.manager.SetModuleSetting("moveable-chat.hide-vanilla", "false");
+    Require(!replacements.front()->ReplacesVanillaChat(), "Vanilla chat can be kept");
+
+    Require(M::BoostPriorityClass("above-normal") == M::AboveNormalPriorityClassValue
+        && M::BoostPriorityClass("high") == M::HighPriorityClassValue, "FPS Boost maps its priority choices");
+    Require(M::BoostPriorityClass("realtime") == M::NormalPriorityClassValue, "An unknown priority never raises the process");
+    Require(!catalog.manager.Availability("low-fire").available, "Low Fire stays unavailable until its hook exists");
+
+    M::TextMessage joined{2, {}, "\xC2\xA7" "e%multiplayer.player.joined", {"Bob"}};
+    Require(M::ChatLineFromText(joined) == std::string("\xC2\xA7" "eBob joined the game"), "Known translation keys are filled in");
+    M::TextMessage said{2, {}, "%chat.type.text", {"Bob", "hi"}};
+    Require(M::ChatLineFromText(said) == std::string("<Bob> hi"), "Translated chat keeps its author");
+    M::TextMessage unknown{2, {}, "%some.key", {"a", "b"}};
+    Require(M::ChatLineFromText(unknown) == std::string("some.key a b"), "Unknown keys show the key and parameters");
+    M::TextMessage json{10, {}, R"({"rawtext":[{"text":"Hello "},{"text":"there"}]})", {}};
+    Require(M::ChatLineFromText(json) == std::string("Hello there"), "JSON rawtext is flattened");
+    Require(!M::ChatLineFromText({3, {}, "popup", {}}) && !M::ChatLineFromText({5, {}, "tip", {}}), "Popups and tips are not chat");
+    Require(M::ChatLineFromText({7, "Bob", "psst", {}}) == std::string("Bob whispers to you: psst"), "Whispers name the sender");
 }
 
 void SprintAndFramePacingStayWithinPlayerControls() {
@@ -1728,18 +2445,1738 @@ void PreservedShutdownTests() {
         Require(!Oinkster::UnloadGuard::Blocked(), "Reset must clear the guard");
 }
 
+void ReplayFileRoundTripsAndRecovers() {
+    namespace Replay = Oinkster::Replay;
+    const auto root = std::filesystem::temp_directory_path() / "OinksterReplayTests";
+    const auto path = root / "round-trip.oinkreplay";
+    std::error_code ignored;
+    std::filesystem::remove_all(root, ignored);
+
+    Replay::Writer writer;
+    std::string error;
+    Require(writer.Open(path, 1'700'000'000'123ULL, error), "Replay writer must open");
+    Require(writer.AppendMetadata(R"({"minecraftVersion":"1.26.5203.0","protocol":0})", error),
+        "Replay metadata must append");
+    const std::array<std::uint8_t, 5> packet{{0x09, 0x01, 0x02, 0x03, 0x04}};
+    Require(writer.Append(Replay::RecordKind::IncomingPacket, 12'345, packet, error),
+        "Incoming packet must append");
+
+    // Before Finalize, the readable prefix is deliberately left beside the
+    // destination so a crash loses only the last incomplete record.
+    const auto partial = writer.PartialPath();
+    const auto recovered = Replay::Read(partial);
+    Require(recovered.error.empty(), "A live partial replay prefix must be readable");
+    Require(!recovered.cleanEnd && recovered.records.size() == 2,
+        "A partial replay must report recovery rather than a clean end");
+
+    if (!writer.Finalize(99'000, error)) {
+        throw std::runtime_error("Replay finalization must publish the completed file: " + error);
+    }
+    Require(std::filesystem::exists(path) && !std::filesystem::exists(partial),
+        "Finalization must replace the partial file with the destination");
+    const auto replay = Replay::Read(path);
+    Require(replay.error.empty() && replay.cleanEnd, "Final replay must have a valid clean end");
+    Require(replay.startedUnixMillis == 1'700'000'000'123ULL, "Replay start time must round-trip");
+    Require(replay.records.size() == 2 && replay.records[1].timestampMicros == 12'345,
+        "Replay records and timestamps must round-trip");
+    Require(replay.records[1].payload == std::vector<std::uint8_t>(packet.begin(), packet.end()),
+        "Packet bytes must round-trip exactly");
+
+    // A truncated tail is recoverable, while corrupted committed bytes are
+    // rejected instead of being fed back into the game.
+    const auto truncatedPath = root / "truncated.oinkreplay";
+    std::filesystem::copy_file(path, truncatedPath, std::filesystem::copy_options::overwrite_existing);
+    std::filesystem::resize_file(truncatedPath, std::filesystem::file_size(truncatedPath) - 8);
+    const auto truncated = Replay::Read(truncatedPath);
+    Require(truncated.error.empty() && !truncated.cleanEnd && truncated.records.size() == 2,
+        "A torn final record must preserve the committed prefix");
+
+    auto bytes = ReadFile(path);
+    Require(bytes.size() > 64, "Replay fixture must contain record payload bytes");
+    bytes[64] = static_cast<char>(static_cast<unsigned char>(bytes[64]) ^ 0x80U);
+    const auto corruptPath = root / "corrupt.oinkreplay";
+    {
+        std::ofstream output(corruptPath, std::ios::binary | std::ios::trunc);
+        output.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    }
+    Require(!Replay::Read(corruptPath).error.empty(), "A corrupt replay record must be rejected");
+    std::filesystem::remove_all(root, ignored);
+}
+
+void AppendReplayText(Oinkster::Replay::Writer& writer, Oinkster::Replay::RecordKind kind,
+    std::uint64_t timestamp, std::string_view text) {
+    std::string error;
+    const auto bytes = std::span(reinterpret_cast<const std::uint8_t*>(text.data()), text.size());
+    Require(writer.Append(kind, timestamp, bytes, error), "Replay fixture record must append");
+}
+
+void ReplayTimelineBuildsSamplesAndMarks() {
+    namespace Replay = Oinkster::Replay;
+    const auto root = std::filesystem::temp_directory_path() / "OinksterReplayTimelineTests";
+    const auto path = root / "timeline.oinkreplay";
+    std::error_code ignored;
+    std::filesystem::remove_all(root, ignored);
+
+    Replay::Writer writer;
+    std::string error;
+    Require(writer.Open(path, 1'700'000'000'000ULL, error), "Replay writer must open");
+    Require(writer.AppendMetadata(R"({"format":"oinkster-replay"})", error), "Metadata must append");
+    AppendReplayText(writer, Replay::RecordKind::Camera, 0,
+        R"({"x":1.0,"y":64.0,"z":-2.0,"yaw":90.0,"pitch":0.0,"dimension":0})");
+    AppendReplayText(writer, Replay::RecordKind::Marker, 50'000, "mark 1");
+    AppendReplayText(writer, Replay::RecordKind::Camera, 100'000,
+        R"({"x":11.0,"y":65.0,"z":8.0,"yaw":null,"pitch":null,"dimension":null})");
+    AppendReplayText(writer, Replay::RecordKind::Marker, 150'000, "pause");
+    Require(writer.Finalize(400'000, error), "Replay must finalize");
+
+    const auto timeline = Replay::BuildTimeline(Replay::Read(path));
+    Require(timeline.error.empty() && timeline.cleanEnd, "Timeline must come from a clean replay");
+    Require(timeline.startedUnixMillis == 1'700'000'000'000ULL, "Start time must carry over");
+    Require(timeline.durationMicros == 150'000, "An unfinished pause removes the remaining wall-clock time");
+    Require(timeline.samples.size() == 2, "Both camera records must become samples");
+    Require(!timeline.samples[1].yaw && !timeline.samples[1].dimension, "null fields must stay absent");
+    Require(timeline.marks.size() == 1 && timeline.marks[0].label == "mark 1",
+        "Playback controls stay out of the visible highlight marks");
+    RequireNear(timeline.minX, 1.0, 1e-9, "Bounds must cover the path (min x)");
+    RequireNear(timeline.maxX, 11.0, 1e-9, "Bounds must cover the path (max x)");
+    RequireNear(timeline.minZ, -2.0, 1e-9, "Bounds must cover the path (min z)");
+    RequireNear(timeline.maxZ, 8.0, 1e-9, "Bounds must cover the path (max z)");
+
+    const auto summary = Replay::Summarize(path);
+    Require(summary.error.empty() && summary.cleanEnd && summary.sampleCount == 2 && summary.markCount == 1,
+        "Summary must count samples and highlight marks only");
+    Require(summary.thumbnail.size() == 2 && summary.bytes > 0, "Summary must carry a thumbnail path and size");
+    std::filesystem::remove_all(root, ignored);
+}
+
+void ReplayTimelineCollapsesRecordingPauses() {
+    namespace Replay = Oinkster::Replay;
+    const auto text = [](Replay::RecordKind kind, std::uint64_t t, std::string_view value) {
+        return Replay::Record{kind, t, std::vector<std::uint8_t>(value.begin(), value.end())};
+    };
+    Replay::ReadResult replay;
+    replay.records = {
+        text(Replay::RecordKind::Marker, 1'000, "clip-start"),
+        text(Replay::RecordKind::Camera, 1'100, R"({"x":1,"y":2,"z":3})"),
+        text(Replay::RecordKind::Marker, 1'200, "pause"),
+        text(Replay::RecordKind::Camera, 2'000, R"({"x":9,"y":9,"z":9})"),
+        text(Replay::RecordKind::Marker, 3'200, "resume"),
+        text(Replay::RecordKind::Camera, 3'300, R"({"x":4,"y":5,"z":6})"),
+        text(Replay::RecordKind::Marker, 3'400, "mark 1"),
+    };
+    replay.cleanEnd = true;
+    replay.endTimestampMicros = 4'000;
+
+    const auto clock = Replay::BuildPlaybackClock(replay);
+    Require(clock.clipStartMicros == 1'000 && clock.endMicros == 2'000,
+        "The playback clock removes a completed recording pause");
+    Require(clock.Map(2'000) == 1'200 && clock.Map(3'300) == 1'300,
+        "Paused state changes collapse to the pause point and resumed time continues there");
+    const auto timeline = Replay::BuildTimeline(replay);
+    Require(timeline.samples.size() == 2 && timeline.samples[0].t == 1'100 && timeline.samples[1].t == 1'300,
+        "Camera movement made while recording was paused is omitted");
+    Require(timeline.marks.size() == 1 && timeline.marks[0].t == 1'400 && timeline.durationMicros == 2'000,
+        "Highlights and duration use the collapsed playback clock");
+}
+
+void ReplayTimelineInterpolatesAndClamps() {
+    namespace Replay = Oinkster::Replay;
+    Replay::ReplayTimeline timeline;
+    timeline.samples = {
+        {1'000, 0.0, 64.0, 0.0, 350.0F, 10.0F, 0},
+        {2'000, 10.0, 66.0, -20.0, 10.0F, 30.0F, 0},
+        {3'000, 500.0, 70.0, 500.0, 0.0F, 0.0F, 1},
+    };
+    Require(!Replay::SampleAt(Replay::ReplayTimeline{}, 0), "An empty timeline has no sample");
+    const auto before = Replay::SampleAt(timeline, 0);
+    Require(before && before->x == 0.0 && before->t == 1'000, "Before the first sample must clamp to it");
+    const auto after = Replay::SampleAt(timeline, 9'000);
+    Require(after && after->x == 500.0, "After the last sample must clamp to it");
+    const auto middle = Replay::SampleAt(timeline, 1'500);
+    Require(middle.has_value(), "A time between samples must interpolate");
+    RequireNear(middle->x, 5.0, 1e-9, "x must interpolate linearly");
+    RequireNear(middle->y, 65.0, 1e-9, "y must interpolate linearly");
+    RequireNear(middle->z, -10.0, 1e-9, "z must interpolate linearly");
+    RequireNear(*middle->pitch, 20.0, 1e-4, "pitch must interpolate linearly");
+    // 350 -> 10 is a 20 degree turn through 0, not 340 degrees back.
+    RequireNear(*middle->yaw, 0.0, 1e-4, "yaw must take the shortest arc");
+    const auto crossing = Replay::SampleAt(timeline, 2'800);
+    Require(crossing && crossing->dimension == 1 && crossing->x == 500.0,
+        "A dimension change must snap instead of interpolating");
+    const auto points = Replay::DecimatePath(timeline, 2);
+    Require(points.size() == 2 && points[0].x == 0.0F && points[1].x == 500.0F,
+        "Decimation must keep the first and last points");
+}
+
+void ReplayTimelineSkipsMalformedCamera() {
+    namespace Replay = Oinkster::Replay;
+    Replay::ReadResult replay;
+    const auto record = [](std::uint64_t t, std::string_view text) {
+        return Replay::Record{Replay::RecordKind::Camera, t, std::vector<std::uint8_t>(text.begin(), text.end())};
+    };
+    replay.records = {
+        record(10, "not json"),
+        record(20, R"({"x":1,"y":2})"),
+        record(30, R"({"x":"1","y":2,"z":3})"),
+        record(40, R"([1,2,3])"),
+        record(50, R"({"x":1e999,"y":2,"z":3})"),
+        record(60, R"({"x":4,"y":5,"z":6})"),
+    };
+    const auto timeline = Replay::BuildTimeline(replay);
+    Require(timeline.samples.size() == 1 && timeline.samples[0].x == 4.0, "Only the valid camera sample survives");
+    Require(!timeline.cleanEnd && timeline.durationMicros == 60, "A partial replay lasts until its last record");
+}
+
+void ReplaySummaryReadsPartial() {
+    namespace Replay = Oinkster::Replay;
+    const auto root = std::filesystem::temp_directory_path() / "OinksterReplaySummaryTests";
+    std::error_code ignored;
+    std::filesystem::remove_all(root, ignored);
+    Replay::Writer writer;
+    std::string error;
+    Require(writer.Open(root / "partial.oinkreplay", 1ULL, error), "Replay writer must open");
+    AppendReplayText(writer, Replay::RecordKind::Camera, 250'000, R"({"x":0,"y":0,"z":0})");
+    const auto partial = writer.PartialPath();
+    const auto summary = Replay::Summarize(partial);
+    Require(summary.error.empty() && !summary.cleanEnd, "A partial replay must summarize as recoverable");
+    Require(summary.durationMicros == 250'000 && summary.sampleCount == 1, "Partial duration is the last timestamp");
+    writer.Close();
+    std::filesystem::remove_all(root, ignored);
+}
+
+
+void ReplayCaptureParsesHeadersAndClassifies() {
+    namespace C = Oinkster::ReplayCapture;
+    const auto header = [](std::initializer_list<std::uint8_t> bytes) {
+        const std::vector<std::uint8_t> data(bytes);
+        return C::ParseHeader(data);
+    };
+    const auto startGame = header({0x0B, 0xFF});
+    Require(startGame && startGame->id == 11 && startGame->length == 1, "A one-byte header parses");
+    const auto settings = header({0x8F, 0x01});
+    Require(settings && settings->id == 143 && settings->length == 2, "A two-byte header parses");
+    // id 11 with sub-client bits set (raw 0x40B) still reports id 11.
+    const auto subClient = header({0x8B, 0x08});
+    Require(subClient && subClient->id == 11 && subClient->raw == 0x40B, "Sub-client bits are masked off the id");
+    Require(!header({}) && !header({0x80}) && !header({0xFF, 0xFF, 0xFF, 0xFF, 0x7F}),
+        "Empty, truncated and oversized headers are rejected");
+
+    C::ConnectionClassifier classifier;
+    // The singleplayer server's view of the client: never captured, even if
+    // a server-only id later appears on it.
+    auto result = classifier.Observe(0xA0, C::PacketId::PlayerAuthInput);
+    Require(result.direction == C::Direction::ClientToServer && !result.sessionStart, "Client traffic is recognised");
+    result = classifier.Observe(0xA0, C::PacketId::StartGame);
+    Require(result.direction == C::Direction::ClientToServer, "A connection's direction never flips");
+    // A join seen from its first packet.
+    result = classifier.Observe(0xB0, C::PacketId::NetworkSettings);
+    Require(result.direction == C::Direction::ServerToClient && result.sessionStart && result.joinedFromStart
+        && result.session == 1, "A join starts a complete session");
+    result = classifier.Observe(0xB0, C::PacketId::LevelChunk);
+    Require(result.direction == C::Direction::ServerToClient && !result.sessionStart && result.session == 1,
+        "Later packets stay in the session");
+    classifier.Forget(0xB0);
+    result = classifier.Observe(0xB0, C::PacketId::NetworkSettings);
+    Require(result.sessionStart && result.session == 2,
+        "A disconnected connection address can be reused for a new session");
+    // Injected mid-session: ambiguous ids wait, then a mid-stream id starts
+    // an incomplete session.
+    result = classifier.Observe(0xC0, 9);
+    Require(result.direction == C::Direction::Unknown, "Ambiguous ids do not classify a connection");
+    result = classifier.Observe(0xC0, C::PacketId::LevelChunk);
+    Require(result.sessionStart && !result.joinedFromStart && result.session == 3, "A mid-session join is marked incomplete");
+    Require(classifier.Observe(0, C::PacketId::StartGame).direction == C::Direction::Unknown, "A null key is ignored");
+}
+
+Oinkster::ReplayPacketEvent ReplayPacket(double seconds, std::uint32_t session, std::uint32_t id, bool start = false) {
+    Oinkster::ReplayPacketEvent event{At(seconds), session, start, start, id, {}};
+    event.bytes.push_back(static_cast<char>(id < 0x80 ? id : (id & 0x7FU) | 0x80U));
+    if (id >= 0x80) event.bytes.push_back(static_cast<char>(id >> 7U));
+    event.bytes += "payload";
+    return event;
+}
+
+void ReplayModRecordsWorldSessions() {
+    namespace Replay = Oinkster::Replay;
+    using namespace Oinkster::ReplayCapture;
+    using State = Oinkster::ReplayControlState;
+    const auto root = std::filesystem::temp_directory_path() / "OinksterReplayModTests";
+    std::error_code ignored;
+    std::filesystem::remove_all(root, ignored);
+    std::filesystem::create_directories(root, ignored);
+    wchar_t previous[32768]{};
+    const auto previousLength = GetEnvironmentVariableW(L"LOCALAPPDATA", previous, static_cast<DWORD>(std::size(previous)));
+    // Recordings go under %LOCALAPPDATA%; point it at a scratch folder so the
+    // test never touches the player's real replays.
+    SetEnvironmentVariableW(L"LOCALAPPDATA", root.c_str());
+    const auto replays = root / "Oinkster" / "Client" / "replays";
+    const auto files = [&] {
+        std::vector<std::filesystem::path> found;
+        for (std::filesystem::directory_iterator it(replays, ignored), end; !ignored && it != end; it.increment(ignored)) {
+            if (it->path().extension() == L".oinkreplay") found.push_back(it->path());
+        }
+        ignored.clear();
+        std::ranges::sort(found);
+        return found;
+    };
+    const auto sessionFiles = [&] {
+        std::size_t count = 0;
+        for (std::filesystem::directory_iterator it(replays / ".session", ignored), end; !ignored && it != end; it.increment(ignored)) ++count;
+        ignored.clear();
+        return count;
+    };
+    const auto newest = [&](const std::vector<std::filesystem::path>& before) {
+        for (const auto& path : files()) {
+            if (std::ranges::find(before, path) == before.end()) return Replay::BuildTimeline(Replay::Read(path));
+        }
+        throw std::runtime_error("no new replay was saved");
+    };
+
+    try {
+        Catalog catalog;
+        catalog.manager.SetCapability(Capability::PacketCapture, {CapabilityState::Available, {}});
+        Require(catalog.manager.SetEnabled("replay-mod", true), "Replay Mod enables once packets are captured");
+        auto* replay = catalog.manager.EnabledModulesOf<Oinkster::IReplayControlModule>().at(0);
+        Require(!replay->ReplaySnapshot(At(0)).canStart && !replay->StartReplay(At(0)),
+            "Nothing can start before a world is joined");
+
+        // Joining captures the session in the background; nothing records
+        // until Start (auto-record is off by default).
+        catalog.manager.Publish(ReplayPacket(1, 1, PacketId::NetworkSettings, true));
+        catalog.manager.Publish(ReplayPacket(1.1, 1, PacketId::StartGame));
+        catalog.manager.Publish(ReplayPacket(1.2, 1, PacketId::LevelChunk));
+        catalog.manager.Publish(Oinkster::PlayerTransform{At(1.3), {1, 64, 2}, 90.0F, 0.0F, 0});
+        Require(replay->ReplaySnapshot(At(1.5)).state == State::Idle && replay->ReplaySnapshot(At(1.5)).canStart,
+            "A join does not record by itself, but Start is offered");
+        Require(files().empty() && sessionFiles() == 1, "The session is captured in the background only");
+
+        // First clip: starts mid-session yet still carries the world.
+        Require(replay->StartReplay(At(2)) && replay->MarkReplay(At(2.5)), "Start and Mark work");
+        Require(replay->FinishReplay(At(3)), "Finish saves");
+        auto first = files();
+        Require(first.size() == 1, "One replay is saved");
+        const auto clip = Replay::BuildTimeline(Replay::Read(first[0]));
+        Require(clip.cleanEnd && clip.hasStartGame && clip.packetCount == 3, "A clip keeps the join so the world can be rebuilt");
+        RequireNear(static_cast<double>(clip.clipStartMicros), 1'000'000.0, 1.0, "The clip starts where Start was pressed");
+        Require(clip.marks.size() == 1 && clip.marks[0].label == "mark 1" && clip.samples.size() == 1, "Marks and camera samples are kept");
+        RequireNear(static_cast<double>(Replay::Summarize(first[0]).durationMicros), 1'000'000.0, 1.0,
+            "A clip's length runs from its start");
+
+        // Start again in the same world after finishing.
+        Require(replay->ReplaySnapshot(At(3.5)).canStart && replay->StartReplay(At(4)), "Another clip can start after Finish");
+        catalog.manager.Publish(ReplayPacket(4.5, 1, PacketId::LevelChunk));
+        Require(replay->FinishReplay(At(5)), "The second clip saves");
+        const auto second = newest(first);
+        Require(second.packetCount == 4 && second.marks.empty(), "A later clip has the whole session but only its own marks");
+
+        // Leaving the world saves a running clip and drops the session capture.
+        first = files();
+        Require(replay->StartReplay(At(6)), "A third clip starts");
+        catalog.manager.Publish(ReplayPacket(7, 1, PacketId::Disconnect));
+        Require(files().size() == 3 && sessionFiles() == 0, "Disconnect saves the clip and removes the session capture");
+        Require(!replay->ReplaySnapshot(At(8)).canStart, "Nothing can start after leaving");
+
+        // Auto-record: a join starts a clip, and joining another world saves it.
+        catalog.manager.SetModuleSetting("replay-mod.auto-record", "true");
+        catalog.manager.Publish(ReplayPacket(10, 2, PacketId::NetworkSettings, true));
+        Require(replay->ReplaySnapshot(At(10.5)).state == State::Recording, "Auto-record starts on join");
+        catalog.manager.Publish(ReplayPacket(11, 3, PacketId::NetworkSettings, true));
+        Require(files().size() == 4, "Joining another world saves the running clip");
+
+        // Joined before Oinkster loaded: nothing can be recorded.
+        Oinkster::ReplayPacketEvent midSession = ReplayPacket(20, 4, PacketId::LevelChunk);
+        midSession.sessionStart = true;
+        catalog.manager.Publish(midSession);
+        Require(!replay->ReplaySnapshot(At(21)).canStart && files().size() == 5,
+            "A mid-session join is not recorded (the auto clip of the previous world was saved)");
+    } catch (...) {
+        SetEnvironmentVariableW(L"LOCALAPPDATA", previousLength ? previous : nullptr);
+        std::filesystem::remove_all(root, ignored);
+        throw;
+    }
+    SetEnvironmentVariableW(L"LOCALAPPDATA", previousLength ? previous : nullptr);
+    std::filesystem::remove_all(root, ignored);
+}
+
+
+void RakNetFramesAcksAndSplits() {
+    namespace R = Oinkster::RakNet;
+    const auto start = R::Clock::now();
+    R::Writer writer;
+    writer.VarU32(300);
+    writer.U24LE(0x123456);
+    writer.U64BE(0x0102030405060708ULL);
+    R::Reader reader(writer.Data());
+    Require(reader.VarU32() == 300 && reader.U24LE() == 0x123456 && reader.U64BE() == 0x0102030405060708ULL && reader.Ok(),
+        "Integers round-trip");
+    (void)reader.U8();
+    Require(!reader.Ok(), "Reading past the end is caught");
+
+    const auto ack = R::BuildAck(false, {5, 1, 2, 3, 9});
+    Require(R::IsAckOrNak(ack) && R::ParseAck(ack) == std::vector<std::uint32_t>{1, 2, 3, 5, 9}, "ACK ranges round-trip");
+
+    // A message larger than the MTU is split by the sender and reassembled
+    // by the receiver; small messages pack together.
+    R::Connection server(1400);
+    R::Connection client(1400);
+    std::vector<std::uint8_t> big(5000);
+    for (std::size_t index = 0; index < big.size(); ++index) big[index] = static_cast<std::uint8_t>(index * 7);
+    server.Send(big);
+    server.Send(std::vector<std::uint8_t>{0xFE, 1, 2, 3});
+    const auto datagrams = server.Flush(start);
+    Require(datagrams.size() >= 4, "A large message is split across datagrams");
+    std::vector<std::vector<std::uint8_t>> received;
+    for (const auto& datagram : datagrams) {
+        Require(datagram.size() <= 1400 - R::UdpOverhead, "Datagrams respect the MTU");
+        for (auto& message : client.Receive(datagram, start)) received.push_back(std::move(message));
+    }
+    Require(received.size() == 2 && received[0] == big && received[1] == std::vector<std::uint8_t>{0xFE, 1, 2, 3},
+        "Split messages reassemble in order");
+    Require(server.BytesInFlight() > 0, "Sent data stays in flight until acknowledged");
+    for (const auto& reply : client.Flush(start)) (void)server.Receive(reply, start);
+    Require(server.BytesInFlight() == 0, "ACKs release in-flight data");
+
+    // NAKed data is resent, and duplicates are dropped by the receiver.
+    server.Send(std::vector<std::uint8_t>{0xFE, 9});
+    const auto lost = server.Flush(start);
+    Require(lost.size() == 1, "One datagram for one small message");
+    const auto sequence = R::ParseDatagram(lost[0])->sequence;
+    (void)server.Receive(R::BuildAck(true, {sequence}), start);
+    const auto resent = server.Flush(start);
+    Require(resent.size() == 1 && R::ParseDatagram(resent[0])->sequence != sequence, "A NAKed datagram is resent under a new sequence");
+    Require(client.Receive(resent[0], start).size() == 1 && client.Receive(lost[0], start).empty(),
+        "A late duplicate of a reliable frame is dropped");
+}
+
+// Recording fixture: the join sequence, a world, and a clip from 1 s to 3 s.
+Oinkster::Replay::ReadResult PlaybackFixture() {
+    namespace Replay = Oinkster::Replay;
+    Replay::ReadResult replay;
+    const auto packet = [](std::uint64_t t, std::vector<std::uint8_t> bytes) {
+        return Replay::Record{Replay::RecordKind::IncomingPacket, t, std::move(bytes)};
+    };
+    replay.records = {
+        {Replay::RecordKind::Metadata, 0, {'{', '}'}},
+        packet(0, {0x8F, 0x01, 0xAA}),            // NetworkSettings (answered by us)
+        packet(1, {0x02, 0, 0, 0, 0}),            // PlayStatus: LoginSuccess
+        packet(2, {0x06, 0x11}),                  // ResourcePacksInfo
+        packet(2, {0x52, 0x04, 'p', 'a', 'c', 'k', 0x33}), // ResourcePackDataInfo
+        packet(2, {0x53, 0x04, 'p', 'a', 'c', 'k', 0, 0, 0, 0, 0x44}), // ResourcePackChunkData 0
+        packet(3, {0x07, 0x22}),                  // ResourcePackStack
+        // StartGame: unique id 5 (zigzag 10), runtime id 7, survival (zigzag 0), then the rest.
+        packet(4, {0x0B, 0x0A, 0x07, 0x00, 0x42, 0x43}),
+        packet(1'000'000, {0x3A, 0x01}),          // LevelChunk at the clip start
+        packet(1'500'000, {0x13, 0x07, 0x99}),    // MovePlayer for the viewer: dropped
+        packet(1'600'000, {0x13, 0x08, 0x99}),    // MovePlayer for another entity: kept
+        packet(1'700'000, {0x05, 0x00}),          // Disconnect: dropped
+        {Replay::RecordKind::Marker, 1'000'000, {'c', 'l', 'i', 'p', '-', 's', 't', 'a', 'r', 't'}},
+    };
+    replay.cleanEnd = true;
+    replay.endTimestampMicros = 3'000'000;
+    return replay;
+}
+
+void ReplayPlaybackHandshakeAndPacing() {
+    namespace P = Oinkster::ReplayPlayback;
+    using Bytes = std::vector<std::uint8_t>;
+    const std::vector<Bytes> packets{{0x01, 0x02}, Bytes(300, 0x7F)};
+    const auto batch = P::EncodeBatch(packets, true);
+    Require(batch[0] == 0xFE && batch[1] == 0xFF && P::DecodeBatch(batch, true) == packets, "Batches round-trip");
+    Require(!P::DecodeBatch(Bytes{0xFE, 0x00, 0x01}, true), "A zlib batch is not misread");
+
+    std::string error;
+    Require(!P::Session::Load(Oinkster::Replay::ReadResult{}, error) && !error.empty(), "A replay without a world is refused");
+    auto session = P::Session::Load(PlaybackFixture(), error);
+    Require(session.has_value(), "The fixture loads");
+    Require(session->PacketCount() == 3 && session->LengthMicros() == 2'000'000, "Handshake and control packets are filtered out");
+
+    const auto now = P::Clock::now();
+    std::vector<Bytes> out;
+    auto handled = session->OnClientPacket(Bytes{0xC1, 0x01, 0x00, 0x00, 0x08, 0xB1}, now, out);  // protocol 2225
+    Require(handled.accepted, "The supported protocol is accepted");
+    Require(out.size() == 1 && out[0] == P::NetworkSettingsPacket() && session->CompressionEnabled(),
+        "Network settings are answered and compression framing begins");
+    out.clear();
+    handled = session->OnClientPacket(Bytes{0x01, 0x00}, now, out);  // Login
+    Require(handled.accepted, "Login is accepted");
+    Require(out.size() == 2 && out[0] == Bytes{0x02, 0, 0, 0, 0} && out[1] == Bytes{0x06, 0x11}, "Login gets success and the pack info");
+    out.clear();
+    handled = session->OnClientPacket(Bytes{0x08, 0x01}, now, out);  // SendPacks
+    Require(handled.accepted && out == std::vector<Bytes>{{0x52, 0x04, 'p', 'a', 'c', 'k', 0x33}},
+        "A client missing recorded packs receives the captured pack description");
+    out.clear();
+    handled = session->OnClientPacket(Bytes{0x54, 0x04, 'p', 'a', 'c', 'k', 0, 0, 0, 0}, now, out);
+    Require(handled.accepted && out == std::vector<Bytes>{{0x53, 0x04, 'p', 'a', 'c', 'k', 0, 0, 0, 0, 0x44}},
+        "A requested resource-pack chunk is served from the recording");
+    out.clear();
+    handled = session->OnClientPacket(Bytes{0x08, 0x02}, now, out);  // AllPacksDownloaded
+    Require(handled.accepted, "Downloaded packs are accepted");
+    Require(out.size() == 1 && out[0] == Bytes{0x07, 0x22}, "The pack stack follows");
+    out.clear();
+    handled = session->OnClientPacket(Bytes{0x08, 0x04}, now, out);
+    Require(!handled.accepted && !handled.error.empty() && session->CurrentStage() == P::Stage::WaitingForPacksCompleted,
+        "The obsolete off-by-one completion status is rejected");
+    handled = session->OnClientPacket(Bytes{0x08, 0x03}, now, out);  // Completed
+    Require(handled.accepted, "The current completion status is accepted");
+    Require(out.empty() && session->CurrentStage() == P::Stage::CatchingUp, "Completed starts the world");
+
+    auto mismatch = P::Session::Load(PlaybackFixture(), error);
+    out.clear();
+    handled = mismatch->OnClientPacket(Bytes{0xC1, 0x01, 0x00, 0x00, 0x08, 0x90}, now, out);
+    Require(!handled.accepted && !handled.error.empty() && out.size() == 1 && out[0][0] == 0x02,
+        "A mismatched client protocol gets a PlayStatus rejection and a useful error");
+    out.clear();
+
+    session->Pump(now, 1 << 20, out);
+    Require(out.size() == 2, "The world before the clip sends StartGame and the first chunk");
+    Require(out[0] == Bytes{0x0B, 0x0A, 0x07, 0x0C, 0x42, 0x43}, "StartGame is set to spectator");
+    Require(out[1] == Bytes{0x3A, 0x01}, "The first clip chunk is sent during catch-up");
+    Require(session->CurrentStage() == P::Stage::Playing, "Playback starts at the clip");
+    out.clear();
+    session->Pump(now + std::chrono::milliseconds(300), 1 << 20, out);
+    Require(out.empty(), "Packets wait for their time");
+    session->Pump(now + std::chrono::milliseconds(700), 1 << 20, out);
+    Require(out.size() == 1 && out[0] == Bytes{0x13, 0x08, 0x99}, "Other entities move on time; the viewer is never moved");
+    session->SetPaused(true, now + std::chrono::milliseconds(700));
+    RequireNear(static_cast<double>(session->PositionMicros(now + std::chrono::seconds(5))), 700'000.0, 1000.0, "Pause holds the position");
+    session->SetPaused(false, now + std::chrono::seconds(5));
+    session->SetSpeed(2.0F, now + std::chrono::seconds(5));
+    RequireNear(static_cast<double>(session->PositionMicros(now + std::chrono::milliseconds(5500))), 1'700'000.0, 1000.0,
+        "Speed scales playback");
+    out.clear();
+    session->Pump(now + std::chrono::seconds(7), 1 << 20, out);
+    Require(session->CurrentStage() == P::Stage::Finished, "Playback finishes at the end of the clip");
+}
+
+void ReplayPlaybackUsesActiveRecordingTime() {
+    namespace P = Oinkster::ReplayPlayback;
+    namespace Replay = Oinkster::Replay;
+    using Bytes = std::vector<std::uint8_t>;
+    auto replay = PlaybackFixture();
+    const auto marker = [](std::uint64_t t, std::string_view label) {
+        return Replay::Record{Replay::RecordKind::Marker, t,
+            std::vector<std::uint8_t>(label.begin(), label.end())};
+    };
+    replay.records.push_back(marker(1'200'000, "pause"));
+    replay.records.push_back(marker(2'200'000, "resume"));
+    std::string error;
+    auto session = P::Session::Load(replay, error);
+    Require(session.has_value() && session->LengthMicros() == 1'000'000,
+        "A one-second recording pause is removed from the playable length");
+    const auto now = P::Clock::now();
+    session->BeginInjected(now);
+    std::vector<Bytes> out;
+    session->Pump(now, 1 << 20, out);
+    out.clear();
+    session->Pump(now + std::chrono::milliseconds(199), 1 << 20, out);
+    Require(out.empty(), "A packet captured during the pause waits for the pause point");
+    session->Pump(now + std::chrono::milliseconds(200), 1 << 20, out);
+    Require(out == std::vector<Bytes>{{0x13, 0x08, 0x99}},
+        "Paused packets catch up instantly when active recording time reaches the pause point");
+}
+
+void ReplayPlaybackRecreatesTheRecordingPlayer() {
+    namespace P = Oinkster::ReplayPlayback;
+    namespace Replay = Oinkster::Replay;
+    using Bytes = std::vector<std::uint8_t>;
+    auto replay = PlaybackFixture();
+    const auto text = [](std::string_view json) { return Bytes(json.begin(), json.end()); };
+    Bytes playerList{0x3F, 0x01, 0x01, 0x00};  // PlayerList as 1.26.5203 sends an add
+    for (std::uint8_t byte = 1; byte <= 16; ++byte) playerList.push_back(byte);  // the recorder's UUID
+    playerList.insert(playerList.end(), {0x0A, 0x03, 'B', 'o', 'b', 0x03, '1', '2', '3', 0xEE});  // unique id 5, name, XUID, skin...
+    replay.records.insert(replay.records.begin() + 7, Replay::Record{Replay::RecordKind::IncomingPacket, 3, playerList});
+    replay.records.push_back({Replay::RecordKind::IncomingPacket, 1'100'000, {0x2C, 0x01, 0x07}});  // Animate: recorder swings
+    {
+        // InventoryContent, window 0: three slots, an item (id 42, count 1) in slot 2.
+        Bytes content{0x31, 0x00, 0x03};
+        for (int slot = 0; slot < 3; ++slot) {
+            const Bytes item = slot == 2 ? Bytes{0x2A, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00} : Bytes(8, 0x00);
+            content.insert(content.end(), item.begin(), item.end());
+        }
+        content.insert(content.end(), {0x00, 0x00});  // container name
+        content.insert(content.end(), 8, 0x00);       // storage item
+        replay.records.push_back({Replay::RecordKind::IncomingPacket, 500'000, content});
+    }
+    replay.records.push_back({Replay::RecordKind::Camera, 900'000,
+        text(R"({"x":1,"y":64,"z":2,"yaw":90,"pitch":10,"dimension":null,"slot":2})")});
+    replay.records.push_back({Replay::RecordKind::Camera, 1'200'000,
+        text(R"({"x":3,"y":64,"z":2,"yaw":90,"pitch":10,"dimension":null})")});
+
+    std::string error;
+    auto session = P::Session::Load(replay, error);
+    Require(session.has_value(), "A replay with camera samples loads");
+    const auto now = P::Clock::now();
+    session->BeginInjected(now);
+    std::vector<Bytes> out;
+    session->Pump(now + std::chrono::seconds(1), 1 << 20, out);
+    session->Pump(now + std::chrono::seconds(1), 1 << 20, out);
+    const auto find = [&](std::uint8_t id) {
+        return std::ranges::find_if(out, [id](const Bytes& packet) { return !packet.empty() && packet[0] == id; });
+    };
+
+    const auto list = find(0x3F);
+    Require(list != out.end(), "The recorder's player-list entry is sent");
+    Bytes ghostUuid;
+    for (std::uint8_t byte = 1; byte <= 16; ++byte) ghostUuid.push_back(byte <= 8 ? byte ^ 0xA5 : byte);
+    Require(std::equal(ghostUuid.begin(), ghostUuid.end(), list->begin() + 4), "Its UUID is the ghost's, not the viewer's");
+    Require(list->size() >= 6 && Bytes(list->end() - 6, list->end()) == Bytes{0x03, 'B', 'o', 'b', 0x00, 0xEE},
+        "The name and skin are kept and the XUID is cleared");
+    Require(find(0x0B) != out.end(), "StartGame is still sent");
+
+    const auto add = find(0x0C);
+    Require(add != out.end() && std::equal(ghostUuid.begin(), ghostUuid.end(), add->begin() + 1)
+        && (*add)[17] == 3 && (*add)[18] == 'B', "The recording player is spawned with its own name");
+    Require(add > std::ranges::find(out, Bytes{0x3A, 0x01}), "It spawns at the clip start, after the world before it");
+    const Bytes emptyHand(8, 0x00);
+    Require(std::search(add->begin(), add->end(), emptyHand.begin(), emptyHand.end()) != add->end(),
+        "AddPlayer holds air as a full 1.26.50 ItemInstance");
+
+    // Held item: slot 2 of the recorded inventory, selected in the samples.
+    const auto equip = find(0x1F);
+    const Bytes sword{0x2A, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00};
+    Require(equip != out.end() && std::search(equip->begin(), equip->end(), sword.begin(), sword.end()) != equip->end()
+        && Bytes(equip->end() - 3, equip->end()) == Bytes{0x02, 0x02, 0x00},
+        "The ghost holds the recorded item in its selected hotbar slot");
+    Require(find(0x20) != out.end(), "The ghost's armor is sent");
+    out.clear();
+    session->Pump(now + std::chrono::milliseconds(1300), 1 << 20, out);
+    const auto swing = find(0x2C);
+    Require(swing != out.end() && (*swing)[1] == 0x01 && (*swing)[2] != 0x07, "The recorder's swing animates the ghost, not the viewer");
+    const auto move = find(0x12);
+    Require(move != out.end() && move->size() == 22, "The ghost walks the recorded camera path as servers move players");
+    Require(Bytes(move->begin() + 1, move->begin() + 7) == Bytes{0x81, 0x80, 0xFC, 0xFF, 0x07, 0x01},
+        "MoveActorAbsolute: the ghost's runtime id, on ground, then its eye position and angle bytes");
+}
+
+void ReplayPlaybackSeeksBothWays() {
+    namespace P = Oinkster::ReplayPlayback;
+    namespace Replay = Oinkster::Replay;
+    using Bytes = std::vector<std::uint8_t>;
+    auto replay = PlaybackFixture();
+    // A mob spawned during the clip (AddActor, unique id 9 = zigzag 18).
+    replay.records.insert(replay.records.begin() + 9,
+        Replay::Record{Replay::RecordKind::IncomingPacket, 1'200'000, {0x0D, 0x12, 0x05}});
+    std::string error;
+    auto session = P::Session::Load(replay, error);
+    Require(session.has_value(), "The fixture loads");
+    const auto now = P::Clock::now();
+    session->BeginInjected(now);
+    std::vector<Bytes> out;
+    session->Pump(now, 1 << 20, out);
+    Require(!out.empty() && out[0][0] == 0x0B, "StartGame goes out once at the start");
+
+    out.clear();
+    Require(!session->SeekTo(1'500'000, now), "Seeking forward is not a rewind");
+    session->Pump(now, 1 << 20, out);
+    Require(std::ranges::find(out, Bytes{0x0D, 0x12, 0x05}) != out.end() && std::ranges::find(out, Bytes{0x13, 0x08, 0x99}) != out.end(),
+        "A forward seek sends everything in between at once");
+
+    out.clear();
+    Require(session->SeekTo(0, now), "Seeking back rebuilds the world");
+    session->Pump(now, 1 << 20, out);
+    Require(!out.empty() && out[0] == Bytes{0x0E, 0x12}, "Entities the replay spawned are removed first");
+    Require(std::ranges::none_of(out, [](const Bytes& packet) { return packet[0] == 0x0B; }), "StartGame is never sent twice");
+    Require(std::ranges::find(out, Bytes{0x3A, 0x01}) != out.end(), "The terrain is replayed up to the target");
+    Require(std::ranges::find(out, Bytes{0x0D, 0x12, 0x05}) == out.end(), "Nothing after the target is sent yet");
+    RequireNear(static_cast<double>(session->PositionMicros(now)), 0.0, 1.0, "The position is the target");
+}
+
+void ReplayInjectorTakesOverOnlyALocalWorld() {
+    namespace I = Oinkster::ReplayInjector;
+    namespace P = Oinkster::ReplayPlayback;
+    using Bytes = std::vector<std::uint8_t>;
+    std::string error;
+    auto session = P::Session::Load(PlaybackFixture(), error);
+    Require(session.has_value(), "The fixture loads");
+    const auto now = P::Clock::now();
+    I::Controller controller;
+    controller.BeginLoading();
+    Require(controller.CurrentPhase() == I::Phase::Loading && !controller.Snapshot(now).ready, "Watch starts loading");
+    controller.Loaded(std::move(*session));
+    Require(controller.CurrentPhase() == I::Phase::WaitingForWorld, "A loaded replay waits for a world");
+
+    Require(controller.OnServerPacket(1, 143, true, false, now) == I::Verdict::Pass
+        && controller.CurrentPhase() == I::Phase::WaitingForWorld, "A connection to an external server is never taken over");
+    Require(controller.OnServerPacket(2, 143, true, true, now) == I::Verdict::Pass
+        && controller.CurrentPhase() == I::Phase::JoiningWorld, "The next local world is bound");
+    Require(controller.OnServerPacket(2, 2, false, true, now) == I::Verdict::Pass, "The local world's handshake passes through");
+    Require(!controller.Next(2, now), "Nothing is injected before the pack list");
+    Require(controller.OnServerPacket(2, 6, false, true, now) == I::Verdict::Drop, "The local world's pack list is replaced");
+    const auto packsInfo = controller.Next(2, now);
+    Require(packsInfo && *packsInfo == Bytes{0x06, 0x11}, "by the recorded server's");
+    Require(controller.OnClientPacket(Bytes{0x08, 0x01, 0x00}) == I::Verdict::Drop, "A pack download request is answered by the replay");
+    const auto dataInfo = controller.Next(2, now);
+    Require(dataInfo && (*dataInfo)[0] == 0x52, "with the recorded pack's data info");
+    Require(controller.OnClientPacket(Bytes{0x54, 0x04, 'p', 'a', 'c', 'k', 0, 0, 0, 0}) == I::Verdict::Drop, "A chunk request is answered too");
+    const auto packChunk = controller.Next(2, now);
+    Require(packChunk && packChunk->back() == 0x44, "with the recorded chunk");
+    Require(controller.OnClientPacket(Bytes{0x08, 0x03, 0x00}) == I::Verdict::Pass, "Other pack responses reach the local world");
+    Require(controller.OnServerPacket(2, 7, false, true, now) == I::Verdict::Drop, "The local world's pack stack is replaced");
+    const auto stack = controller.Next(2, now);
+    Require(stack && *stack == Bytes{0x07, 0x22}, "by the recorded server's");
+    Require(controller.OnServerPacket(3, 50, false, true, now) == I::Verdict::Pass, "Other connections are untouched");
+    Require(controller.OnServerPacket(2, 11, false, true, now) == I::Verdict::Drop
+        && controller.CurrentPhase() == I::Phase::Playing, "After the pack stack the local world's packets are replaced");
+    Require(controller.OnClientPacket(Bytes{0x90, 0x01}) == I::Verdict::Drop,
+        "Recorded gameplay packets never reach the throwaway local server");
+    Require(!controller.Next(3, now), "Only the bound connection receives the recording");
+    const auto startGame = controller.Next(2, now);
+    Require(startGame && *startGame == Bytes{0x0B, 0x0A, 0x07, 0x0C, 0x42, 0x43}, "The recorded StartGame comes first, as spectator");
+    const auto chunk = controller.Next(2, now);
+    Require(chunk && *chunk == Bytes{0x3A, 0x01}, "The world before the clip is rebuilt");
+    Require(!controller.Next(2, now + std::chrono::milliseconds(300)), "Recorded packets wait for their time");
+    const auto move = controller.Next(2, now + std::chrono::milliseconds(700));
+    Require(move && *move == Bytes{0x13, 0x08, 0x99}, "Playback follows the recording's timing");
+    Require(controller.OnServerPacket(2, 58, false, true, now) == I::Verdict::Drop, "Later local-world packets stay dropped");
+
+    controller.SetPaused(true, now + std::chrono::milliseconds(700));
+    Require(controller.Snapshot(now + std::chrono::seconds(5)).paused, "Pause is reported");
+    Require(controller.OnServerPacket(4, 143, true, true, now) == I::Verdict::Pass
+        && controller.CurrentPhase() == I::Phase::Idle, "Joining another world ends the replay");
+}
+
+void ReplayRewindPutsPlacedBlocksBack() {
+    namespace P = Oinkster::ReplayPlayback;
+    namespace Replay = Oinkster::Replay;
+    using Bytes = std::vector<std::uint8_t>;
+    auto replay = PlaybackFixture();
+    // UpdateBlock: sandstone (hashed id 0xA43117FB) placed at (-424, 182, 39), layer 0.
+    const Bytes position{0xCF, 0x06, 0xB6, 0x01, 0x4E};
+    Bytes place{0x15};
+    place.insert(place.end(), position.begin(), position.end());
+    place.insert(place.end(), {0xFB, 0xAF, 0xC4, 0xA1, 0x0A, 0x03, 0x00});
+    replay.records.insert(replay.records.begin() + 9, Replay::Record{Replay::RecordKind::IncomingPacket, 1'200'000, place});
+    std::string error;
+    auto session = P::Session::Load(replay, error);
+    Require(session.has_value(), "The fixture loads");
+    const auto now = P::Clock::now();
+    session->BeginInjected(now);
+    std::vector<Bytes> out;
+    session->Pump(now, 1 << 20, out);
+    Require(!session->SeekTo(1'500'000, now), "Seeking forward is not a rewind");
+    out.clear();
+    session->Pump(now, 1 << 20, out);
+    Require(std::ranges::find(out, place) != out.end(), "The block is placed when the replay reaches it");
+
+    out.clear();
+    Require(session->SeekTo(0, now), "Seeking back rebuilds the world");
+    session->Pump(now, 1 << 20, out);
+    Bytes air{0x15};
+    air.insert(air.end(), position.begin(), position.end());
+    air.insert(air.end(), {0xA0, 0x82, 0xD1, 0xDF, 0x0D, 0x03, 0x00});
+    Require(!out.empty() && out[0] == air, "A rewind first puts the placed block back to air (hashed id 0xDBF44120)");
+    Require(std::ranges::find(out, place) == out.end(), "It is not placed again before the replay reaches it");
+}
+
+void ReplayPlayersAreTrackedAndPicked() {
+    namespace I = Oinkster::ReplayInjector;
+    using Bytes = std::vector<std::uint8_t>;
+    const auto f32 = [](Bytes& bytes, float value) {
+        const auto bits = std::bit_cast<std::uint32_t>(value);
+        for (unsigned shift = 0; shift < 32; shift += 8) bytes.push_back(static_cast<std::uint8_t>(bits >> shift));
+    };
+    // AddPlayer "Bob", runtime id 5, feet at (1, 64, 2), facing south (yaw 0).
+    Bytes add{0x0C};
+    add.insert(add.end(), 16, 0x11);
+    add.insert(add.end(), {0x03, 'B', 'o', 'b', 0x05, 0x00});
+    for (const float value : {1.0F, 64.0F, 2.0F, 0.0F, 0.0F, 0.0F, 10.0F, 0.0F, 0.0F}) f32(add, value);
+    add.insert(add.end(), 8, 0x00);
+    // MovePlayer for Bob: eye at (3, 65.62, 2), facing west (yaw 90).
+    Bytes move{0x13, 0x05};
+    for (const float value : {3.0F, 65.62F, 2.0F, 0.0F, 90.0F, 90.0F}) f32(move, value);
+    move.insert(move.end(), {0x00, 0x01, 0x00, 0x00, 0x00});
+
+    I::PlayerTracker tracker;
+    const auto now = I::Clock::now();
+    tracker.Observe(Bytes{0x13, 0x09, 0x00}, now);
+    Require(tracker.Players().empty(), "A MovePlayer for an unknown player adds nobody");
+    // A cosmetic the server spawns as a player (never on the player list).
+    Bytes cosmetic = add;
+    std::fill_n(cosmetic.begin() + 1, 16, std::uint8_t{0x22});
+    cosmetic[21] = 0x06;  // runtime id 6
+    tracker.Observe(cosmetic, now);
+    Require(tracker.Players().empty(), "A spawned player who is not on the player list is not offered");
+    Bytes list{0x3F, 0x01, 0x01, 0x00};
+    list.insert(list.end(), 16, std::uint8_t{0x11});
+    list.insert(list.end(), {0x0A, 0x03, 'B', 'o', 'b', 0x02, '4', '2'});
+    // The NPC has a list entry too (for its model), with XUID "0".
+    list.insert(list.end(), 16, std::uint8_t{0x22});
+    list.insert(list.end(), {0x0C, 0x03, 'H', 'a', 't', 0x01, '0'});
+    tracker.Observe(list, now);
+    tracker.Observe(add, now);
+    auto players = tracker.Players();
+    Require(players.size() == 1 && players[0].name == "Bob" && players[0].runtimeId == 5, "AddPlayer is tracked by name and id");
+    RequireNear(players[0].eye.y, 65.62, 0.001, "AddPlayer's feet position becomes eye height");
+
+    tracker.Observe(move, now + std::chrono::milliseconds(100));
+    const auto halfway = tracker.PoseAt(5, now + std::chrono::milliseconds(150));
+    Require(halfway.has_value(), "A tracked player has a pose");
+    RequireNear(halfway->eye.x, 2.0, 0.01, "Between updates the pose eases from the old position to the new one");
+    RequireNear(halfway->yaw, 45.0, 0.1, "and turns halfway");
+    RequireNear(tracker.PoseAt(5, now + std::chrono::seconds(1))->eye.x, 3.0, 0.001, "and then arrives");
+
+    players = tracker.Players();
+    const Oinkster::Vec3 viewer{3.0, 65.62, -6.0};
+    Require(I::PlayerAlongRay(players, viewer, 0.0F, 0.0F).has_value(), "Looking south at Bob picks him");
+    Require(!I::PlayerAlongRay(players, viewer, 180.0F, 0.0F), "Looking away picks nobody");
+    Require(!I::PlayerAlongRay(players, viewer, 0.0F, -80.0F), "Looking up past him picks nobody");
+
+    const auto behind = I::BehindView(*tracker.PoseAt(5, now + std::chrono::seconds(1)));
+    RequireNear(behind.eye.x, 6.5, 0.01, "A teleport lands behind a player facing west (+X of them)");
+
+    // Servers move other players with MoveActorAbsolute: flags, eye position,
+    // then pitch, body yaw and head yaw in 1/256ths of a turn.
+    Bytes absolute{0x12, 0x05, 0x00};
+    for (const float value : {10.0F, 70.62F, 2.0F}) f32(absolute, value);
+    absolute.insert(absolute.end(), {0x20, 0x00, 0x80});
+    tracker.Observe(absolute, now + std::chrono::seconds(2));
+    auto pose = tracker.PoseAt(5, now + std::chrono::seconds(5));
+    RequireNear(pose->eye.x, 10.0, 0.001, "MoveActorAbsolute moves a tracked player");
+    RequireNear(pose->eye.y, 70.62, 0.001, "at eye height");
+    RequireNear(pose->yaw, 180.0, 0.01, "and turns the view to where their head points, not their body");
+    RequireNear(pose->pitch, 45.0, 0.01, "and tilts it");
+    // MoveActorDelta carries only what changed: here z and head yaw.
+    Bytes delta{0x6F, 0x05, 0x24, 0x00};
+    f32(delta, 8.0F);
+    delta.push_back(0x40);
+    tracker.Observe(delta, now + std::chrono::seconds(6));
+    pose = tracker.PoseAt(5, now + std::chrono::seconds(10));
+    RequireNear(pose->eye.x, 10.0, 0.001, "MoveActorDelta keeps the fields it does not carry");
+    RequireNear(pose->eye.z, 8.0, 0.001, "and updates the ones it does");
+    RequireNear(pose->yaw, 90.0, 0.01, "including head yaw");
+    RequireNear(pose->pitch, 45.0, 0.01, "while pitch stays");
+    Bytes mob{0x12, 0x63, 0x00};
+    for (const float value : {0.0F, 0.0F, 0.0F}) f32(mob, value);
+    mob.insert(mob.end(), {0x00, 0x00, 0x00});
+    tracker.Observe(mob, now + std::chrono::seconds(6));
+    Require(tracker.Players().size() == 1 && !tracker.PoseAt(0x63, now), "A moving mob is not tracked as a player");
+}
+
+void ReplayExitLeavesTheWorld() {
+    namespace I = Oinkster::ReplayInjector;
+    namespace P = Oinkster::ReplayPlayback;
+    using Bytes = std::vector<std::uint8_t>;
+    std::string error;
+    auto session = P::Session::Load(PlaybackFixture(), error);
+    Require(session.has_value(), "The fixture loads");
+    const auto now = P::Clock::now();
+    I::Controller controller;
+    controller.BeginLoading();
+    controller.Loaded(std::move(*session));
+    (void)controller.OnServerPacket(2, 143, true, true, now);
+    (void)controller.OnServerPacket(2, 7, false, true, now);
+    (void)controller.OnServerPacket(2, 11, false, true, now);
+    Require(controller.CurrentPhase() == I::Phase::Playing, "The replay plays");
+    controller.Spectate(12345, now);
+    (void)controller.Next(2, now + std::chrono::milliseconds(20));
+    Require(!controller.Spectating(), "Following a player who is not there stops");
+
+    controller.Exit();
+    const auto disconnect = controller.Next(2, now);
+    Require(disconnect && *disconnect == Bytes{0x05, 0x00, 0x01}, "Exit hands the game a Disconnect without a message");
+    Require(controller.CurrentPhase() == I::Phase::Idle, "and ends the replay");
+    Require(!controller.Next(2, now), "Nothing follows it");
+}
+
+void ReplayWorldCleanupFindsOnlyItsOwnWorld() {
+    namespace W = Oinkster::ReplayWorld;
+    namespace fs = std::filesystem;
+    const auto root = fs::temp_directory_path() / std::format("oinkster-world-test-{}", GetCurrentProcessId());
+    fs::remove_all(root);
+    const auto world = [&](const fs::path& base, std::string_view name) {
+        const auto folder = base / "games" / "com.mojang" / "minecraftWorlds" / W::WorldFolderName;
+        fs::create_directories(folder / "db");
+        std::ofstream(folder / "levelname.txt", std::ios::binary) << name;
+        return folder;
+    };
+    const auto replayWorld = world(root / "Users" / "123", W::WorldDisplayName);
+    (void)world(root / "Users" / "456", "My Survival World");
+    const auto uwpWorld = world(root, std::string(W::WorldDisplayName) + "\r\n");
+    auto found = W::FindReplayWorlds(root);
+    std::ranges::sort(found);
+    auto expected = std::vector<fs::path>{replayWorld, uwpWorld};
+    std::ranges::sort(expected);
+    Require(found == expected, "Only folders named like the replay world and titled Oinkster Replay are found");
+    Require(W::FindReplayWorlds(root / "missing").empty(), "A missing data root finds nothing");
+    fs::remove_all(root);
+}
+
+void ReplayViewHidesTheRecordingPlayer() {
+    namespace I = Oinkster::ReplayInjector;
+    namespace P = Oinkster::ReplayPlayback;
+    namespace Replay = Oinkster::Replay;
+    using Bytes = std::vector<std::uint8_t>;
+    auto replay = PlaybackFixture();
+    const auto text = [](std::string_view json) { return Bytes(json.begin(), json.end()); };
+    // InventoryContent, window 0: one item (id 42) in slot 0, so the recording player holds it.
+    Bytes content{0x31, 0x00, 0x01, 0x2A, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+    content.insert(content.end(), 8, 0x00);
+    replay.records.push_back({Replay::RecordKind::IncomingPacket, 500'000, content});
+    replay.records.push_back({Replay::RecordKind::Camera, 900'000, text(R"({"x":1,"y":64,"z":2,"yaw":90,"pitch":10})")});
+    replay.records.push_back({Replay::RecordKind::Camera, 1'200'000, text(R"({"x":3,"y":64,"z":2,"yaw":90,"pitch":10})")});
+    std::string error;
+    auto session = P::Session::Load(replay, error);
+    Require(session.has_value() && session->HasGhost(), "A replay with camera samples re-creates the recording player");
+    const auto now = P::Clock::now();
+    I::Controller controller;
+    controller.BeginLoading();
+    controller.Loaded(std::move(*session));
+    (void)controller.OnServerPacket(2, 143, true, true, now);
+    (void)controller.OnServerPacket(2, 7, false, true, now);
+    (void)controller.OnServerPacket(2, 11, false, true, now);
+    const auto later = now + std::chrono::milliseconds(400);
+    while (controller.Next(2, later)) {}
+    const auto players = controller.Players();
+    Require(players.size() == 1 && players[0].recorder, "The recording player is tracked");
+
+    controller.Spectate(P::RecorderRuntimeId, later);
+    const auto remove = controller.Next(2, later);
+    Require(remove && !remove->empty() && (*remove)[0] == 0x0E, "Viewing the recording player despawns them first");
+    const auto view = controller.Next(2, later + std::chrono::milliseconds(20));
+    Require(view && (*view)[0] == 0x13, "then the viewer's camera is moved to their eyes");
+    {
+        Oinkster::RakNet::Reader reader(std::span(*view).subspan(1));
+        (void)reader.VarU64();
+        float fields[5]{};
+        for (auto& field : fields) {
+            const auto bytes = reader.Bytes(4);
+            Require(bytes.size() == 4, "The view carries a position and angles");
+            field = std::bit_cast<float>(static_cast<std::uint32_t>(bytes[0]) | (static_cast<std::uint32_t>(bytes[1]) << 8U)
+                | (static_cast<std::uint32_t>(bytes[2]) << 16U) | (static_cast<std::uint32_t>(bytes[3]) << 24U));
+        }
+        Require(fields[0] >= 1.0F && fields[0] <= 3.0F, "following the recorded camera path");
+        RequireNear(fields[1], 65.62, 0.001, "at the recorded eye height");
+        RequireNear(fields[3], 10.0, 0.001, "with the recorded pitch");
+        RequireNear(fields[4], 90.0, 0.001, "and yaw");
+    }
+    Require(controller.Spectating() == P::RecorderRuntimeId, "and keeps following");
+
+    controller.Spectate(std::nullopt, later);
+    const auto spawn = controller.Next(2, later);
+    Require(spawn && (*spawn)[0] == 0x0C, "Stopping spawns the recording player again");
+    bool equipped = false;
+    while (const auto next = controller.Next(2, later)) equipped |= (*next)[0] == 0x1F || (*next)[0] == 0x20;
+    Require(equipped, "with what they hold and wear");
+}
+
+void ReplayRecorderFoundUnderAnotherListId() {
+    namespace P = Oinkster::ReplayPlayback;
+    namespace Replay = Oinkster::Replay;
+    using Bytes = std::vector<std::uint8_t>;
+    auto replay = PlaybackFixture();
+    const auto text = [](std::string_view json) { return Bytes(json.begin(), json.end()); };
+    // As on The Hive: StartGame says unique id 5, the list files the player under 17.
+    Bytes playerList{0x3F, 0x01, 0x01, 0x00};
+    for (std::uint8_t byte = 1; byte <= 16; ++byte) playerList.push_back(byte);
+    playerList.insert(playerList.end(), {0x22, 0x03, 'B', 'o', 'b', 0x03, '1', '2', '3', 0xEE});
+    replay.records.insert(replay.records.begin() + 7, Replay::Record{Replay::RecordKind::IncomingPacket, 3, playerList});
+    replay.records.push_back({Replay::RecordKind::Camera, 900'000, text(R"({"x":1,"y":64,"z":2,"yaw":90,"pitch":10})")});
+    std::string error;
+    auto session = P::Session::Load(replay, error);
+    Require(session.has_value() && session->HasGhost() && session->GhostHasSkin(),
+        "The recording player is found by the first list entry nobody spawns");
+    const auto now = P::Clock::now();
+    session->BeginInjected(now);
+    std::vector<Bytes> out;
+    session->Pump(now + std::chrono::seconds(1), 1 << 20, out);
+    session->Pump(now + std::chrono::seconds(1), 1 << 20, out);
+    const auto list = std::ranges::find_if(out, [](const Bytes& packet) { return packet[0] == 0x3F; });
+    Bytes ghostUuid;
+    for (std::uint8_t byte = 1; byte <= 16; ++byte) ghostUuid.push_back(byte <= 8 ? byte ^ 0xA5 : byte);
+    Require(list != out.end() && std::equal(ghostUuid.begin(), ghostUuid.end(), list->begin() + 4),
+        "Its list entry is re-keyed to the ghost");
+    const auto add = std::ranges::find_if(out, [](const Bytes& packet) { return packet[0] == 0x0C; });
+    Require(add != out.end() && (*add)[17] == 3 && (*add)[18] == 'B', "and the ghost carries its name");
+}
+
+void ReplayRecorderFoundInLargeServerList() {
+    namespace P = Oinkster::ReplayPlayback;
+    namespace Replay = Oinkster::Replay;
+    using Bytes = std::vector<std::uint8_t>;
+    auto replay = PlaybackFixture();
+    const auto text = [](std::string_view json) { return Bytes(json.begin(), json.end()); };
+    // A 40-entry list (28 01 00). Its first UUID ends BE 87, so read one byte
+    // early (01 00 as the UUID's start) BE 87 EC 42 is a valid unique id and
+    // the name and XUID still follow: that entry must not be the one chosen.
+    Bytes uuid;
+    for (std::uint8_t byte = 1; byte <= 14; ++byte) uuid.push_back(byte);
+    uuid.insert(uuid.end(), {0xBE, 0x87});
+    Bytes playerList{0x3F, 0x28, 0x01, 0x00};
+    playerList.insert(playerList.end(), uuid.begin(), uuid.end());
+    playerList.insert(playerList.end(), {0xEC, 0x42, 0x03, 'B', 'o', 'b', 0x03, '1', '2', '3', 0xEE});
+    replay.records.insert(replay.records.begin() + 7, Replay::Record{Replay::RecordKind::IncomingPacket, 3, playerList});
+    replay.records.push_back({Replay::RecordKind::Camera, 900'000, text(R"({"x":1,"y":64,"z":2,"yaw":90,"pitch":10})")});
+    std::string error;
+    auto session = P::Session::Load(replay, error);
+    Require(session.has_value() && session->GhostHasSkin(), "The recording player is found in a large list");
+    const auto now = P::Clock::now();
+    session->BeginInjected(now);
+    std::vector<Bytes> out;
+    session->Pump(now + std::chrono::seconds(1), 1 << 20, out);
+    session->Pump(now + std::chrono::seconds(1), 1 << 20, out);
+    const auto list = std::ranges::find_if(out, [](const Bytes& packet) { return packet[0] == 0x3F; });
+    Require(list != out.end() && list->size() > 20, "The list is played");
+    Require((*list)[1] == 0x28 && (*list)[2] == 0x01 && (*list)[3] == 0x00, "Its header is left alone");
+    Bytes ghostUuid = uuid;
+    for (std::size_t index = 0; index < 8; ++index) ghostUuid[index] ^= 0xA5;
+    Require(std::equal(ghostUuid.begin(), ghostUuid.end(), list->begin() + 4), "and the entry right after it is re-keyed");
+}
+
+void ReplayOldHeightChunksAreModernized() {
+    namespace P = Oinkster::ReplayPlayback;
+    namespace Replay = Oinkster::Replay;
+    using Bytes = std::vector<std::uint8_t>;
+    // One version-8 sub-chunk: 1 bit per block, a named palette (stone), then
+    // 16 biome sections (one plains section, 15 "same as below") and no
+    // border blocks - a 0-255 world's full chunk.
+    Bytes storage{0x02};
+    storage.insert(storage.end(), 512, 0x00);
+    storage.insert(storage.end(), {0x02, 0x0A, 0x00, 0x08, 0x04, 'n', 'a', 'm', 'e', 0x05, 's', 't', 'o', 'n', 'e', 0x00});
+    Bytes payload{0x08, 0x01};
+    payload.insert(payload.end(), storage.begin(), storage.end());
+    payload.insert(payload.end(), {0x00, 0x01});
+    payload.insert(payload.end(), 15, 0xFF);
+    payload.push_back(0x00);
+    Oinkster::RakNet::Writer chunk;
+    chunk.VarU32(0x3A);
+    for (const std::uint8_t field : Bytes{0x04, 0x06, 0x00, 0x01, 0x00, 0x00, 0x00}) chunk.U8(field);
+    chunk.VarU32(static_cast<std::uint32_t>(payload.size()));
+    chunk.Bytes(payload);
+    auto replay = PlaybackFixture();
+    replay.records.insert(replay.records.begin() + 9, Replay::Record{Replay::RecordKind::IncomingPacket, 1'200'000, chunk.Take()});
+    std::string error;
+    auto session = P::Session::Load(replay, error);
+    Require(session.has_value() && session->ModernizedChunks() == 1, "An old-height chunk is rewritten; modern ones are not");
+    const auto now = P::Clock::now();
+    session->BeginInjected(now);
+    std::vector<Bytes> out;
+    for (int step = 0; step <= 40; ++step) session->Pump(now + std::chrono::milliseconds(100 * step), 1 << 20, out);
+    const auto found = std::ranges::find_if(out, [](const Bytes& packet) { return packet.size() > 500 && packet[0] == 0x3A; });
+    Require(found != out.end(), "The chunk is played");
+    Bytes expected{0x09, 0x01, 0x00};
+    expected.insert(expected.end(), storage.begin(), storage.end());
+    expected.insert(expected.end(), {0x00, 0x01, 0xFF, 0xFF, 0xFF, 0x00, 0x01});
+    expected.insert(expected.end(), 15 + 4, 0xFF);
+    expected.push_back(0x00);
+    Oinkster::RakNet::Reader reader(std::span(*found).subspan(8));
+    const auto length = reader.VarU32();
+    const auto rewritten = reader.Rest();
+    Require(length == rewritten.size() && Bytes(rewritten.begin(), rewritten.end()) == expected,
+        "Sub-chunks become version 9 at their absolute height and the biomes cover -64 to 320");
+}
+
+void ServerBlocksBecomeABehaviorPack() {
+    namespace B = Oinkster::ReplayBlockPack;
+    using Bytes = std::vector<std::uint8_t>;
+    Bytes packet{0x0B, 0x05, 0x02, 0x99, 0x10};  // StartGame and some unrelated fields
+    const auto text = [&](std::string_view value) {
+        packet.push_back(static_cast<std::uint8_t>(value.size()));
+        packet.insert(packet.end(), value.begin(), value.end());
+    };
+    const auto field = [&](std::uint8_t tag, std::string_view name) {
+        packet.push_back(tag);
+        text(name);
+    };
+    // hive:shutter - a model, a placement event (dropped), one state that
+    // turns it, in the network form (query.block_property, quarter turns).
+    text("hive:shutter");
+    packet.insert(packet.end(), {0x0A, 0x00});
+    field(10, "components");
+    field(10, "minecraft:geometry");
+    field(8, "identifier");
+    text("geometry.hive.shutter");
+    packet.push_back(0);
+    field(10, "minecraft:on_player_placing");
+    field(8, "event");
+    text("turn");
+    packet.push_back(0);
+    packet.push_back(0);
+    field(9, "properties");
+    packet.insert(packet.end(), {0x0A, 0x02});
+    field(8, "name");
+    text("custom:facing");
+    field(9, "enum");
+    packet.insert(packet.end(), {0x03, 0x04, 0x00, 0x02});
+    packet.push_back(0);
+    field(9, "permutations");
+    packet.insert(packet.end(), {0x0A, 0x02});
+    field(8, "condition");
+    text("query.block_property('custom:facing') == 1");
+    field(10, "components");
+    field(10, "minecraft:transformation");
+    field(3, "RY");
+    packet.push_back(0x02);
+    packet.push_back(0);
+    packet.push_back(0);
+    packet.push_back(0);
+    field(10, "menu_category");
+    field(8, "category");
+    text("construction");
+    field(8, "group");
+    text("");
+    packet.push_back(0);
+    packet.push_back(0);
+    // hive:plain - a full cube textured by the resource pack.
+    text("hive:plain");
+    packet.insert(packet.end(), {0x0A, 0x00});
+    field(10, "components");
+    field(10, "minecraft:light_emission");
+    field(3, "emission");
+    packet.push_back(24);  // zigzag 12
+    packet.push_back(0);
+    packet.push_back(0);
+    packet.push_back(0);
+    packet.insert(packet.end(), {0x00, 0x01, 0x07});  // the fields after the list
+
+    const auto blocks = B::FindCustomBlocks(packet);
+    Require(blocks.size() == 2 && blocks[0].name == "hive:shutter" && blocks[1].name == "hive:plain",
+        "The server's block definitions are found in StartGame, in order");
+    const auto shutter = B::BlockJson(blocks[0]);
+    Require(Oinkster::Json::Parse(shutter).has_value(), "A block file is valid JSON");
+    Require(shutter.find(R"("identifier": "hive:shutter")") != std::string::npos
+        && shutter.find(R"("states": {"custom:facing": [0, 1]})") != std::string::npos,
+        "It keeps the identifier and the block's states");
+    Require(shutter.find(R"("minecraft:geometry": {"identifier": "geometry.hive.shutter"})") != std::string::npos,
+        "and its model");
+    Require(shutter.find("query.block_state('custom:facing') == 1") != std::string::npos
+        && shutter.find(R"("rotation": [0, 90, 0])") != std::string::npos,
+        "Permutations read states the current way and rotate in degrees");
+    Require(shutter.find("on_player_placing") == std::string::npos, "Events are left out");
+    Require(B::BlockJson(blocks[1]).find(R"("minecraft:light_emission": 12)") != std::string::npos, "Light is kept");
+    const auto pack = B::BuildPack(blocks);
+    Require(pack.size() == 3 && pack[0].path == "manifest.json" && Oinkster::Json::Parse(pack[0].text).has_value()
+        && Oinkster::Json::Parse(B::WorldPacksJson()).has_value(), "The pack is a manifest plus one file per block");
+    Require(B::FindCustomBlocks(Bytes{0x0B, 0x00, 0x01}).empty(), "A StartGame without custom blocks has none");
+}
+
+void CameraKeyframesMakeASmoothPath() {
+    namespace C = Oinkster::ReplayCameraPath;
+    C::Path path;
+    Require(!path.Evaluate(0), "No keyframes, no camera");
+    path.Add({2'000'000, {10.0, 70.0, 0.0}, 170.0F, 10.0F});
+    path.Add({0, {0.0, 70.0, 0.0}, 0.0F, 0.0F});
+    path.Add({4'000'000, {20.0, 80.0, 10.0}, -170.0F, -20.0F});
+    Require(path.Size() == 3 && path.Keyframes()[0].micros == 0 && path.Keyframes()[2].micros == 4'000'000, "Keyframes keep time order");
+    RequireNear(path.Evaluate(2'000'000)->eye.x, 10.0, 1e-9, "The path passes through each keyframe");
+    RequireNear(path.Evaluate(9'000'000)->eye.y, 80.0, 1e-9, "and holds the last one after it");
+    const auto between = *path.Evaluate(1'000'000);
+    Require(between.eye.x > 0.0 && between.eye.x < 10.0, "Between keyframes it moves from one to the next");
+    // 170 to -170 is a 20-degree turn across 180, not 340 the long way.
+    const float turning = path.Evaluate(3'000'000)->yaw;
+    Require(std::abs(turning) > 150.0F, "The camera turns the short way round (near 180, not through 0)");
+    Require(path.Add({2'050'000, {11.0, 70.0, 0.0}, 0.0F, 0.0F}) == 1 && path.Size() == 3, "Adding at the same moment replaces it");
+    Require(!path.Retime(0, 2'020'000) && path.Retime(0, 3'000'000) == 1, "A keyframe moves in time, but not onto another");
+
+    const auto loaded = C::Path::FromJson(path.ToJson());
+    Require(loaded && *loaded == path, "Keyframes save and load");
+    Require(!C::Path::FromJson("not json") && C::Path::FromJson(R"({"keyframes": []})")->Empty(), "A bad file loads nothing");
+}
+
+void CameraKeyframesEaseAndCut() {
+    namespace C = Oinkster::ReplayCameraPath;
+    C::Path path;
+    path.Add({0, {0.0, 64.0, 0.0}, 0.0F, 0.0F});
+    path.Add({1'000'000, {10.0, 64.0, 0.0}, 0.0F, 0.0F});
+    const double smooth = path.Evaluate(250'000)->eye.x;
+    path.SetEase(0, C::Ease::EaseInOut);
+    const double eased = path.Evaluate(250'000)->eye.x;
+    Require(eased < smooth && eased > 0.0, "Ease in/out starts slower than the even glide");
+    RequireNear(path.Evaluate(500'000)->eye.x, 5.0, 1e-9, "and is halfway at the halfway point");
+    path.SetEase(0, C::Ease::Cut);
+    RequireNear(path.Evaluate(999'000)->eye.x, 0.0, 1e-9, "A cut holds the shot until the next keyframe");
+    RequireNear(path.Evaluate(1'000'000)->eye.x, 10.0, 1e-9, "then jumps to it");
+    const auto loaded = C::Path::FromJson(path.ToJson());
+    Require(loaded && loaded->Keyframes()[0].ease == C::Ease::Cut && *loaded == path, "Easing is saved with the keyframes");
+    path.Add({20'000, {3.0, 64.0, 0.0}, 0.0F, 0.0F});
+    Require(path.Keyframes()[0].ease == C::Ease::Cut, "Re-pinning a keyframe keeps its easing");
+}
+
+void VideosEncodeToMp4() {
+    namespace V = Oinkster::VideoRecorder;
+    const auto file = std::filesystem::temp_directory_path() / std::format("oinkster-video-test-{}.mp4", GetCurrentProcessId());
+    std::filesystem::remove(file);
+    std::string error;
+    Require(V::WriteTestVideo(file, 322, 180, 30, error), ("An H.264 MP4 is written (" + error + ")").c_str());
+    std::error_code ignored;
+    Require(std::filesystem::file_size(file, ignored) > 1000, "and has video in it");
+    std::ifstream video(file, std::ios::binary);
+    std::string head(12, '\0');
+    video.read(head.data(), 12);
+    Require(head.substr(4, 4) == "ftyp", "It is an MP4 file");
+    video.close();
+    std::filesystem::remove(file, ignored);
+    Require(!V::Recording(), "Nothing is recording");
+}
+
+void ReplayCameraFliesAlongThePath() {
+    namespace I = Oinkster::ReplayInjector;
+    namespace P = Oinkster::ReplayPlayback;
+    std::string error;
+    auto session = P::Session::Load(PlaybackFixture(), error);
+    Require(session.has_value(), "The fixture loads");
+    const auto now = P::Clock::now();
+    I::Controller controller;
+    controller.BeginLoading();
+    controller.Loaded(std::move(*session));
+    (void)controller.OnServerPacket(2, 143, true, true, now);
+    (void)controller.OnServerPacket(2, 7, false, true, now);
+    (void)controller.OnServerPacket(2, 11, false, true, now);
+    controller.PlayCameraPath(true, now);
+    Require(!controller.PlayingCameraPath(), "An empty path cannot play");
+    Oinkster::ReplayCameraPath::Path path;
+    path.Add({0, {1.0, 65.0, 2.0}, 90.0F, 30.0F});
+    path.Add({60'000'000, {5.0, 65.0, 2.0}, 90.0F, 30.0F});
+    controller.SetCameraPath(path);
+    controller.PlayCameraPath(true, now);
+    const auto view = controller.Next(2, now + std::chrono::milliseconds(20));
+    Require(view && (*view)[0] == 0x13, "Playing the path moves the viewer's camera");
+    Oinkster::RakNet::Reader reader(std::span(*view).subspan(1));
+    (void)reader.VarU64();
+    const auto pitchBytes = reader.Bytes(16).subspan(12, 4);
+    const float pitch = std::bit_cast<float>(static_cast<std::uint32_t>(pitchBytes[0]) | (static_cast<std::uint32_t>(pitchBytes[1]) << 8U)
+        | (static_cast<std::uint32_t>(pitchBytes[2]) << 16U) | (static_cast<std::uint32_t>(pitchBytes[3]) << 24U));
+    RequireNear(pitch, 30.0, 0.001, "with the keyframes' look");
+    controller.Spectate(12345, now);
+    Require(!controller.PlayingCameraPath(), "Following a player stops the path");
+    Require(controller.Snapshot(now).cameraKeyframes == 2, "The status counts the keyframes");
+}
+
+void ServerNameTagsAreCleanedForDisplay() {
+    namespace I = Oinkster::ReplayInjector;
+    Require(I::CleanPlayerName("\xC2\xA7iDeathBlocko\xC2\xA7" "8 [\xC2\xA7iU\xC2\xA7" "8]\n\xEE\x86\x8F \xC2\xA7p57.4K Hiders Killed")
+        == "DeathBlocko [U]", "Colour codes, the second line and icon glyphs are dropped");
+    Require(I::CleanPlayerName("\xC2\xA7" "7BunkerRoom55096") == "BunkerRoom55096", "A plain coloured name keeps its text");
+    Require(I::CleanPlayerName("Caf\xC3\xA9 Steve") == "Caf\xC3\xA9 Steve", "Ordinary Unicode is kept");
+    Require(I::CleanPlayerName("\xC2\xA7r\n") == "Player", "A name with nothing left falls back");
+}
+
+
+void NullMovementKeepsOnlyTheNewestKey() {
+    M::NullMovementFilter filter;
+    filter.Configure({{{'A', 'D'}, {}}});
+    std::array<bool, 256> held{};
+    std::vector<Oinkster::KeyMessage> out;
+    const auto send = [&](std::uint32_t key, bool pressed, bool repeated = false) {
+        held[key] = pressed;
+        out.clear();
+        return filter.Transform(key, pressed, repeated, held, out);
+    };
+    Require(!send('W', true), "Keys off a configured axis pass through untouched");
+    Require(send('A', true) && out.size() == 1 && out[0].key == 'A' && out[0].pressed, "The first key goes down");
+    Require(send('D', true) && out.size() == 2 && out[0].key == 'A' && !out[0].pressed && out[1].key == 'D' && out[1].pressed,
+        "Pressing the opposite key releases the older one first");
+    Require(send('A', true, true) && out.empty(), "Auto-repeat of the overridden key is swallowed");
+    Require(send('D', true, true) && out.size() == 1 && out[0].key == 'D', "Auto-repeat of the active key continues");
+    Require(send('D', false) && out.size() == 2 && out[0].key == 'D' && !out[0].pressed && out[1].key == 'A' && out[1].pressed,
+        "Releasing the newer key hands the axis back to the still-held older one");
+    Require(send('A', false) && out.size() == 1 && out[0].key == 'A' && !out[0].pressed, "The last release goes through");
+    Require(send('D', false) && out.empty(), "A release the game never saw down is not sent");
+    send('A', true);
+    filter.Reset();
+    held['A'] = false;
+    Require(send('D', true) && out.size() == 1 && out[0].key == 'D', "After a reset nothing stale is released");
+}
+
+void ChunkBordersProjectAroundThePlayer() {
+    // Camera at the origin looking down -Z (identity rotation), 90 degree FOV.
+    M::CameraView view{{8.0F, 70.0F, 8.0F}, {0.0F, 0.0F, 0.0F, 1.0F}, 1.5707964F};
+    const auto line = M::ProjectSegment(view, {8.0F, 70.0F, -2.0F}, {8.0F, 71.0F, -2.0F}, 200.0F, 100.0F, 0xFFFFFFFFU, 1.0F);
+    Require(line.has_value(), "A segment in front of the camera projects");
+    RequireNear(line->x1, 100.0, 1e-3, "Straight ahead lands on the screen centre");
+    RequireNear(line->y1, 50.0, 1e-3, "Eye level lands on the vertical centre");
+    Require(line->y2 < line->y1, "Up in the world is up on screen");
+    Require(!M::ProjectSegment(view, {8.0F, 70.0F, 20.0F}, {8.0F, 71.0F, 20.0F}, 200.0F, 100.0F, 0, 1.0F),
+        "A segment wholly behind the camera is dropped");
+    const auto clipped = M::ProjectSegment(view, {8.0F, 69.0F, 20.0F}, {8.0F, 69.0F, -20.0F}, 200.0F, 100.0F, 0, 1.0F);
+    Require(clipped && std::isfinite(clipped->x1) && std::isfinite(clipped->y1), "A segment crossing the camera is clipped, not dropped");
+    Require(clipped->x1 >= 0.0F && clipped->x1 <= 200.0F && clipped->y1 >= 0.0F && clipped->y1 <= 100.0F,
+        "Near-plane clipping also keeps projected endpoints on screen");
+
+    M::ChunkBorderStyle style;
+    style.gridSpacing = 0;
+    const auto corners = M::BuildChunkBorders(style, view, {8.0F, 70.0F, 8.0F}, 200.0F, 100.0F);
+    Require(!corners.lines.empty() && corners.lines.size() <= 16, "Corners only: at most the 16 lattice columns");
+    std::uint32_t strongestCurrent{};
+    std::uint32_t strongestNeighbor{};
+    for (const auto& corner : corners.lines) {
+        const auto rgb = corner.argb & 0x00FFFFFFU;
+        Require(rgb == (style.cornerColor & 0x00FFFFFFU) || rgb == (style.neighborColor & 0x00FFFFFFU),
+            "Corners retain the configured corner colours while distance changes opacity");
+        if (rgb == (style.cornerColor & 0x00FFFFFFU)) strongestCurrent = std::max(strongestCurrent, corner.argb >> 24U);
+        if (rgb == (style.neighborColor & 0x00FFFFFFU)) strongestNeighbor = std::max(strongestNeighbor, corner.argb >> 24U);
+    }
+    Require(strongestCurrent > strongestNeighbor, "The current chunk boundary is stronger than neighboring chunks");
+    style.gridSpacing = 2;
+    const auto grid = M::BuildChunkBorders(style, view, {8.0F, 70.0F, 8.0F}, 200.0F, 100.0F);
+    Require(grid.lines.size() > corners.lines.size(), "The wall grid adds lines");
+    float thinnest = std::numeric_limits<float>::max();
+    float thickest{};
+    bool sawGridColor{};
+    for (const auto& segment : grid.lines) {
+        thinnest = std::min(thinnest, segment.thickness);
+        thickest = std::max(thickest, segment.thickness);
+        sawGridColor |= (segment.argb & 0x00FFFFFFU) == (style.chunkColor & 0x00FFFFFFU);
+    }
+    Require(sawGridColor && thinnest < style.thickness && thickest > style.thickness,
+        "Minor wall lines are thinner while section boundaries and corner pillars are emphasized");
+    const auto negative = M::BuildChunkBorders(style, view, {-0.5F, 70.0F, -0.5F}, 200.0F, 100.0F);
+    Require(!negative.Empty(), "Negative coordinates use floor-division and still produce stable chunk borders");
+    Require(M::BuildChunkBorders(style, view, {NAN, 0.0F, 0.0F}, 200.0F, 100.0F).Empty(), "An invalid position draws nothing");
+}
+
+void PostProcessConstantsAreBounded() {
+    Oinkster::PostProcessSettings settings;
+    Require(settings.Identity(), "Defaults leave the frame unchanged");
+    settings.saturation = 9.0F;
+    settings.contrast = NAN;
+    settings.tint = 0xFF336699U;
+    settings.tintStrength = 0.5F;
+    settings.blur = 3.0F;
+    const auto constants = Oinkster::MakePostProcessConstants(1920.0F, 1080.0F, settings);
+    RequireNear(constants.grade[0], 2.0, 1e-6, "Saturation clamps");
+    RequireNear(constants.grade[1], 1.0, 1e-6, "A non-finite contrast falls back to neutral");
+    RequireNear(constants.tint[0], 0x33 / 255.0, 1e-6, "Tint red comes from the ARGB colour");
+    RequireNear(constants.tint[2], 0x99 / 255.0, 1e-6, "Tint blue comes from the ARGB colour");
+    RequireNear(constants.extra[1], 1.0 / 1920.0, 1e-9, "Texel size follows the display");
+    RequireNear(constants.extra[3], 1.0, 1e-6, "Blur strength clamps");
+    RequireNear(constants.projection[0], 2.0 / 1920.0, 1e-9, "The projection matches ImGui's");
+    static_assert(sizeof(Oinkster::PostProcessConstants) == 28 * sizeof(float));
+}
+
+void NewModuleMathFailsClosed() {
+    const auto start = At(10);
+    RequireNear(M::AttackRecovery({}, At(11), 500ms), 1.0, 1e-6, "No attack is ready");
+    RequireNear(M::AttackRecovery(start, start, 500ms), 0.0, 1e-6, "A new attack starts empty");
+    RequireNear(M::AttackRecovery(start, start + 250ms, 500ms), 0.5, 1e-6, "Attack recovery is linear");
+    RequireNear(M::AttackRecovery(start, start + 2s, 500ms), 1.0, 1e-6, "Attack recovery clamps ready");
+
+    const M::CameraView view{{0.0F, 0.0F, 0.0F}, {0.0F, 0.0F, 0.0F, 1.0F}, M::CameraMath::Pi * 0.5F};
+    const auto center = M::ProjectPoint(view, {0.0F, 0.0F, -5.0F}, 1920.0F, 1080.0F);
+    Require(center.has_value(), "A waypoint in front of the camera projects");
+    RequireNear(center->x, 960.0, 1e-4, "The forward point is horizontally centered");
+    RequireNear(center->y, 540.0, 1e-4, "The forward point is vertically centered");
+    RequireNear(center->depth, 5.0, 1e-6, "Projected depth is forward distance");
+    Require(!M::ProjectPoint(view, {0.0F, 0.0F, 5.0F}, 1920.0F, 1080.0F), "A point behind the camera is rejected");
+    Require(!M::ProjectPoint(view, {0.0F, 0.0F, -5.0F}, 0.0F, 1080.0F), "An invalid viewport is rejected");
+}
+
+void FoodAndScoreboardPacketsAreBounded() {
+    const auto string = [](Oinkster::RakNet::Writer& writer, std::string_view value) {
+        writer.VarU32(static_cast<std::uint32_t>(value.size()));
+        writer.Bytes(std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(value.data()), value.size()));
+    };
+
+    Oinkster::RakNet::Writer attributes;
+    attributes.VarU64(42);
+    attributes.VarU32(3);
+    const auto attribute = [&](std::string_view name, float maximum, float current) {
+        attributes.F32LE(0.0F);
+        attributes.F32LE(maximum);
+        attributes.F32LE(current);
+        attributes.F32LE(0.0F);
+        attributes.F32LE(maximum);
+        attributes.F32LE(maximum);
+        string(attributes, name);
+        attributes.VarU32(0);
+    };
+    attribute("minecraft:player.hunger", 20.0F, 17.0F);
+    attribute("minecraft:player.saturation", 20.0F, 4.5F);
+    attribute("minecraft:player.exhaustion", 40.0F, 2.0F);
+    attributes.VarU64(9001);
+    const auto food = M::ParseFoodAttributes(attributes.Data());
+    Require(food && food->hunger && food->saturation && food->exhaustion, "The bounded food attributes decode");
+    RequireNear(*food->hunger, 17.0, 1e-6, "Hunger keeps its current value");
+    RequireNear(*food->saturation, 4.5, 1e-6, "Saturation keeps its current value");
+    Oinkster::RakNet::Writer tooManyAttributes;
+    tooManyAttributes.VarU64(1);
+    tooManyAttributes.VarU32(65);
+    Require(!M::ParseFoodAttributes(tooManyAttributes.Data()), "An oversized attribute list fails closed");
+
+    Oinkster::RakNet::Writer displayBytes;
+    string(displayBytes, "sidebar");
+    string(displayBytes, "oinkster:test");
+    string(displayBytes, "Test board");
+    string(displayBytes, "dummy");
+    displayBytes.U32LE(1);
+    const auto display = M::ParseDisplayObjective(displayBytes.Data());
+    Require(display && display->slot == "sidebar" && display->objective == "oinkster:test"
+        && display->displayName == "Test board" && display->descending, "A sidebar objective decodes");
+
+    Oinkster::RakNet::Writer scores;
+    scores.U8(0);
+    scores.VarU32(1);
+    scores.VarU64(14);  // zig-zag encoded score id 7
+    string(scores, "oinkster:test");
+    scores.U32LE(42);
+    scores.U8(3);
+    string(scores, "Alice");
+    const auto update = M::ParseScoreUpdate(scores.Data());
+    Require(update && !update->remove && update->entries.size() == 1, "A scoreboard change decodes");
+    Require(update->entries.front().id == 7 && update->entries.front().score == 42
+        && update->entries.front().displayName == "Alice", "Scoreboard entry fields remain intact");
+    auto trailing = scores.Data();
+    trailing.push_back(0xFF);
+    Require(!M::ParseScoreUpdate(trailing), "Trailing scoreboard bytes fail closed");
+
+    Oinkster::RakNet::Writer remove;
+    string(remove, "oinkster:test");
+    const auto objective = M::ParseRemoveObjective(remove.Data());
+    Require(objective && *objective == "oinkster:test", "Objective removal decodes");
+}
+
+void BlueberryParityModulesCompose() {
+    Catalog catalog;
+    for (const auto capability : {Capability::InputFiltering, Capability::PerspectivePresentation, Capability::CameraPresentation,
+        Capability::LocalPlayerPosition}) {
+        catalog.manager.SetCapability(capability, {CapabilityState::Available, {}});
+    }
+    for (const auto* id : {"scroll-wheel-disabler", "sensitivity-multiplier", "null-movement", "modern-keyboard-handling",
+        "snap-look", "chunk-borders", "post-processing", "debug-menu"}) {
+        Require(catalog.manager.SetEnabled(id, true), "Parity module enables once its capabilities validate");
+    }
+    catalog.manager.SetModuleSetting("sensitivity-multiplier.horizontal", "9");
+    catalog.manager.SetModuleSetting("sensitivity-multiplier.vertical", "0.5");
+    Oinkster::MouseShaping shaping;
+    for (const auto* module : catalog.manager.EnabledModulesOf<Oinkster::IMouseShapingModule>()) module->ShapeMouse(shaping, true);
+    Require(shaping.blockWheel, "The wheel is blocked while gameplay owns the mouse");
+    RequireNear(shaping.sensitivityX, 3.0, 1e-6, "Horizontal sensitivity clamps");
+    RequireNear(shaping.sensitivityY, 0.5, 1e-6, "Vertical sensitivity applies");
+    Oinkster::MouseShaping menu;
+    for (const auto* module : catalog.manager.EnabledModulesOf<Oinkster::IMouseShapingModule>()) module->ShapeMouse(menu, false);
+    Require(!menu.blockWheel && menu.sensitivityX == 1.0F, "Game screens keep the vanilla mouse");
+
+    auto profile = M::CollectPresentationProfile(catalog.manager);
+    Require(!profile.perspective, "Snap look is idle until its key");
+    Require(profile.cameraPose && !profile.cameraPose->selection, "Chunk borders request the camera while the hidden debug overlay avoids target work");
+    (void)catalog.manager.PublishInput(Oinkster::KeyboardEvent{'V', true, false});
+    profile = M::CollectPresentationProfile(catalog.manager);
+    Require(profile.perspective && profile.perspective->perspective == Oinkster::CameraPerspective::ThirdPersonFront,
+        "Holding the key snaps to the front view");
+    (void)catalog.manager.PublishInput(Oinkster::KeyboardEvent{'V', false, false});
+    Require(!M::CollectPresentationProfile(catalog.manager).perspective, "Releasing it returns");
+
+    const auto restores = catalog.manager.EnabledModulesOf<Oinkster::IHeldKeyRestoreModule>();
+    Require(restores.size() == 1 && restores.front()->KeysToRestore().size() == 7, "Modern keyboard restores the seven movement keys");
+    Require(catalog.manager.EnabledModulesOf<Oinkster::IKeyTransformModule>().size() == 1, "Null movement transforms keys");
+    Require(catalog.manager.EnabledModulesOf<Oinkster::IPostProcessModule>().size() == 1, "Post processing grades the frame");
+
+    const auto debugModules = catalog.manager.EnabledModulesOf<Oinkster::IDebugOverlayModule>();
+    Require(debugModules.size() == 1, "The debug menu is a specialized two-sided overlay, not a movable HUD card");
+    auto* debug = debugModules.front();
+    Oinkster::PlayerTransform transform;
+    transform.capturedAt = At(1);
+    transform.position = {-0.5, 65.62, 31.5};
+    transform.yawDegrees = 180.0F;
+    transform.pitchDegrees = 10.0F;
+    transform.dimension = 0;
+    catalog.manager.Publish(transform);
+    Oinkster::RenderEvent gameplay;
+    gameplay.width = 1920.0F;
+    gameplay.height = 1080.0F;
+    gameplay.presentedAt = At(1);
+    gameplay.gameplayVisible = true;
+    catalog.manager.Publish(gameplay);
+    Require(!debug->DebugOverlay().visible, "The enabled debug overlay starts hidden");
+    (void)catalog.manager.PublishInput(Oinkster::KeyboardEvent{VK_F3, true, true});
+    Require(!debug->DebugOverlay().visible, "Repeated F3 input is ignored");
+    (void)catalog.manager.PublishInput(Oinkster::KeyboardEvent{VK_F3, true, false, true});
+    Require(!debug->DebugOverlay().visible, "F3 captured by the UI is ignored");
+    (void)catalog.manager.PublishInput(Oinkster::KeyboardEvent{VK_F3, true, false});
+    const auto overlay = debug->DebugOverlay();
+    Require(overlay.visible && overlay.left.size() == 2 && overlay.right.size() == 2,
+        "F3 reveals exact performance/world and build/display groups");
+    std::string text;
+    for (const auto& group : overlay.left) for (const auto& row : group.lines) text += row.text + '\n';
+    Require(text.find("Block: -1 64 31") != std::string::npos, "Block coordinates floor the feet position");
+    Require(text.find("Chunk: 15 15 in -1 1") != std::string::npos, "Chunk-relative position and chunk index");
+    Require(text.find("North") != std::string::npos, "Facing follows the Bedrock yaw convention");
+    profile = M::CollectPresentationProfile(catalog.manager);
+    Require(profile.cameraPose && profile.cameraPose->selection, "A visible debug target row requests block selection");
+    gameplay.gameplayVisible = false;
+    gameplay.presentedAt = At(2);
+    catalog.manager.Publish(gameplay);
+    Require(!debug->DebugOverlay().visible, "Menus and other non-gameplay screens hide the overlay without changing its toggle");
+    gameplay.gameplayVisible = true;
+    gameplay.presentedAt = At(3);
+    catalog.manager.Publish(gameplay);
+    const auto stale = debug->DebugOverlay();
+    std::string staleText;
+    for (const auto& group : stale.left) for (const auto& row : group.lines) staleText += row.text + '\n';
+    Require(stale.visible && staleText.find("XYZ: --") != std::string::npos && staleText.find("Block:") == std::string::npos,
+        "Returning to gameplay omits stale coordinate telemetry instead of presenting old values as current");
+    Require(catalog.manager.SetEnabled("debug-menu", false), "The debug module disables cleanly");
+    (void)catalog.manager.PublishInput(Oinkster::KeyboardEvent{VK_F3, true, false});
+    Require(catalog.manager.SetEnabled("debug-menu", true), "The debug module can be re-enabled");
+    catalog.manager.Publish(gameplay);
+    Require(!debug->DebugOverlay().visible, "Disabling the module removes F3 handling and resets hidden state");
+}
+
+
+// A PlayerList add entry in the 1.26.5203 layout, as recorded from servers:
+// marker, uuid, unique id, name, XUID, chat id, platform, the serialized
+// skin through FullId, then the variable tail.
+void WritePlayerListEntry(Oinkster::RakNet::Writer& writer, std::uint8_t uuidByte, std::string_view name, std::string_view xuid,
+    bool personaTail) {
+    const auto text = [&](std::string_view value) {
+        writer.VarU32(static_cast<std::uint32_t>(value.size()));
+        writer.Bytes(std::span(reinterpret_cast<const std::uint8_t*>(value.data()), value.size()));
+    };
+    writer.U8(1);
+    writer.U8(0);
+    for (int index = 0; index < 16; ++index) writer.U8(uuidByte);
+    writer.VarU64(84);
+    text(name);
+    text(xuid);
+    text("");
+    writer.U32LE(8);
+    text("skin-id");
+    text("playfab");
+    text(R"({"geometry":{"default":"geometry.humanoid.custom"}})");
+    writer.U32LE(64);
+    writer.U32LE(64);
+    std::vector<std::uint8_t> skin(64 * 64 * 4, 0);
+    // Head front base layer (8..15, 8..15) red; hat pixel at (40,8) blue.
+    for (int y = 8; y < 16; ++y) for (int x = 8; x < 16; ++x) {
+        const auto at = static_cast<std::size_t>((y * 64 + x) * 4);
+        skin[at] = 200; skin[at + 3] = 255;
+    }
+    const auto hat = static_cast<std::size_t>((8 * 64 + 40) * 4);
+    skin[hat + 2] = 220; skin[hat + 3] = 255;
+    writer.VarU32(static_cast<std::uint32_t>(skin.size()));
+    writer.Bytes(skin);
+    writer.VarU32(0);   // animations
+    writer.U32LE(0);    // cape width
+    writer.U32LE(0);    // cape height
+    text("");           // cape data
+    text(R"({"minecraft:geometry":[]})");
+    text("1.17.0");
+    text("");           // animation data
+    text("");           // cape id
+    text("full-id");
+    // The tail as observed (arm size, colour, flags, "true", a hash or an
+    // empty string, teacher/host/sub-client, player colour).
+    const std::array<std::uint8_t, 12> head{1, 0, 0, 0, 0xFF, 0, 0, 1, 0, 0, 1, 1};
+    writer.Bytes(head);
+    text("true");
+    text(personaTail ? "+BsRJfs0IrVNuQvTU0Wm2FuOaVC3Tzyi8qJA188xJio=" : "");
+    writer.U8(0); writer.U8(personaTail ? 1 : 0); writer.U8(0);
+    writer.U32LE(0xFFEDEDEDU);
+}
+
+void PlayerListPacketsBuildARoster() {
+    Oinkster::RakNet::Writer add;
+    add.VarU32(3);
+    WritePlayerListEntry(add, 0x11, "\xC2\xA7" "aAlpha", "2535400000000001", false);
+    WritePlayerListEntry(add, 0x22, "Bravo", "2535400000000002", true);
+    WritePlayerListEntry(add, 0x33, "Hub NPC", "0", false);
+    const auto parsed = M::ParsePlayerList(add.Data());
+    Require(parsed && !parsed->remove && parsed->players.size() == 3, "Every add entry is found past its skin");
+    Require(parsed->players[1].name == "Bravo" && parsed->players[1].xuid == "2535400000000002", "Names and XUIDs decode");
+    Require(parsed->players[0].skinWidth == 64 && parsed->players[0].skin.size() == 64 * 64 * 4, "The skin image is kept");
+    const auto face = M::HeadFace(64, 64, parsed->players[0].skin);
+    Require(face && (*face)[1] == 0xFFC80000U, "The head face is the base layer, ARGB");
+    Require((*face)[0] == 0xFF0000DCU, "The hat layer covers the base where opaque");
+
+    M::PlayerRoster roster;
+    roster.Apply(*parsed);
+    Require(roster.Players().size() == 3 && roster.Find("Alpha") != nullptr && roster.Find("alpha") != nullptr,
+        "Players are found by their cleaned name, case-insensitively");
+    Oinkster::RakNet::Writer remove;
+    remove.VarU32(1);
+    remove.U8(0);
+    remove.U8(1);
+    for (int index = 0; index < 16; ++index) remove.U8(0x22);
+    const auto removal = M::ParsePlayerList(remove.Data());
+    Require(removal && removal->remove && removal->players.size() == 1, "A removal carries uuids only");
+    roster.Apply(*removal);
+    Require(roster.Players().size() == 2 && roster.Find("Bravo") == nullptr, "Removed players leave the roster");
+
+    auto truncated = add.Data();
+    truncated.resize(truncated.size() / 2);
+    Require(!M::ParsePlayerList(truncated), "A truncated list is rejected, not half-read");
+    Require(!M::ParsePlayerList(std::vector<std::uint8_t>{1, 7, 7}), "An unknown marker is rejected");
+
+    Catalog catalog;
+    catalog.manager.SetCapability(Capability::PacketCapture, {CapabilityState::Available, {}});
+    Require(catalog.manager.SetEnabled("player-list", true), "The player list enables when packet capture is available");
+    Oinkster::RakNet::Writer whole;
+    whole.VarU32(M::GamePacket::PlayerList);
+    whole.Bytes(add.Data());
+    const auto wholeBytes = whole.Data();
+    catalog.manager.Publish(Oinkster::ReplayPacketEvent{At(1), 7, true, true, M::GamePacket::PlayerList,
+        std::string(reinterpret_cast<const char*>(wholeBytes.data()), wholeBytes.size())});
+    catalog.manager.Publish(Oinkster::ServerState{At(1), Oinkster::SessionKind::Server, L"The Hive", Oinkster::ServerNetwork::Hive});
+    Oinkster::RenderEvent frame;
+    frame.width = 1280.0F;
+    frame.height = 720.0F;
+    frame.presentedAt = At(1);
+    frame.gameplayVisible = true;
+    frame.keysDown = std::bitset<256>{};
+    frame.keysDown->set(VK_TAB);
+    catalog.manager.Publish(frame);
+    const auto listModules = catalog.manager.EnabledModulesOf<Oinkster::IPlayerListModule>();
+    Require(listModules.size() == 1, "The list exposes its typed renderer contract");
+    const auto view = listModules.front()->PlayerList();
+    Require(view.visible && view.title == "The Hive" && view.rows.size() == 2,
+        "Holding Tab shows the server roster and filters NPC entries");
+    Require(view.rows[0].name == "Alpha" && view.rows[1].name == "Bravo" && view.rows[0].hasFace,
+        "Player rows sort alphabetically and retain decoded heads");
+    catalog.manager.Publish(Oinkster::ServerState{At(2), Oinkster::SessionKind::None, L"", Oinkster::ServerNetwork::Local});
+    Require(listModules.front()->PlayerList().rows.empty(), "Disconnect clears the roster instead of leaking a stale session");
+}
+
+void ChatTitleAndFormPacketsDecode() {
+    // Recorded from The Hive on 1.26.5203.
+    const std::vector<std::uint8_t> raw{0x00, 0x00, 0x00, 0x05, 'H', 'e', 'l', 'l', 'o', 0x00, 0x00, 0x00};
+    const auto system = M::ParseText(raw);
+    Require(system && system->type == 0 && system->message == "Hello" && system->source.empty(), "A raw message decodes");
+    const std::vector<std::uint8_t> chat{0x00, 0x01, 0x01, 0x03, 'B', 'o', 'b', 0x02, 'h', 'i', 0x00, 0x00};
+    const auto said = M::ParseText(chat);
+    Require(said && said->type == 1 && said->source == "Bob" && said->message == "hi", "A chat message keeps its author");
+    const std::vector<std::uint8_t> translated{0x01, 0x02, 0x02, 0x03, 'k', 'e', 'y', 0x02, 0x01, 'a', 0x01, 'b'};
+    const auto keyed = M::ParseText(translated);
+    Require(keyed && keyed->parameters.size() == 2 && keyed->parameters[1] == "b", "Translation parameters decode");
+    Require(!M::ParseText(std::vector<std::uint8_t>{0x00, 0x05, 0x00}), "An unknown payload kind is rejected");
+    const std::vector<std::uint8_t> title{0x04, 0x04, 'W', 'i', 'n', '!'};
+    const auto shown = M::ParseTitle(title);
+    Require(shown && shown->type == 2 && shown->text == "Win!", "Title types are zigzag varints");
+    const std::vector<std::uint8_t> form{0x02, 0x02, '{', '}'};
+    const auto request = M::ParseFormRequest(form);
+    Require(request && request->id == 2 && request->json == "{}", "A form request carries its id and JSON");
+    const std::vector<std::uint8_t> packet{0x3F, 0x01, 0x00};
+    const auto split = M::SplitPacket(packet);
+    Require(split && split->id == 63 && split->body.size() == 2, "The header varint gives the packet id");
+}
+
+
+
+
+
+void HiveMessagesAreRecognised() {
+    // The Hive's own lines, with their colour codes.
+    const auto over = M::ClassifyHiveChat("\xC2\xA7" "c\xC2\xA7" "l\xC2\xBB \xC2\xA7r\xC2\xA7" "c\xC2\xA7" "lGame OVER!");
+    Require(over.kind == M::HiveEventKind::GameOver, "Game over is recognised through its formatting");
+    const auto connected = M::ClassifyHiveChat("\xC2\xA7" "aYou are connected to server name SKY-DUOS12");
+    Require(connected.kind == M::HiveEventKind::ConnectedServer && connected.value == "SKY-DUOS", "The game code drops the instance number");
+    const auto party = M::ClassifyHiveChat("\xC2\xA7" "b\xC2\xBB \xC2\xA7" "bTurboRed80\xC2\xA7" "b wants you to join their party!");
+    Require(party.kind == M::HiveEventKind::PartyInvite && party.value == "TurboRed80", "Party invites name the inviter");
+    const auto friendInvite = M::ClassifyHiveChat("\xC2\xA7" "aYou received a friend invite from \xC2\xA7" "bSome Player\xC2\xA7" "a!");
+    Require(friendInvite.kind == M::HiveEventKind::FriendInvite && friendInvite.value == "Some Player", "Friend invites name the sender");
+    const auto team = M::ClassifyHiveChat("\xC2\xA7" "e\xC2\xBB \xC2\xA7rYou are on the \xC2\xA7" "cRed Team\xC2\xA7r!");
+    Require(team.kind == M::HiveEventKind::TeamAssigned && team.value == "Red Team", "The player's team is remembered");
+    const auto out = M::ClassifyHiveChat("\xC2\xA7" "cRed Team \xC2\xA7" "7has been \xC2\xA7" "cELIMINATED\xC2\xA7" "7!");
+    Require(out.kind == M::HiveEventKind::TeamEliminated && out.value == "Red Team", "Team eliminations name the team");
+    Require(M::ClassifyHiveChat("\xC2\xA7" "7Indigo \xC2\xBB hello").kind == M::HiveEventKind::None, "Player chat is not an event");
+    Require(M::ClassifyHiveTitle("\xC2\xA7" "7You're spectating the \xC2\xA7" "as\xC2\xA7" "eh\xC2\xA7" "6o\xC2\xA7" "cw\xC2\xA7" "7!").kind == M::HiveEventKind::Died,
+        "Spectating after a death counts as dying");
+    const auto code = M::ClassifyHiveTitle("\xC2\xA7" "eJoin Code: \xC2\xA7" "fABC123");
+    Require(code.kind == M::HiveEventKind::JoinCode && code.value == "ABC123", "Join codes are read from the title");
+    Require(M::IsHiveHub("HUB-BED") && M::IsHiveHub("HUB") && !M::IsHiveHub("SKY"), "Hubs are never re-queued");
+
+    const std::string form = R"({"type":"form","title":"\u00a7lChoose Map","content":"","buttons":[{"text":"Random\nPick any"},{"text":"\u00a7aFort\n\u00a783 votes"},{"text":"Dragon Isle\n1 vote"}]})";
+    const auto buttons = M::MapVoteButtons(form);
+    Require(buttons && buttons->size() == 3 && (*buttons)[1] == "Fort", "Map buttons keep their first line without formatting");
+    const auto preferred = M::ParseMapList(" dragon isle, Fort ");
+    Require(M::ChooseMapButton(*buttons, preferred, {}) == 2u, "The first preferred map in the player's order wins");
+    const auto avoid = M::ParseMapList("fort");
+    Require(M::ChooseMapButton(*buttons, {}, avoid) == 2u, "Avoiding a map picks another real map, not Random");
+    Require(!M::ChooseMapButton(*buttons, {}, {}), "With no preferences nothing is voted");
+    Require(!M::MapVoteButtons(R"({"title":"Shop","buttons":[]})"), "Other forms are left alone");
+}
+
+void PacketSenderLearnsTheGamesOwnLayouts() {
+    namespace P = Oinkster::PacketSender;
+    // A CommandRequest the game sent for "/hub": header, command, then the
+    // origin/internal/version bytes kept verbatim.
+    const std::vector<std::uint8_t> sent{0x4D, 0x04, '/', 'h', 'u', 'b', 0x00, 0xAA, 0xBB, 0x00, 0x01, 0x00};
+    const auto learned = P::LearnCommandTemplate(sent);
+    Require(learned && learned->header.size() == 1 && learned->suffix.size() == 6, "The command's surroundings are learned");
+    const auto built = P::BuildCommand(*learned, "/q sky");
+    const std::vector<std::uint8_t> expected{0x4D, 0x06, '/', 'q', ' ', 's', 'k', 'y', 0x00, 0xAA, 0xBB, 0x00, 0x01, 0x00};
+    Require(built == expected, "A new command reuses the learned layout exactly");
+    Require(!P::LearnCommandTemplate(std::vector<std::uint8_t>{0x4D, 0x02, 'h', 'i', 0x00}), "Only slash commands are learned");
+    Require(!P::LearnCommandTemplate(std::vector<std::uint8_t>{0x09, 0x02, '/', 'a', 0x00}), "Other packets are not commands");
+
+    const std::vector<std::uint8_t> answered{0x65, 0x07, 0x01, 0x02, '1', '\n', 0x00};
+    const auto form = P::LearnFormTemplate(answered);
+    Require(form && form->beforeResponse == std::vector<std::uint8_t>{0x01} && form->suffix == std::vector<std::uint8_t>{0x00},
+        "The form response layout is learned around the response string");
+    const auto vote = P::BuildFormResponse(*form, 300, "2");
+    const std::vector<std::uint8_t> voteBytes{0x65, 0xAC, 0x02, 0x01, 0x01, '2', 0x00};
+    Require(vote == voteBytes, "Form ids are varints");
+    Require(!P::LearnFormTemplate(std::vector<std::uint8_t>{0x65, 0x07, 0x00, 0x00}), "A closed form is not a template");
+
+    std::optional<P::CommandTemplate> command;
+    std::optional<P::FormTemplate> formOut;
+    const auto text = P::EncodeTemplates(learned, form, "1.26.5203.0");
+    P::DecodeTemplates(text, "1.26.5203.0", command, formOut);
+    Require(command && command->suffix == learned->suffix && formOut && formOut->suffix == form->suffix, "Templates persist");
+    std::optional<P::CommandTemplate> other;
+    std::optional<P::FormTemplate> otherForm;
+    P::DecodeTemplates(text, "1.26.6000.0", other, otherForm);
+    Require(!other && !otherForm, "Another build never reuses a template");
+    other = *learned;
+    otherForm = *form;
+    P::DecodeTemplates("build=1.26.5203.0\ncommand=zz:00\nform=01:0:00\n", "1.26.5203.0", other, otherForm);
+    Require(!other && !otherForm, "Malformed persisted templates clear stale learned layouts and fail closed");
+}
+
+void SkinsSaveAndWear() {
+    Require(M::SanitizeSkinFileName("Steve:Main?") == L"Steve_Main_", "Skin filenames replace Windows path metacharacters");
+    Require(M::SanitizeSkinFileName("CON.txt") == L"_CON.txt", "Reserved Windows device names stay safe even with an extension");
+    Require(M::SanitizeSkinFileName("...  ") == L"player", "An empty sanitized name uses a stable fallback");
+    Require(M::SanitizeSkinFileName(std::string(80, 'a')).size() == 48, "Skin filenames are bounded");
+    std::vector<std::uint8_t> rgba(2 * 2 * 4, 0x7F);
+    const auto png = M::EncodePng(2, 2, rgba);
+    Require(png.size() > 57 && png[0] == 0x89 && png[1] == 'P' && png[12] == 'I' && png[13] == 'H', "A PNG starts with its signature and IHDR");
+    Require(std::string(png.end() - 8, png.end() - 4) == "IEND", "and ends with IEND");
+    Require(M::EncodePng(2, 2, std::vector<std::uint8_t>(3)).empty(), "A wrong-sized image encodes nothing");
+
+    Oinkster::RakNet::Writer add;
+    add.VarU32(1);
+    WritePlayerListEntry(add, 0x44, "Delta", "2535400000000004", true);
+    const auto parsed = M::ParsePlayerList(add.Data());
+    Require(parsed && parsed->players.size() == 1, "The entry parses");
+    const auto& skin = parsed->players[0].serializedSkin;
+    Require(skin.size() > 64 * 64 * 4 && skin[0] == 7 && std::string(skin.begin() + 1, skin.begin() + 8) == "skin-id",
+        "The serialized skin is kept from its ID onwards");
+    Require(skin.back() == '=', "and ends with its profile hash");
+    std::array<std::uint8_t, 16> uuid{};
+    uuid.fill(0x5A);
+    const auto packet = M::BuildPlayerSkinPacket(uuid, skin, "", "");
+    Require(packet[0] == 93 && packet[1] == 0x5A && packet.size() == 1 + 16 + skin.size() + 2, "PlayerSkin is uuid, skin, two names");
+    const auto split = M::SplitPacket(packet);
+    Require(split && split->id == 93, "The PlayerSkin header round-trips");
+}
+
 }
 
 int main() {
-    const std::array<std::pair<const char*, void (*)()>, 43> tests{{
+    const std::array<std::pair<const char*, void (*)()>, 97> tests{{
+        {"MoveableChatFadesAndFollowsTheChatScreen", MoveableChatFadesAndFollowsTheChatScreen},
         {"CatalogIdsAreUniqueAndWellFormed", CatalogIdsAreUniqueAndWellFormed},
+        {"NullMovementKeepsOnlyTheNewestKey", NullMovementKeepsOnlyTheNewestKey},
+        {"ChunkBordersProjectAroundThePlayer", ChunkBordersProjectAroundThePlayer},
+        {"PostProcessConstantsAreBounded", PostProcessConstantsAreBounded},
+        {"NewModuleMathFailsClosed", NewModuleMathFailsClosed},
+        {"FoodAndScoreboardPacketsAreBounded", FoodAndScoreboardPacketsAreBounded},
+        {"BlueberryParityModulesCompose", BlueberryParityModulesCompose},
+        {"PlayerListPacketsBuildARoster", PlayerListPacketsBuildARoster},
+        {"ChatTitleAndFormPacketsDecode", ChatTitleAndFormPacketsDecode},
+        {"HiveMessagesAreRecognised", HiveMessagesAreRecognised},
+        {"PacketSenderLearnsTheGamesOwnLayouts", PacketSenderLearnsTheGamesOwnLayouts},
+        {"SkinsSaveAndWear", SkinsSaveAndWear},
         {"NativeCatalogMatchesLauncherJson", NativeCatalogMatchesLauncherJson},
+        {"NowPlayingUsesCachedMediaAndQueuesActions", NowPlayingUsesCachedMediaAndQueuesActions},
         {"AvailabilityFollowsCapabilities", AvailabilityFollowsCapabilities},
         {"ModuleLifecycleIsIsolated", ModuleLifecycleIsIsolated},
+        {"ClickFiltersAreDeterministicAndFailSafe", ClickFiltersAreDeterministicAndFailSafe},
+        {"CompetitiveServerPolicyFailsClosed", CompetitiveServerPolicyFailsClosed},
         {"ClickGuiViewsAndFavorites", ClickGuiViewsAndFavorites},
         {"SettingParsingAndNormalization", SettingParsingAndNormalization},
         {"ModuleSettingsRoundTripThroughManager", ModuleSettingsRoundTripThroughManager},
         {"SettingsDocumentRoundTripsAndMigrates", SettingsDocumentRoundTripsAndMigrates},
+        {"SettingsProfilesSaveSwitchAndRemove", SettingsProfilesSaveSwitchAndRemove},
         {"SettingsApplyAndCapturePreserveDeferredModules", SettingsApplyAndCapturePreserveDeferredModules},
         {"KeybindConflictsAndReservedKeys", KeybindConflictsAndReservedKeys},
         {"RollingFpsAndFrameTime", RollingFpsAndFrameTime},
@@ -1765,15 +4202,53 @@ int main() {
         {"HitDistanceUsesNearestBoundingBoxPoint", HitDistanceUsesNearestBoundingBoxPoint},
         {"EquipmentWarningsAreNotSpammy", EquipmentWarningsAreNotSpammy},
         {"CrosshairGeometryAndPresentation", CrosshairGeometryAndPresentation},
+        {"CrosshairSourceAndPerspective", CrosshairSourceAndPerspective},
+        {"CrosshairDrawnAndGameCopy", CrosshairDrawnAndGameCopy},
+        {"GameCrosshairTextureSource", GameCrosshairTextureSource},
+        {"UserResourcePackParsing", UserResourcePackParsing},
+        {"ResourcePackEntriesRoundTripUnknownFields", ResourcePackEntriesRoundTripUnknownFields},
+        {"VsyncPolicyUsesOnlyLegalTearingPresents", VsyncPolicyUsesOnlyLegalTearingPresents},
+        {"ResourcePackDisplayRotatesUserPacks", ResourcePackDisplayRotatesUserPacks},
+        {"CameraMathMatchesGameConvention", CameraMathMatchesGameConvention},
+        {"VisualPresentationModulesCompose", VisualPresentationModulesCompose},
         {"SubtitlesExpireDeduplicateAndOrient", SubtitlesExpireDeduplicateAndOrient},
         {"ChatPresentationTransforms", ChatPresentationTransforms},
         {"SprintAndFramePacingStayWithinPlayerControls", SprintAndFramePacingStayWithinPlayerControls},
+        {"ToggleSneakResetsOutsideGameplay", ToggleSneakResetsOutsideGameplay},
         {"JsonParserIsStrictAndBounded", JsonParserIsStrictAndBounded},
         {"SignatureSelectionFailsClosed", SignatureSelectionFailsClosed},
         {"WorldTelemetryRollsBackOutsideMinecraft", WorldTelemetryRollsBackOutsideMinecraft},
         {"ConcurrentPublishSettingsAndRendering", ConcurrentPublishSettingsAndRendering},
         {"PreservedSkinAndInputTests", PreservedSkinAndInputTests},
         {"PreservedShutdownTests", PreservedShutdownTests},
+        {"ReplayFileRoundTripsAndRecovers", ReplayFileRoundTripsAndRecovers},
+        {"ReplayTimelineBuildsSamplesAndMarks", ReplayTimelineBuildsSamplesAndMarks},
+        {"ReplayTimelineCollapsesRecordingPauses", ReplayTimelineCollapsesRecordingPauses},
+        {"ReplayTimelineInterpolatesAndClamps", ReplayTimelineInterpolatesAndClamps},
+        {"ReplayTimelineSkipsMalformedCamera", ReplayTimelineSkipsMalformedCamera},
+        {"ReplaySummaryReadsPartial", ReplaySummaryReadsPartial},
+        {"ReplayCaptureParsesHeadersAndClassifies", ReplayCaptureParsesHeadersAndClassifies},
+        {"ReplayModRecordsWorldSessions", ReplayModRecordsWorldSessions},
+        {"RakNetFramesAcksAndSplits", RakNetFramesAcksAndSplits},
+        {"ReplayPlaybackHandshakeAndPacing", ReplayPlaybackHandshakeAndPacing},
+        {"ReplayPlaybackUsesActiveRecordingTime", ReplayPlaybackUsesActiveRecordingTime},
+        {"ReplayPlaybackRecreatesTheRecordingPlayer", ReplayPlaybackRecreatesTheRecordingPlayer},
+        {"ReplayPlaybackSeeksBothWays", ReplayPlaybackSeeksBothWays},
+        {"ReplayInjectorTakesOverOnlyALocalWorld", ReplayInjectorTakesOverOnlyALocalWorld},
+        {"ReplayRewindPutsPlacedBlocksBack", ReplayRewindPutsPlacedBlocksBack},
+        {"ReplayPlayersAreTrackedAndPicked", ReplayPlayersAreTrackedAndPicked},
+        {"ReplayExitLeavesTheWorld", ReplayExitLeavesTheWorld},
+        {"ReplayWorldCleanupFindsOnlyItsOwnWorld", ReplayWorldCleanupFindsOnlyItsOwnWorld},
+        {"ReplayViewHidesTheRecordingPlayer", ReplayViewHidesTheRecordingPlayer},
+        {"ReplayRecorderFoundUnderAnotherListId", ReplayRecorderFoundUnderAnotherListId},
+        {"ReplayRecorderFoundInLargeServerList", ReplayRecorderFoundInLargeServerList},
+        {"ReplayOldHeightChunksAreModernized", ReplayOldHeightChunksAreModernized},
+        {"ServerBlocksBecomeABehaviorPack", ServerBlocksBecomeABehaviorPack},
+        {"CameraKeyframesMakeASmoothPath", CameraKeyframesMakeASmoothPath},
+        {"ReplayCameraFliesAlongThePath", ReplayCameraFliesAlongThePath},
+        {"CameraKeyframesEaseAndCut", CameraKeyframesEaseAndCut},
+        {"VideosEncodeToMp4", VideosEncodeToMp4},
+        {"ServerNameTagsAreCleanedForDisplay", ServerNameTagsAreCleanedForDisplay},
         {"ModuleLifecycleIsIsolated (repeat)", ModuleLifecycleIsIsolated},
     }};
     int failed = 0;

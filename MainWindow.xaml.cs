@@ -19,7 +19,10 @@ public sealed partial class MainWindow : Window
         ExtendsContentIntoTitleBar = true;
         SetTitleBar(AppTitleBar);
 
-        AppWindow.SetIcon("Assets/AppIcon.ico");
+        // Absolute path: the taskbar button and its hover thumbnail both come
+        // from this window icon, and a relative path only resolves when the
+        // working directory happens to be the app folder.
+        AppWindow.SetIcon(Path.Combine(AppContext.BaseDirectory, "Assets", "OinksterAppIcon.ico"));
         AppWindow.Resize(new Windows.Graphics.SizeInt32(1180, 760));
 
         // Navigate the root frame to the main page on startup.

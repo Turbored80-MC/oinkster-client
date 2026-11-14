@@ -1,9 +1,11 @@
 #include "Oinkster/WorldTelemetry.hpp"
 #include "Oinkster/ModuleManager.hpp"
 #include "Oinkster/HookManager.hpp"
+#include "Oinkster/CameraTelemetry.hpp"
 #include "Oinkster/CombatTelemetry.hpp"
 #include "Oinkster/Diagnostics.hpp"
 #include "Oinkster/PlayerSkinTelemetry.hpp"
+#include "Oinkster/PresentationAdapter.hpp"
 #include "Oinkster/PlayerStateTelemetry.hpp"
 #include "Oinkster/ResourcePackTelemetry.hpp"
 #include "Oinkster/SafeMemory.hpp"
@@ -17,6 +19,7 @@
 #include <atomic>
 #include <cstring>
 #include <format>
+#include <mutex>
 #include <string>
 #include <utility>
 
@@ -35,6 +38,12 @@ void* renderLevelPrepTarget{};
 // the same disable -> drain -> remove sequence PlayerSkinTelemetry and
 // MouseInputBlocker use for their hooks.
 std::atomic_uint32_t activeCallbacks{};
+// Steady-clock ticks of the last frame Minecraft prepared a level for
+// rendering; 0 = never. Read from the Present thread to tell "in a world"
+// apart from the main menu and other out-of-world screens.
+std::atomic<SteadyClock::rep> lastLevelFrameTicks{};
+std::mutex viewMutex;
+std::optional<View> latestView;
 // Render-thread only: throttles publishing to ~60 Hz.
 SteadyTime lastPublished{};
 constexpr auto PublishInterval = std::chrono::milliseconds(16);
@@ -95,6 +104,7 @@ void HookedRenderLevelPrep(void* screen, void* screenContext, void* levelRendere
     // must never clear it while this hook is still enabled.
     if (originalRenderLevelPrep) originalRenderLevelPrep(screen, screenContext, levelRenderer, actor);
     if (!attached.load(std::memory_order_acquire) || !moduleManager || !levelRenderer) return;
+    lastLevelFrameTicks.store(SteadyClock::now().time_since_epoch().count(), std::memory_order_release);
 
     // _renderLevelPrep's Actor& is the local render player. Reuse this
     // already-validated hook as the skin reader's ownership source instead
@@ -102,6 +112,7 @@ void HookedRenderLevelPrep(void* screen, void* screenContext, void* levelRendere
     // PlayerSkinTelemetry re-checks the object's RTTI and every pointer read
     // before accepting an atlas, so a changed argument contract fails closed.
     PlayerSkinTelemetry::ObserveLocalPlayer(actor);
+    PresentationAdapter::ObserveLocalPlayer(actor);
 
     void* levelRendererPlayer{};
     if (!SafeMemory::ReadField(levelRenderer, LevelRenderer_LevelRendererPlayer, levelRendererPlayer)
@@ -131,12 +142,30 @@ void HookedRenderLevelPrep(void* screen, void* screenContext, void* levelRendere
     // Ping and world identity, on their own ~1 s cadence.
     SessionTelemetry::Observe(actor, now);
     ResourcePackTelemetry::Observe(actor, now);
+    CameraTelemetry::Observe(actor, now);
     // Hurt-timer driven combat events, from the unadjusted eye position.
     CombatTelemetry::Observe(actor, {position[0], position[1], position[2]}, transform, now);
+    {
+        std::scoped_lock lock(viewMutex);
+        latestView = View{now, {position[0], position[1], position[2]}, transform.yawDegrees, transform.pitchDegrees};
+    }
     lastPublished = now;
     moduleManager->Publish(transform);
 }
 
+}
+
+bool Attached() noexcept { return attached.load(std::memory_order_acquire); }
+
+std::optional<View> LatestView() noexcept {
+    std::scoped_lock lock(viewMutex);
+    return latestView;
+}
+
+bool LevelRenderedWithin(SteadyTime now, SteadyClock::duration window) noexcept {
+    const auto ticks = lastLevelFrameTicks.load(std::memory_order_acquire);
+    if (ticks == 0) return false;
+    return now - SteadyTime(SteadyClock::duration(ticks)) <= window;
 }
 
 bool Install(ModuleManager& modules, std::wstring& detail) noexcept {
@@ -182,9 +211,11 @@ bool Install(ModuleManager& modules, std::wstring& detail) noexcept {
     PlayerStateTelemetry::Attach(modules);
     CombatTelemetry::Attach(modules);
     ResourcePackTelemetry::Attach(modules);
+    CameraTelemetry::Attach(modules);
     lastPublished = {};
     lastSampleLogged = {};
     samplesLogged = 0;
+    lastLevelFrameTicks.store(0, std::memory_order_release);
     attached.store(true);
     detail = L"World telemetry attached (camera position).";
     modules.SetCapability(Capability::LocalPlayerPosition, {CapabilityState::Available, {}});
@@ -223,6 +254,7 @@ void Remove() noexcept {
             PlayerStateTelemetry::Detach();
     CombatTelemetry::Detach();
     ResourcePackTelemetry::Detach();
+    CameraTelemetry::Detach();
             moduleManager = nullptr;
             return;
         }
@@ -234,6 +266,7 @@ void Remove() noexcept {
     PlayerStateTelemetry::Detach();
     CombatTelemetry::Detach();
     ResourcePackTelemetry::Detach();
+    CameraTelemetry::Detach();
     moduleManager = nullptr;
 }
 

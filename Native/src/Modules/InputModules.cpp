@@ -9,6 +9,91 @@
 
 namespace Oinkster::Modules {
 
+void ClickDebouncer::Configure(std::chrono::milliseconds left, std::chrono::milliseconds right, bool linked) noexcept {
+    left_ = std::max(left, std::chrono::milliseconds(10));
+    right_ = linked ? left_ : std::max(right, std::chrono::milliseconds(10));
+}
+
+bool ClickDebouncer::Allow(std::uint32_t button, SteadyTime at) noexcept {
+    auto* last = button == 1U ? &lastLeft_ : button == 2U ? &lastRight_ : nullptr;
+    const auto interval = button == 1U ? left_ : right_;
+    if (!last) return true;
+    if (*last && at >= **last && at - **last < interval) return false;
+    *last = at;
+    return true;
+}
+
+void NullMovementFilter::Configure(std::array<Axis, 2> axes) noexcept {
+    axes_ = axes;
+    Reset();
+}
+
+bool NullMovementFilter::Transform(std::uint32_t key, bool pressed, bool repeated,
+    const std::array<bool, 256>& physical, std::vector<KeyMessage>& out) {
+    if (key == 0 || key >= 256) return false;
+    std::uint32_t other = 0;
+    for (const auto& axis : axes_) {
+        if (axis.first == 0 || axis.second == 0 || axis.first == axis.second) continue;
+        if (key == axis.first) other = axis.second;
+        else if (key == axis.second) other = axis.first;
+    }
+    if (other == 0 || other >= 256) return false;
+    if (pressed) {
+        // Auto-repeat only continues a key the game already holds.
+        if (repeated) {
+            if (sent_[key]) out.push_back({key, true});
+            return true;
+        }
+        if (sent_[other]) {
+            out.push_back({other, false});
+            sent_[other] = false;
+        }
+        out.push_back({key, true});
+        sent_[key] = true;
+        return true;
+    }
+    if (sent_[key]) {
+        out.push_back({key, false});
+        sent_[key] = false;
+    }
+    if (physical[other] && !sent_[other]) {
+        out.push_back({other, true});
+        sent_[other] = true;
+    }
+    return true;
+}
+
+void NullMovementFilter::Reset() noexcept { sent_ = {}; }
+
+void ClickDebouncer::Clear() noexcept {
+    lastLeft_.reset();
+    lastRight_.reset();
+}
+
+void CpsLimiter::Configure(std::size_t left, std::size_t right) noexcept {
+    leftLimit_ = std::clamp<std::size_t>(left, 1, 30);
+    rightLimit_ = std::clamp<std::size_t>(right, 1, 30);
+}
+
+bool CpsLimiter::Allow(std::uint32_t button, SteadyTime at) noexcept {
+    auto* window = button == 1U ? &left_ : button == 2U ? &right_ : nullptr;
+    auto* last = button == 1U ? &lastLeft_ : button == 2U ? &lastRight_ : nullptr;
+    const auto limit = button == 1U ? leftLimit_ : rightLimit_;
+    if (!window || !last) return true;
+    if (*last && at < **last) window->Clear();
+    *last = at;
+    if (window->Count(at, std::chrono::seconds(1)) >= limit) return false;
+    window->Add(at);
+    return true;
+}
+
+void CpsLimiter::Clear() noexcept {
+    left_.Clear();
+    right_.Clear();
+    lastLeft_.reset();
+    lastRight_.reset();
+}
+
 void InputLatencyMeter::OnInput(SteadyTime at) {
     if (!pending_ || at < *pending_) pending_ = at;
 }
@@ -79,10 +164,14 @@ public:
     CpsModule(ModuleMetadata metadata, HudLayout layout, SharedServices&)
         : HudModuleBase(std::move(metadata), {
             BoolSetting("show-right", "Show right clicks", true),
+            ChoiceSetting("count-mode", "Count", "physical", {
+                {"physical", "Physical clicks"}, {"accepted", "Clicks accepted by filters"}},
+                "Physical preserves raw device telemetry; accepted excludes clicks discarded by DC Prevent or CPS Cap."),
             ChoiceSetting("style", "Style", "labelled", {{"labelled", "CPS  L 9  R 2"}, {"compact", "9 | 2"}})}, layout) {}
     void OnSettingsChanged(const SettingsReader& settings) override {
         std::scoped_lock lock(mutex_);
         showRight_ = settings.Bool("show-right");
+        acceptedOnly_ = settings.Choice("count-mode") == "accepted";
         compact_ = settings.Choice("style") == "compact";
     }
     void OnEnable() override { Reset(); }
@@ -91,6 +180,7 @@ public:
         // Clicks the ClickGUI consumed never reached gameplay - not counted.
         if (event.uiCaptured || !event.pressed) return;
         std::scoped_lock lock(mutex_);
+        if (acceptedOnly_ && event.IsCancelled()) return;
         if (event.changedButton == 1U) left_.Add(event.occurredAt);
         else if (event.changedButton == 2U) right_.Add(event.occurredAt);
     }
@@ -120,6 +210,7 @@ private:
     std::size_t leftCount_{};
     std::size_t rightCount_{};
     bool showRight_{true};
+    bool acceptedOnly_{};
     bool compact_{};
 };
 
@@ -157,7 +248,7 @@ public:
     }
     void OnMouse(const MouseEvent& event) override {
         if (event.changedButton != 1U && event.changedButton != 2U) return;
-        if (event.pressed && event.uiCaptured) return;
+        if (event.pressed && (event.uiCaptured || event.IsCancelled())) return;
         std::scoped_lock lock(mutex_);
         const bool left = event.changedButton == 1U;
         (left ? leftDown_ : rightDown_) = event.pressed;
@@ -296,10 +387,90 @@ private:
     InputLatencyMeter meter_;
     std::string display_{"average"};
 };
+
+class DcPreventModule final : public HudModuleBase<> {
+public:
+    DcPreventModule(ModuleMetadata metadata, HudLayout layout, SharedServices&)
+        : HudModuleBase(std::move(metadata), {
+            IntSetting("left-ms", "Left debounce", 20, 10, 1000, "%d ms",
+                "Clicks inside this interval are discarded; the interval can never be shorter than 10 ms."),
+            IntSetting("right-ms", "Right debounce", 20, 10, 1000, "%d ms"),
+            BoolSetting("linked", "Link left and right", true)}, layout) {}
+    void OnSettingsChanged(const SettingsReader& settings) override {
+        std::scoped_lock lock(mutex_);
+        filter_.Configure(std::chrono::milliseconds(settings.Int("left-ms")),
+            std::chrono::milliseconds(settings.Int("right-ms")), settings.Bool("linked"));
+    }
+    void OnEnable() override { Reset(); }
+    void OnDisable() override { Reset(); }
+    void OnMouse(const MouseEvent& event) override {
+        if (event.uiCaptured || event.IsCancelled() || !event.pressed
+            || (event.changedButton != 1U && event.changedButton != 2U)) return;
+        std::scoped_lock lock(mutex_);
+        if (filter_.Allow(event.changedButton, event.occurredAt)) return;
+        ++suppressed_;
+        event.Cancel();
+    }
+    [[nodiscard]] HudContent Content() const override {
+        std::scoped_lock lock(mutex_);
+        return {{{std::format("DC Prevent  {} suppressed", suppressed_),
+            suppressed_ == 0 ? HudTone::Muted : HudTone::Good}}, {}, {}};
+    }
+
+private:
+    void Reset() {
+        std::scoped_lock lock(mutex_);
+        filter_.Clear();
+        suppressed_ = 0;
+    }
+    ClickDebouncer filter_;
+    std::uint64_t suppressed_{};
+};
+
+class CpsCapModule final : public HudModuleBase<> {
+public:
+    CpsCapModule(ModuleMetadata metadata, HudLayout layout, SharedServices&)
+        : HudModuleBase(std::move(metadata), {
+            IntSetting("left-cps", "Left CPS limit", 15, 1, 30, "%d CPS"),
+            IntSetting("right-cps", "Right CPS limit", 15, 1, 30, "%d CPS")}, layout) {}
+    void OnSettingsChanged(const SettingsReader& settings) override {
+        std::scoped_lock lock(mutex_);
+        filter_.Configure(static_cast<std::size_t>(settings.Int("left-cps")),
+            static_cast<std::size_t>(settings.Int("right-cps")));
+    }
+    void OnEnable() override { Reset(); }
+    void OnDisable() override { Reset(); }
+    void OnMouse(const MouseEvent& event) override {
+        // DC Prevent is registered first at the same Immediate priority. A
+        // click it rejects never consumes CPS Cap's rolling-window budget.
+        if (event.uiCaptured || event.IsCancelled() || !event.pressed
+            || (event.changedButton != 1U && event.changedButton != 2U)) return;
+        std::scoped_lock lock(mutex_);
+        if (filter_.Allow(event.changedButton, event.occurredAt)) return;
+        ++suppressed_;
+        event.Cancel();
+    }
+    [[nodiscard]] HudContent Content() const override {
+        std::scoped_lock lock(mutex_);
+        return {{{std::format("CPS Cap  {} suppressed", suppressed_),
+            suppressed_ == 0 ? HudTone::Muted : HudTone::Good}}, {}, {}};
+    }
+
+private:
+    void Reset() {
+        std::scoped_lock lock(mutex_);
+        filter_.Clear();
+        suppressed_ = 0;
+    }
+    CpsLimiter filter_;
+    std::uint64_t suppressed_{};
+};
 }
 
 std::unique_ptr<IModule> MakeCps(ModuleMetadata m, HudLayout l, SharedServices& s) { return std::make_unique<CpsModule>(std::move(m), l, s); }
 std::unique_ptr<IModule> MakeKeystrokes(ModuleMetadata m, HudLayout l, SharedServices& s) { return std::make_unique<KeystrokesModule>(std::move(m), l, s); }
 std::unique_ptr<IModule> MakeInputLatency(ModuleMetadata m, HudLayout l, SharedServices& s) { return std::make_unique<InputLatencyModule>(std::move(m), l, s); }
+std::unique_ptr<IModule> MakeDcPrevent(ModuleMetadata m, HudLayout l, SharedServices& s) { return std::make_unique<DcPreventModule>(std::move(m), l, s); }
+std::unique_ptr<IModule> MakeCpsCap(ModuleMetadata m, HudLayout l, SharedServices& s) { return std::make_unique<CpsCapModule>(std::move(m), l, s); }
 
 }

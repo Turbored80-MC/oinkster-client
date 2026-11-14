@@ -1,6 +1,7 @@
 #include "Oinkster/Modules/Factories.hpp"
 #include "Oinkster/Modules/AccessibilityLogic.hpp"
 #include "Oinkster/Modules/HudFormat.hpp"
+#include "Oinkster/Modules/PacketLogic.hpp"
 #include "Oinkster/Modules/TelemetryLogic.hpp"
 #include <Windows.h>
 #include <algorithm>
@@ -177,6 +178,26 @@ std::wstring PresentChatLine(const ChatEvent& event, const ChatPresentation& opt
     return line;
 }
 
+float ChatLineAlpha(SteadyClock::duration age, float visibleSeconds) noexcept {
+    if (!(visibleSeconds > 0.0F)) return 0.0F;
+    const float elapsed = std::chrono::duration<float>(age).count();
+    if (elapsed < 0.0F) return 1.0F;
+    const float remaining = std::clamp((1.0F - elapsed / visibleSeconds) * 10.0F, 0.0F, 1.0F);
+    return remaining * remaining;
+}
+
+void ChatScreenTracker::Update(bool gameplayVisible, SteadyTime now) noexcept {
+    if (gameplayVisible) {
+        open_ = false;
+        // The HUD hides a moment after the key (debounced); keep the key
+        // pending until then, but never past the window.
+        if (keyAt_ && now - *keyAt_ > OpenWindow) keyAt_.reset();
+        return;
+    }
+    if (keyAt_ && now - *keyAt_ <= OpenWindow) open_ = true;
+    keyAt_.reset();
+}
+
 bool SprintController::WantsSprint(const SprintInputs& inputs) const noexcept {
     if (!inputs.focused || inputs.menuVisible || !inputs.gameplayHasCursor) return false;
     if (!inputs.forwardHeld || inputs.sneakHeld) return false;
@@ -315,6 +336,147 @@ private:
     std::size_t lines_{8};
 };
 
+// A draggable replacement for the game's chat. Presets: Java (bottom-left,
+// newest line at the bottom, grows upward, lines fade after ~10 s) and
+// Bedrock (top-left, same fading). While the chat screen is open it shows
+// the longer history at full opacity.
+class MoveableChatModule final : public HudModuleBase<IChatReplacementModule, IPacketObserverModule> {
+public:
+    static constexpr std::size_t MaxHistory = 100;
+    static constexpr HudLayout JavaLayout{0.01F, 0.86F};
+    static constexpr HudLayout BedrockLayout{0.01F, 0.04F};
+    MoveableChatModule(ModuleMetadata metadata, HudLayout, SharedServices&)
+        : HudModuleBase(std::move(metadata), {
+            ChoiceSetting("preset", "Preset", "java", {
+                {"java", "Java: bottom-left, grows upward"}, {"bedrock", "Bedrock: top-left"}, {"custom", "Custom"}},
+                "Picking a preset moves the chat to its spot; drag it anywhere afterwards."),
+            ShownWhen(BoolSetting("grow-upward", "Grow upward", true, "New lines push older ones up."), "preset", {"custom"}),
+            ShownWhen(BoolSetting("fade", "Fade old lines", true), "preset", {"custom"}),
+            ShownWhen(BoolSetting("line-backdrops", "Per-line backdrop", true, "A dark strip behind each line instead of one panel."),
+                "preset", {"custom"}),
+            IntSetting("visible-seconds", "Line lifetime", 10, 2, 60, "%d s", "How long a new line stays before fading."),
+            IntSetting("lines", "Lines shown", 10, 1, 20),
+            IntSetting("open-lines", "Lines while chat is open", 20, 5, 50),
+            IntSetting("width", "Width", 320, 150, 640, "%d px"),
+            BoolSetting("hide-vanilla", "Hide vanilla chat", true,
+                "Lines no longer reach the game's chat (including its history); turning this off restores it."),
+            BoolSetting("timestamps", "Timestamps", false),
+            BoolSetting("strip-formatting", "Strip color/format codes", true),
+            KeySetting("chat-key", "Game chat key", 'T', "Must match Minecraft's chat binding; / always counts.")},
+            JavaLayout), history_(MaxHistory) {}
+    void OnSettingsChanged(const SettingsReader& settings) override {
+        std::string preset = settings.Choice("preset");
+        bool moved = false;
+        {
+            std::scoped_lock lock(mutex_);
+            moved = !preset_.empty() && preset != preset_ && preset != "custom";
+            preset_ = preset;
+            if (preset_ == "custom") {
+                growUpward_ = settings.Bool("grow-upward");
+                fade_ = settings.Bool("fade");
+                lineBackdrops_ = settings.Bool("line-backdrops");
+            } else {
+                growUpward_ = preset_ == "java";
+                fade_ = true;
+                lineBackdrops_ = true;
+            }
+            visibleSeconds_ = static_cast<float>(settings.Int("visible-seconds"));
+            lines_ = static_cast<std::size_t>(settings.Int("lines"));
+            openLines_ = static_cast<std::size_t>(settings.Int("open-lines"));
+            width_ = static_cast<float>(settings.Int("width"));
+            hideVanilla_ = settings.Bool("hide-vanilla");
+            options_.timestamps = settings.Bool("timestamps");
+            options_.stripFormatting = settings.Bool("strip-formatting");
+            chatKey_ = settings.Key("chat-key");
+        }
+        if (moved) {
+            HudLayout layout = Layout();
+            const HudLayout target = preset == "java" ? JavaLayout : BedrockLayout;
+            layout.normalizedX = target.normalizedX;
+            layout.normalizedY = target.normalizedY;
+            SetLayout(layout);
+        }
+    }
+    void OnDisable() override {
+        std::scoped_lock lock(mutex_);
+        history_.Clear();
+        tracker_.Reset();
+    }
+    // Chat arrives as the server's Text packets (packet capture): the game's
+    // chat-line sink never sees most lines.
+    [[nodiscard]] bool WantsPacket(std::uint32_t packetId) const noexcept override { return packetId == GamePacket::Text; }
+    void OnReplayPacket(const ReplayPacketEvent& event) override {
+        const auto packet = SplitPacket(std::span(reinterpret_cast<const std::uint8_t*>(event.bytes.data()), event.bytes.size()));
+        if (!packet || packet->id != GamePacket::Text) return;
+        const auto text = ParseText(packet->body);
+        if (!text) return;
+        auto line = ChatLineFromText(*text);
+        if (!line) return;
+        if (line->size() > 512) line->resize(512);
+        std::scoped_lock lock(mutex_);
+        history_.Push({ChatEvent{FromUtf8(*line), {}, std::chrono::system_clock::now()}, event.capturedAt});
+    }
+    void OnKeyboard(const KeyboardEvent& event) override {
+        if (event.uiCaptured || !event.pressed || event.repeated) return;
+        std::scoped_lock lock(mutex_);
+        if ((chatKey_ != 0 && event.key == chatKey_) || event.key == VK_OEM_2) tracker_.OnChatKey(event.occurredAt);
+    }
+    void OnRender(const RenderEvent& event) override {
+        std::scoped_lock lock(mutex_);
+        NoteRender(event);
+        tracker_.Update(event.gameplayVisible || event.menuVisible, event.presentedAt);
+    }
+    [[nodiscard]] bool ReplacesVanillaChat() const override { std::scoped_lock lock(mutex_); return hideVanilla_; }
+    [[nodiscard]] HudContent Content() const override {
+        std::scoped_lock lock(mutex_);
+        HudContent content;
+        content.anchorBottom = growUpward_;
+        content.wrapWidth = width_;
+        content.lineBackdrops = lineBackdrops_;
+        content.bare = lineBackdrops_;
+        const bool open = tracker_.Open();
+        content.overGameScreens = open;
+        const std::size_t limit = std::min(open ? openLines_ : lines_, history_.Size());
+        const SteadyTime now = RenderNow();
+        std::vector<HudLine> newestFirst;
+        for (std::size_t shown = 0; shown < limit; ++shown) {
+            const auto& entry = history_.At(history_.Size() - 1 - shown);
+            float alpha = 1.0F;
+            if (!open && fade_ && now != SteadyTime{}) {
+                alpha = ChatLineAlpha(now - entry.arrivedAt, visibleSeconds_);
+                // Older lines are older still: nothing further is visible.
+                if (alpha <= 0.0F) break;
+            }
+            const std::time_t time = std::chrono::system_clock::to_time_t(entry.event.receivedAt);
+            std::tm local{};
+            const bool known = localtime_s(&local, &time) == 0;
+            newestFirst.push_back({ToUtf8(PresentChatLine(entry.event, options_, known ? local.tm_hour : 0, known ? local.tm_min : 0)),
+                HudTone::Normal, alpha});
+        }
+        content.lines.assign(newestFirst.rbegin(), newestFirst.rend());
+        return content;
+    }
+
+private:
+    struct Entry {
+        ChatEvent event;
+        SteadyTime arrivedAt{};
+    };
+    RingBuffer<Entry> history_;
+    ChatPresentation options_{false, true, true, false, {}, L"Player"};
+    ChatScreenTracker tracker_;
+    std::string preset_;
+    bool growUpward_{true};
+    bool fade_{true};
+    bool lineBackdrops_{true};
+    bool hideVanilla_{true};
+    float visibleSeconds_{10.0F};
+    float width_{320.0F};
+    std::size_t lines_{10};
+    std::size_t openLines_{20};
+    std::uint32_t chatKey_{'T'};
+};
+
 class ToggleSprintDynamicFpsModule final : public ModuleBase<IModule>, public ISprintAssistModule, public IFramePacingModule {
 public:
     ToggleSprintDynamicFpsModule(ModuleMetadata metadata, HudLayout, SharedServices&)
@@ -366,10 +528,56 @@ private:
     std::uint32_t forwardKey_{'W'};
     std::uint32_t sneakKey_{VK_SHIFT};
 };
+
+class ToggleSneakModule final : public HudModuleBase<IKeyHoldAssistModule> {
+public:
+    ToggleSneakModule(ModuleMetadata metadata, HudLayout layout, SharedServices&)
+        : HudModuleBase(std::move(metadata), {
+            KeySetting("toggle-key", "Toggle key", 'X', "Toggles the synthetic sneak hold."),
+            KeySetting("sneak-key", "Game sneak key", VK_SHIFT, "Must match Minecraft's sneak binding.")}, layout) {}
+    void OnSettingsChanged(const SettingsReader& settings) override {
+        std::scoped_lock lock(mutex_);
+        toggleKey_ = settings.Key("toggle-key");
+        sneakKey_ = settings.Key("sneak-key");
+        latched_ = false;
+    }
+    void OnDisable() override { ResetHeldKeyState(); }
+    void OnKeyboard(const KeyboardEvent& event) override {
+        if (event.uiCaptured || !event.pressed || event.repeated) return;
+        std::scoped_lock lock(mutex_);
+        if (toggleKey_ != 0 && event.key == toggleKey_) latched_ = !latched_;
+    }
+    [[nodiscard]] std::uint32_t DesiredHeldKey(const HeldKeyInputs& inputs) override {
+        std::scoped_lock lock(mutex_);
+        if (!inputs.focused || !inputs.gameplayHasCursor || inputs.menuVisible || sneakKey_ == 0) {
+            latched_ = false;
+            return 0;
+        }
+        return latched_ ? sneakKey_ : 0;
+    }
+    void ResetHeldKeyState() noexcept override {
+        std::scoped_lock lock(mutex_);
+        latched_ = false;
+    }
+    [[nodiscard]] HudContent Content() const override {
+        std::scoped_lock lock(mutex_);
+        HudContent content;
+        content.bare = true;
+        if (latched_) content.lines.push_back({"[Sneaking (Toggled)]", HudTone::Normal});
+        return content;
+    }
+
+private:
+    std::uint32_t toggleKey_{'X'};
+    std::uint32_t sneakKey_{VK_SHIFT};
+    bool latched_{};
+};
 }
 
 std::unique_ptr<IModule> MakeSubtitles(ModuleMetadata m, HudLayout l, SharedServices& s) { return std::make_unique<SubtitlesModule>(std::move(m), l, s); }
 std::unique_ptr<IModule> MakeChatTools(ModuleMetadata m, HudLayout l, SharedServices& s) { return std::make_unique<ChatToolsModule>(std::move(m), l, s); }
+std::unique_ptr<IModule> MakeMoveableChat(ModuleMetadata m, HudLayout l, SharedServices& s) { return std::make_unique<MoveableChatModule>(std::move(m), l, s); }
 std::unique_ptr<IModule> MakeToggleSprintDynamicFps(ModuleMetadata m, HudLayout l, SharedServices& s) { return std::make_unique<ToggleSprintDynamicFpsModule>(std::move(m), l, s); }
+std::unique_ptr<IModule> MakeToggleSneak(ModuleMetadata m, HudLayout l, SharedServices& s) { return std::make_unique<ToggleSneakModule>(std::move(m), l, s); }
 
 }

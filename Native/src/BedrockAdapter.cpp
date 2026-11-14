@@ -56,7 +56,7 @@ AdapterResult ReviewedBedrockAdapter::Attach(ModuleManager& modules) noexcept {
     std::wstring error;
     if (!Dx12Overlay::Install(modules, error)) return { AdapterStatus::ValidationFailed, std::move(error) };
     std::wstring inputDetail;
-    (void)MouseInputBlocker::Install(inputDetail);
+    (void)MouseInputBlocker::Install(modules, inputDetail);
     (void)MouseInputBlocker::PollInstall(inputDetail);
     // Best-effort, independently capability-gated integrations. A failure in
     // one source never prevents presentation or another source from starting.

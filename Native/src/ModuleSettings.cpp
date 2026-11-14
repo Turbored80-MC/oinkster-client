@@ -62,6 +62,44 @@ std::optional<std::uint32_t> ParseColorSetting(std::string_view value) noexcept 
 
 std::string FormatColorSetting(std::uint32_t argb) { return std::format("#{:08X}", argb); }
 
+std::optional<PixelGrid> ParsePixelGrid(std::string_view value) noexcept {
+    const auto trimmed = Trim(value);
+    constexpr std::size_t DigitsPerRow = 4;
+    if (trimmed.size() != PixelGridSize * DigitsPerRow) return std::nullopt;
+    PixelGrid grid{};
+    for (std::size_t row = 0; row < PixelGridSize; ++row) {
+        const auto* begin = trimmed.data() + row * DigitsPerRow;
+        std::uint16_t bits{};
+        const auto result = std::from_chars(begin, begin + DigitsPerRow, bits, 16);
+        if (result.ec != std::errc{} || result.ptr != begin + DigitsPerRow) return std::nullopt;
+        grid[row] = bits;
+    }
+    return grid;
+}
+
+std::string FormatPixelGrid(const PixelGrid& grid) {
+    std::string text;
+    text.reserve(PixelGridSize * 4);
+    for (const auto row : grid) text += std::format("{:04X}", row);
+    return text;
+}
+
+PixelGrid MirrorPixelsHorizontally(const PixelGrid& grid) noexcept {
+    PixelGrid result = grid;
+    for (std::size_t row = 0; row < PixelGridSize; ++row) {
+        for (std::size_t column = 0; column < PixelGridSize / 2; ++column) {
+            SetPixel(result, PixelGridSize - 1 - column, row, PixelAt(grid, column, row));
+        }
+    }
+    return result;
+}
+
+PixelGrid MirrorPixelsVertically(const PixelGrid& grid) noexcept {
+    PixelGrid result = grid;
+    for (std::size_t row = 0; row < PixelGridSize / 2; ++row) result[PixelGridSize - 1 - row] = grid[row];
+    return result;
+}
+
 std::string FormatNumberSetting(double value, SettingType type) {
     if (type == SettingType::Int || type == SettingType::Key) return std::format("{}", static_cast<long long>(std::llround(value)));
     // Fixed precision keeps the file stable (no 0.30000000000000004 churn)
@@ -136,8 +174,18 @@ std::string NormalizeSetting(const SettingDescriptor& descriptor, std::string_vi
         }
         return result;
     }
+    case SettingType::Pixels: {
+        auto parsed = ParsePixelGrid(raw);
+        if (!parsed) parsed = ParsePixelGrid(descriptor.defaultValue);
+        return FormatPixelGrid(parsed.value_or(PixelGrid{}));
+    }
     }
     return descriptor.defaultValue;
+}
+
+bool IsSettingVisible(const SettingDescriptor& descriptor, const SettingsReader& reader) {
+    if (descriptor.visibleWhenKey.empty()) return true;
+    return std::ranges::find(descriptor.visibleWhenValues, reader.Raw(descriptor.visibleWhenKey)) != descriptor.visibleWhenValues.end();
 }
 
 SettingsReader::SettingsReader(std::span<const SettingDescriptor> descriptors,
@@ -165,5 +213,6 @@ std::uint32_t SettingsReader::Key(std::string_view key) const {
     return static_cast<std::uint32_t>(ParseNumberSetting(Value(key)).value_or(0.0));
 }
 std::string SettingsReader::Text(std::string_view key) const { return Value(key); }
+PixelGrid SettingsReader::Pixels(std::string_view key) const { return ParsePixelGrid(Value(key)).value_or(PixelGrid{}); }
 
 }

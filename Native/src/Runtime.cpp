@@ -3,6 +3,7 @@
 #include "Oinkster/Dx12Overlay.hpp"
 #include "Oinkster/Json.hpp"
 #include "Oinkster/MouseInputBlocker.hpp"
+#include "Oinkster/ServerPolicy.hpp"
 #include <Windows.h>
 #include <chrono>
 #include <format>
@@ -17,6 +18,15 @@ void Log(std::string_view level, std::string_view event, std::string_view messag
 
 std::wstring Widen(std::string_view value) {
     return std::wstring(value.begin(), value.end());
+}
+
+std::string Narrow(std::wstring_view value) {
+    std::string result;
+    result.reserve(value.size());
+    for (const wchar_t character : value) {
+        result.push_back(character >= 0 && character <= 0x7f ? static_cast<char>(character) : '?');
+    }
+    return result;
 }
 
 std::wstring JsonString(std::wstring_view value) {
@@ -52,12 +62,22 @@ std::wstring JsonString(std::wstring_view value) {
 // optional for the launcher). capabilityReasons is additive so older v2
 // launchers continue to accept the payload.
 std::wstring StatusJson(const ModuleManager& modules, std::wstring_view state, std::optional<bool> hooksInstalled,
-    std::wstring_view inputRouting, std::wstring_view supportedBedrock) {
+    std::wstring_view inputRouting, std::wstring_view supportedBedrock, std::wstring_view startupError = {}) {
     std::wstring json = L"{\"interfaceVersion\":2,\"state\":\"" + std::wstring(state) + L"\"";
     json += std::format(L",\"moduleCount\":{}", modules.Size());
     if (!supportedBedrock.empty()) json += L",\"supportedBedrock\":\"" + std::wstring(supportedBedrock) + L"\"";
     if (hooksInstalled) json += *hooksInstalled ? L",\"hooksInstalled\":true" : L",\"hooksInstalled\":false";
     if (!inputRouting.empty()) json += L",\"inputRouting\":\"" + std::wstring(inputRouting) + L"\"";
+    if (!startupError.empty()) json += L",\"startupError\":" + JsonString(startupError);
+    const auto kind = ServerPolicy::CurrentSessionKind();
+    const auto network = kind == SessionKind::None
+        ? std::string_view("unclassified") : ServerPolicy::NetworkId(ServerPolicy::CurrentNetwork());
+    json += L",\"serverNetwork\":\"" + Widen(network) + L"\"";
+    json += L",\"competitivePolicies\":{";
+    json += ServerPolicy::IsAllowed(kind, ServerPolicy::CurrentNetwork(), "dc-prevent")
+        ? L"\"dc-prevent\":\"allowed\"" : L"\"dc-prevent\":\"blocked\"";
+    json += ServerPolicy::IsAllowed(kind, ServerPolicy::CurrentNetwork(), "cps-cap")
+        ? L",\"cps-cap\":\"allowed\"}" : L",\"cps-cap\":\"blocked\"}";
     json += L",\"capabilities\":{";
     const auto capabilities = modules.Capabilities();
     for (std::size_t index = 0; index < capabilities.size(); ++index) {
@@ -120,8 +140,11 @@ int Runtime::Run() noexcept {
 
         const auto validation = adapter_->Validate();
         if (validation.status != AdapterStatus::Ready) {
-            statusPipe_.Update(StatusJson(modules_, L"review-required", false, {}, supported));
-            Log("warning", "adapter_rejected", "No hooks installed; adapter review required");
+            statusPipe_.Update(StatusJson(modules_, L"review-required", false, {}, supported, validation.message));
+            Log("warning", "adapter_rejected", Narrow(validation.message));
+            // The launcher starts polling only after LoadLibrary returns. Keep
+            // this terminal result available long enough for it to read.
+            std::this_thread::sleep_for(std::chrono::seconds(5));
             statusPipe_.Stop();
             controlPipe_.Stop();
             return 2;
@@ -129,8 +152,12 @@ int Runtime::Run() noexcept {
         Log("info", "adapter_validated", "Exact Bedrock package identity validated");
         const auto attachment = adapter_->Attach(modules_);
         if (attachment.status != AdapterStatus::Ready) {
-            Log("error", "adapter_attach_failed", "Direct3D 12 hook attachment failed");
+            statusPipe_.Update(StatusJson(modules_, L"error", false, {}, supported, attachment.message));
+            Log("error", "adapter_attach_failed", Narrow(attachment.message));
             adapter_->Detach();
+            // The failed install has already removed its partial hooks. Keep
+            // only the read-only status pipe alive for the launcher's poll.
+            std::this_thread::sleep_for(std::chrono::seconds(5));
             statusPipe_.Stop();
             controlPipe_.Stop();
             return 3;

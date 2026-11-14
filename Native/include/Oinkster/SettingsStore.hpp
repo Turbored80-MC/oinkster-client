@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace Oinkster {
 
@@ -46,6 +47,24 @@ public:
     void Save(const ClientSettings& settings) const;
 private:
     std::filesystem::path path_;
+};
+
+// Named snapshots of the complete client configuration. Profiles live beside
+// settings.json in their own directory so launchers that only understand the
+// settings schema cannot accidentally discard them while saving.
+class SettingsProfileStore final {
+public:
+    explicit SettingsProfileStore(std::filesystem::path directory) : directory_(std::move(directory)) {}
+    [[nodiscard]] static bool IsValidName(std::string_view name) noexcept;
+    [[nodiscard]] std::vector<std::string> List() const;
+    [[nodiscard]] std::optional<ClientSettings> Load(std::string_view name) const;
+    void Save(std::string_view name, const ClientSettings& settings) const;
+    [[nodiscard]] bool Remove(std::string_view name) const noexcept;
+    [[nodiscard]] std::string Active() const;
+    void SetActive(std::string_view name) const;
+private:
+    [[nodiscard]] std::filesystem::path ProfilePath(std::string_view name) const;
+    std::filesystem::path directory_;
 };
 
 // Parses a settings document already read into memory (exposed for tests).

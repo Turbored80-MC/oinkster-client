@@ -20,6 +20,9 @@ enum class Capability : std::uint8_t {
     FrameComposition,     // Drawing into / copying the presented backbuffer (own DX12 hook)
     LocalInput,           // Keyboard/mouse messages seen by the subclassed Minecraft window
     InputSynthesis,       // Posting ordinary key presses back to that same window
+    InputFiltering,       // Suppressing reviewed physical mouse events without synthesizing replacements
+    DcPreventPolicy,      // Current session policy permits DC Prevent
+    CpsCapPolicy,         // Current session policy permits CPS Cap
     LocalPlayerPosition,  // World telemetry: local camera position
     LocalPlayerRotation,  // World telemetry: local yaw/pitch
     Inventory,
@@ -28,13 +31,25 @@ enum class Capability : std::uint8_t {
     NetworkMetrics,
     ServerState,
     ResourcePacks,
+    ResourcePackReload,
     CombatEvents,
     SelectedBlockRender,
     DamageRender,
     SoundEvents,
     ChatEvents,
     CameraPresentation,
+    CameraRotation,
+    CameraMotion,
+    ThirdPersonPresentation,
+    LightingPresentation,
+    TimePresentation,
+    WeatherPresentation,
+    ScreenEffectsPresentation,
     HandPresentation,
+    PacketCapture,        // Decoded incoming game packets (NetworkConnection::receivePacket)
+    PerspectivePresentation,
+    PacketSend,
+    FireOverlayPresentation, // First-person on-fire overlay (Low Fire); no reviewed hook yet
     Count
 };
 

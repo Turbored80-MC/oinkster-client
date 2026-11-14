@@ -242,7 +242,8 @@ bool ModuleManager::HasEnabledOverlayModules() const noexcept {
     for (const auto& id : enabled_) {
         auto* module = modules_.at(id).get();
         if (dynamic_cast<IHudModule*>(module) || dynamic_cast<IOverlayModule*>(module)
-            || dynamic_cast<IFrameBlendModule*>(module)) return true;
+            || dynamic_cast<IDebugOverlayModule*>(module)
+            || dynamic_cast<IFrameBlendModule*>(module) || dynamic_cast<IPostProcessModule*>(module)) return true;
     }
     return false;
 }

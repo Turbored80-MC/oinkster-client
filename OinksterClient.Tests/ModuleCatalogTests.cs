@@ -15,23 +15,35 @@ public sealed class ModuleCatalogTests
     // Mirrors Native/src/Capabilities.cpp.
     private static readonly HashSet<string> SupportedCapabilities =
     [
-        "render-metrics", "frame-composition", "local-input", "input-synthesis", "local-player-position",
+        "render-metrics", "frame-composition", "local-input", "input-synthesis", "input-filtering",
+        "dc-prevent-policy", "cps-cap-policy", "local-player-position",
         "local-player-rotation", "effects", "equipment", "inventory", "network-metrics", "server-state",
-        "resource-packs", "combat-events", "sound-events", "chat-events"
+        "resource-packs", "combat-events", "sound-events", "chat-events", "packet-capture",
+        "selected-block-render", "damage-render", "camera-presentation", "camera-rotation", "camera-motion",
+        "third-person-presentation", "lighting-presentation", "time-presentation", "weather-presentation",
+        "screen-effects-presentation", "hand-presentation",
+        "perspective-presentation",
+        "packet-send"
+    ];
+
+    // Known to the native client but without a reviewed implementation yet.
+    private static readonly HashSet<string> UnsupportedCapabilities =
+    [
+        "fire-overlay-presentation"
     ];
 
     private static readonly HashSet<string> KnownCapabilities =
     [
         .. SupportedCapabilities,
-        "selected-block-render", "damage-render", "camera-presentation", "hand-presentation"
+        .. UnsupportedCapabilities
     ];
 
     [Fact]
-    public async Task LoadCatalogAsync_ShippedCatalog_ContainsAllThirtySixUniqueModules()
+    public async Task LoadCatalogAsync_ShippedCatalog_ContainsAllUniqueModules()
     {
         var catalog = await ModuleSettingsService.LoadCatalogAsync();
 
-        Assert.Equal(36, catalog.Count);
+        Assert.Equal(70, catalog.Count);
         Assert.Equal(catalog.Count, catalog.Select(module => module.Id).Distinct(StringComparer.Ordinal).Count());
         Assert.All(catalog, module => Assert.Matches("^[a-z0-9-]+$", module.Id));
     }

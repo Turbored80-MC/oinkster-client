@@ -3,8 +3,11 @@
 #include "Oinkster/ModuleManager.hpp"
 #include <Windows.h>
 #include <algorithm>
+#include <array>
+#include <cctype>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <format>
 #include <fstream>
 #include <map>
@@ -248,11 +251,99 @@ void SettingsStore::Save(const ClientSettings& settings) const {
     }
 }
 
+bool SettingsProfileStore::IsValidName(std::string_view name) noexcept {
+    if (name.empty() || name.size() > 32 || name.front() == ' ' || name.back() == ' ') return false;
+    if (!std::ranges::all_of(name, [](unsigned char character) {
+            return std::isalnum(character) || character == ' ' || character == '-' || character == '_';
+        })) return false;
+    std::string upper(name);
+    std::ranges::transform(upper, upper.begin(), [](unsigned char character) {
+        return static_cast<char>(std::toupper(character));
+    });
+    static constexpr std::array<std::string_view, 4> Reserved{"CON", "PRN", "AUX", "NUL"};
+    if (std::ranges::find(Reserved, upper) != Reserved.end()) return false;
+    return !(upper.size() == 4 && (upper.starts_with("COM") || upper.starts_with("LPT"))
+        && upper[3] >= '1' && upper[3] <= '9');
+}
+
+std::filesystem::path SettingsProfileStore::ProfilePath(std::string_view name) const {
+    return directory_ / (std::string(name) + ".json");
+}
+
+std::vector<std::string> SettingsProfileStore::List() const {
+    std::vector<std::string> profiles;
+    std::error_code error;
+    for (std::filesystem::directory_iterator iterator(directory_, error), end;
+         !error && iterator != end; iterator.increment(error)) {
+        if (!iterator->is_regular_file(error) || iterator->path().extension() != L".json") continue;
+        const auto name = iterator->path().stem().string();
+        if (IsValidName(name)) profiles.push_back(name);
+    }
+    std::ranges::sort(profiles, [](const std::string& left, const std::string& right) {
+        return _stricmp(left.c_str(), right.c_str()) < 0;
+    });
+    return profiles;
+}
+
+std::optional<ClientSettings> SettingsProfileStore::Load(std::string_view name) const {
+    if (!IsValidName(name)) return std::nullopt;
+    const auto path = ProfilePath(name);
+    std::error_code error;
+    if (!std::filesystem::is_regular_file(path, error)) return std::nullopt;
+    return SettingsStore(path).Load();
+}
+
+void SettingsProfileStore::Save(std::string_view name, const ClientSettings& settings) const {
+    if (!IsValidName(name)) throw std::invalid_argument("Invalid profile name");
+    SettingsStore(ProfilePath(name)).Save(settings);
+}
+
+bool SettingsProfileStore::Remove(std::string_view name) const noexcept {
+    if (!IsValidName(name)) return false;
+    std::error_code error;
+    return std::filesystem::remove(ProfilePath(name), error) && !error;
+}
+
+std::string SettingsProfileStore::Active() const {
+    try {
+        std::ifstream input(directory_ / "active.txt", std::ios::binary);
+        std::string name;
+        std::getline(input, name);
+        if (!input.bad() && IsValidName(name)) return name;
+    } catch (...) {}
+    return {};
+}
+
+void SettingsProfileStore::SetActive(std::string_view name) const {
+    if (name.empty()) {
+        std::error_code ignored;
+        std::filesystem::remove(directory_ / "active.txt", ignored);
+        return;
+    }
+    if (!IsValidName(name)) throw std::invalid_argument("Invalid profile name");
+    std::filesystem::create_directories(directory_);
+    const auto path = directory_ / "active.txt";
+    auto temporary = path;
+    temporary += L".partial";
+    {
+        std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+        output.write(name.data(), static_cast<std::streamsize>(name.size()));
+        output.flush();
+        if (!output.good()) throw std::runtime_error("Could not write active profile");
+    }
+    if (!MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        const auto code = GetLastError();
+        std::error_code ignored;
+        std::filesystem::remove(temporary, ignored);
+        throw std::runtime_error("Could not replace active profile (Win32 " + std::to_string(code) + ")");
+    }
+}
+
 void ApplySettings(ModuleManager& modules, const ClientSettings& settings) {
     modules.ReplaceModuleSettings(settings.moduleSettings);
     for (const auto& metadata : modules.Catalog()) {
         const auto state = settings.moduleStates.find(metadata.id);
-        modules.RestoreEnabled(metadata.id, state != settings.moduleStates.end() && state->second);
+        modules.RestoreEnabled(metadata.id, state == settings.moduleStates.end() ? metadata.defaultEnabled : state->second);
         (void)modules.SetKeybind(metadata.id, 0, settings.clickGuiKey, settings.unloadKey);
         if (const auto bind = settings.keybinds.find(metadata.id); bind != settings.keybinds.end()) {
             (void)modules.SetKeybind(metadata.id, bind->second, settings.clickGuiKey, settings.unloadKey);

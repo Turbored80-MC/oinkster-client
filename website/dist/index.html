@@ -3,175 +3,156 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="theme-color" content="#0b0a0d">
-    <meta name="description" content="Oinkster is a focused Minecraft Bedrock client for Windows with performance, input, telemetry, and visual tools.">
-    <title>Oinkster Client — Your world, your rules</title>
+    <meta name="theme-color" content="#bfe0f5">
+    <meta name="description" content="Oinkster is a free, open-source client for Minecraft Bedrock on Windows: HUD mods, input tools and visual tweaks, opened in-game with K.">
+    <title>Oinkster Client</title>
     <link rel="icon" href="favicon.ico" sizes="any">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:ital,wght@0,400;0,700;1,400&family=Pixelify+Sans:wght@500;700&display=swap">
     <link rel="stylesheet" href="styles.css">
 </head>
 <body>
-    <a class="skip-link" href="#main-content">Skip to content</a>
+    <a class="skip-link" href="#main">Skip to content</a>
 
-    <header class="site-header">
-        <a class="brand" href="#top" aria-label="Oinkster home">
-            <img src="assets/oinkster-logo.png" alt="" width="42" height="42">
-            <span>Oinkster</span>
-        </a>
-        <nav aria-label="Main navigation">
-            <a href="#features">Features</a>
-            <a href="#safety">Safety</a>
-            <a href="#faq">FAQ</a>
-            <a class="nav-download" href="#download">Download</a>
-        </nav>
-    </header>
+    <div class="sky">
+        <header class="site-header">
+            <a class="brand" href="./">
+                <img src="assets/pig-64.png" alt="" width="36" height="36">
+                <span>Oinkster</span>
+            </a>
+            <nav aria-label="Main">
+                <a href="#mods">Mods</a>
+                <a href="#source">Source code</a>
+                <a href="#download">Download</a>
+                <a href="bugs.html">Report a bug</a>
+                <a href="suggestions.html">Suggest an idea</a>
+                <a href="https://github.com/Turbored80-MC/oinkster-client">GitHub</a>
+            </nav>
+        </header>
 
-    <main id="main-content">
-        <section class="hero" id="top" aria-labelledby="hero-title">
+        <section class="hero" aria-labelledby="hero-title">
             <div class="hero-copy">
-                <p class="eyebrow"><span class="status-dot" aria-hidden="true"></span> Built for Bedrock on Windows</p>
-                <h1 id="hero-title">Your world,<br><em>your rules.</em></h1>
-                <p class="hero-lede">A focused launcher and in-game toolkit for Minecraft Bedrock. See the performance data that matters, shape your HUD, and keep useful controls close.</p>
+                <p class="beta-tag" data-release-version>1.1.0 Beta</p>
+                <h1 id="hero-title">Oinkster</h1>
+                <p class="hero-lede">A free client for Minecraft Bedrock on Windows. Press K in-game to open it, then turn on the mods you want: FPS and CPS counters, keystrokes, zoom, a custom crosshair and about fifty more.</p>
                 <div class="hero-actions">
-                    <a class="button button-primary" href="#download">Get Oinkster</a>
-                    <a class="button button-ghost" href="#features">Explore features <span aria-hidden="true">↘</span></a>
+                    <a class="button button-primary" href="#download">Download</a>
+                    <a class="button button-plain" href="https://github.com/Turbored80-MC/oinkster-client">Read the source</a>
                 </div>
-                <ul class="hero-meta" aria-label="Requirements">
-                    <li>Windows 10 / 11</li>
-                    <li>x64</li>
-                    <li>Bedrock 1.26.5203</li>
-                </ul>
             </div>
+            <img class="hero-pig" src="assets/pig-512.png" alt="The Oinkster pig, a pink Minecraft-style pig head" width="512" height="512">
+        </section>
+        <div class="grass" aria-hidden="true"></div>
+    </div>
 
-            <div class="launcher-wrap" aria-label="Preview of the Oinkster launcher interface">
-                <div class="ambient ambient-one"></div>
-                <div class="ambient ambient-two"></div>
-                <div class="launcher-window">
-                    <div class="titlebar">
-                        <div class="window-brand"><span class="mini-mark"><img src="assets/oinkster-logo.png" alt=""></span> Oinkster</div>
-                        <div class="window-controls" aria-hidden="true"><span></span><span></span><span></span></div>
-                    </div>
-                    <div class="launcher-body">
-                        <div class="rail" aria-hidden="true">
-                            <span class="rail-logo"><img src="assets/oinkster-logo.png" alt=""></span>
-                            <span class="rail-icon active">▶</span>
-                            <span class="rail-icon">◆</span>
-                            <span class="rail-icon">●</span>
-                        </div>
-                        <div class="launcher-content">
-                            <div class="launcher-topline">
-                                <div><strong>Oinkster</strong><small>Bedrock client</small></div>
-                                <span class="service-pill"><i></i> Bedrock ready</span>
-                            </div>
-                            <div class="launcher-grid">
-                                <div class="launch-copy">
-                                    <span class="release-chip">RELEASE PREVIEW</span>
-                                    <h2>Your world,<br>your rules.</h2>
-                                    <p>Your selected modules are ready and your game is up to date.</p>
-                                    <div class="profile-row"><span class="profile-icon">◆</span><span><b>Vanilla+</b><small>6 modules enabled</small></span><span class="version">1.26.5203<small>Ready</small></span></div>
-                                    <div class="play-row"><span class="play-button">▶&nbsp;&nbsp; Play</span><span class="options-button">•••</span></div>
-                                </div>
-                                <div class="art-card">
-                                    <div class="art-glow"></div>
-                                    <img src="assets/oinkster-logo.png" alt="Pixel-art pink pig, the Oinkster mascot">
-                                    <div class="core-card"><span><b>Oinkster Core</b><small>Ready to activate</small></span><b>↗</b></div>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
+    <main id="main">
+        <section class="block intro" aria-label="What it is">
+            <p>Oinkster has two parts. The launcher checks your Minecraft version, downloads the client and starts it. The client runs inside the game and draws its menu straight into the game window, so you never have to alt-tab out.</p>
+            <p>It's built for one exact Minecraft version at a time. Right now that's <strong data-release-bedrock>Bedrock 26.63</strong> (x64). After a Minecraft update, the launcher waits for a matching Oinkster update rather than loading something that might break your game.</p>
+        </section>
+
+        <section class="block" id="mods" aria-labelledby="mods-title">
+            <h2 id="mods-title">What's in it</h2>
+            <p class="section-lede">Every mod is off until you turn it on. HUD mods can be dragged anywhere on screen, and each one has its own settings.</p>
+            <div class="mod-groups">
+                <div class="mod-group">
+                    <h3>Performance</h3>
+                    <p>FPS, frame time, FPS statistics, frame-time graph, memory use, performance summary.</p>
                 </div>
-                <div class="floating-stat stat-fps"><span>FPS</span><strong>144</strong><small>6.9 ms frame time</small></div>
-                <div class="floating-stat stat-input"><span>INPUT</span><div class="keys"><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd></div></div>
+                <div class="mod-group">
+                    <h3>Input</h3>
+                    <p>CPS, keystrokes, input latency, double-click prevention, CPS cap, scroll wheel disabler, sensitivity multiplier, null movement.</p>
+                </div>
+                <div class="mod-group">
+                    <h3>Info</h3>
+                    <p>Ping, coordinates, direction, speed, clock, stopwatch, session stats, armor status, item durability, potion effects, server and resource pack display, player list.</p>
+                </div>
+                <div class="mod-group">
+                    <h3>PvP</h3>
+                    <p>Combo counter, hit distance, equipment warnings, potion counter.</p>
+                </div>
+                <div class="mod-group">
+                    <h3>Visual</h3>
+                    <p>Custom crosshair, block outline, hurt color, motion blur, zoom, freelook, FOV profiles, fullbright, time changer, weather off, chunk borders, third-person distance and more.</p>
+                </div>
+                <div class="mod-group">
+                    <h3>Comfort</h3>
+                    <p>Toggle sprint and sneak, subtitles, chat tools, less hurt-camera shake, lower FPS while the game is in the background.</p>
+                </div>
             </div>
         </section>
 
-        <section class="marquee" aria-label="Feature categories">
-            <div>PERFORMANCE <span>✦</span> INPUT <span>✦</span> TELEMETRY <span>✦</span> CUSTOMIZATION <span>✦</span> PERFORMANCE <span>✦</span> INPUT <span>✦</span></div>
-        </section>
-
-        <section class="section features" id="features" aria-labelledby="features-title">
-            <div class="section-heading">
-                <div><p class="section-index">01 / TOOLKIT</p><h2 id="features-title">Useful tools.<br><em>Nothing noisy.</em></h2></div>
-                <p>Oinkster keeps its focus on local information and presentation—giving you a clearer view of the game without taking over the experience.</p>
+        <section class="block source" id="source" aria-labelledby="source-title">
+            <div class="source-copy">
+                <h2 id="source-title">The code is open source</h2>
+                <p>Every line of Oinkster, the launcher and the in-game client, is public on GitHub under the AGPL-3.0 license. Anyone can read what it does, build it themselves, or suggest a fix.</p>
+                <p>That matters for something that runs inside your game. You don't have to trust a closed download: you can see exactly what Oinkster reads and changes in the game, and check that it collects nothing about you. The only thing it contacts is GitHub, to check for updates.</p>
+                <a class="button button-dark" href="https://github.com/Turbored80-MC/oinkster-client">Open the repository</a>
             </div>
-            <div class="feature-grid">
-                <article class="feature-card feature-card-wide performance-card">
-                    <div class="feature-copy"><span class="card-number">01</span><h3>Know every frame</h3><p>Track live FPS, frame pacing, one-percent lows, and Minecraft's memory use from a compact performance HUD.</p></div>
-                    <div class="chart" aria-label="Illustrative frame-time chart">
-                        <div class="chart-head"><span>FRAME TIME</span><strong>6.9 <small>ms</small></strong></div>
-                        <svg viewBox="0 0 500 140" role="img" aria-label="A steady illustrative frame-time graph">
-                            <defs><linearGradient id="area" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#f49abc" stop-opacity=".5"/><stop offset="1" stop-color="#f49abc" stop-opacity="0"/></linearGradient></defs>
-                            <path class="area" d="M0,102 C35,91 58,110 91,86 S147,78 180,91 S238,97 267,65 S313,80 345,54 S394,79 430,45 S472,58 500,24 L500,140 L0,140Z"/>
-                            <path class="line" d="M0,102 C35,91 58,110 91,86 S147,78 180,91 S238,97 267,65 S313,80 345,54 S394,79 430,45 S472,58 500,24"/>
-                        </svg>
-                    </div>
-                </article>
-                <article class="feature-card input-card">
-                    <span class="card-number">02</span><h3>See your inputs</h3><p>Keep movement keys, clicks per second, and input-to-frame latency visible while you play.</p>
-                    <div class="key-cluster" aria-hidden="true"><kbd>W</kbd><div><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd></div><div class="mouse-keys"><kbd>LMB <b>8</b></kbd><kbd>RMB <b>2</b></kbd></div></div>
-                </article>
-                <article class="feature-card telemetry-card">
-                    <span class="card-number">03</span><h3>Read the moment</h3><p>Show coordinates, movement speed, session duration, click totals, and distance travelled.</p>
-                    <div class="telemetry-stack" aria-hidden="true"><span><i>XYZ</i><b>128 / 64 / −32</b></span><span><i>SPEED</i><b>4.31 m/s</b></span><span><i>SESSION</i><b>01:42:18</b></span></div>
-                </article>
-                <article class="feature-card feature-card-wide custom-card">
-                    <div class="feature-copy"><span class="card-number">04</span><h3>Make the view yours</h3><p>Arrange HUD modules, tune a local crosshair, add cosmetic motion blur, and keep sprint or background FPS behavior under control.</p></div>
-                    <div class="custom-preview" aria-hidden="true">
-                        <div class="crosshair"><span></span><span></span><span></span><span></span></div>
-                        <div class="module-chip chip-one">FPS <b>144</b></div><div class="module-chip chip-two">CPS <b>8</b></div><div class="module-chip chip-three">04:52 PM</div>
-                    </div>
-                </article>
-            </div>
-        </section>
-
-        <section class="section safety" id="safety" aria-labelledby="safety-title">
-            <div class="safety-panel">
-                <div class="safety-copy">
-                    <p class="section-index">02 / LAUNCHER SAFETY</p>
-                    <h2 id="safety-title">Designed to<br><em>fail closed.</em></h2>
-                    <p>Oinkster checks every client build before activation. If the release, file, architecture, or Bedrock version does not match what is expected, the launcher stops.</p>
-                </div>
-                <ol class="safety-steps">
-                    <li><span>01</span><div><strong>Signed release</strong><p>The launcher validates release metadata with the public key packaged in the app.</p></div></li>
-                    <li><span>02</span><div><strong>Integrity checked</strong><p>The downloaded client must match its signed file size and SHA-256 hash.</p></div></li>
-                    <li><span>03</span><div><strong>Exact compatibility</strong><p>Activation requires native x64 Minecraft and the exact supported Bedrock build.</p></div></li>
+            <div class="source-checks">
+                <h3>What the launcher checks before starting the client</h3>
+                <ol>
+                    <li>The release file is signed with the Oinkster release key that ships inside the launcher.</li>
+                    <li>The downloaded client matches the signed file size and SHA-256 hash exactly.</li>
+                    <li>Minecraft is the 64-bit Windows version and the exact build the client was made for.</li>
                 </ol>
+                <p>If any check fails, nothing is loaded.</p>
             </div>
         </section>
 
-        <section class="section download" id="download" aria-labelledby="download-title">
-            <div class="download-orbit" aria-hidden="true"></div>
-            <img class="download-logo" src="assets/oinkster-logo.png" alt="Oinkster pink pig mascot" width="260" height="260">
-            <p class="section-index">03 / DOWNLOAD</p>
-            <h2 id="download-title">Ready when<br><em>it's ready.</em></h2>
-            <p class="download-lede">The first public installer is still being prepared. This preview will become the download home when a verified release is available.</p>
-            <div id="download-action" class="download-action" data-state="coming-soon">
-                <span class="button button-disabled" aria-disabled="true">Download coming soon</span>
-                <span class="release-status"><i></i><span id="release-status-label">Private preview</span></span>
+        <section class="block download" id="download" aria-labelledby="download-title">
+            <h2 id="download-title">Download</h2>
+            <p class="section-lede">Oinkster <span data-release-version>1.1.0 Beta</span> is the current beta. Expect a few rough edges. When you find one, <a href="bugs.html">tell us about it</a>. Got an idea for a mod? <a href="suggestions.html">Suggest it</a>.</p>
+            <div id="download-action" class="download-action">
+                <span class="button button-disabled" aria-disabled="true">Installer coming soon</span>
+                <span class="download-note" id="release-status-label">The installer is being signed and will be posted here and on GitHub releases.</span>
             </div>
             <dl class="requirements">
-                <div><dt>Platform</dt><dd id="release-platform">Windows x64</dd></div>
-                <div><dt>Game</dt><dd>Minecraft for Windows</dd></div>
-                <div><dt>Supported build</dt><dd id="release-bedrock">Bedrock 1.26.5203</dd></div>
+                <div><dt>Windows</dt><dd>10 or 11, 64-bit</dd></div>
+                <div><dt>Minecraft</dt><dd data-release-bedrock>Bedrock 26.63</dd></div>
+                <div><dt>Price</dt><dd>Free</dd></div>
             </dl>
         </section>
 
-        <section class="section faq" id="faq" aria-labelledby="faq-title">
-            <div class="faq-heading"><p class="section-index">04 / FAQ</p><h2 id="faq-title">Good to know.</h2></div>
-            <div class="faq-list">
-                <details><summary>What is Oinkster?</summary><p>Oinkster is a Windows launcher and client-side toolkit for Minecraft Bedrock. It provides configurable performance, input, telemetry, status, and visual modules.</p></details>
-                <details><summary>Which Minecraft version is supported?</summary><p>The current client code targets Minecraft for Windows version 1.26.5203 on x64. Oinkster refuses to activate against a different game build.</p></details>
-                <details><summary>Why is the download not available yet?</summary><p>The public installer has not been released. The download control will only be enabled after a real, verified package URL is configured.</p></details>
-                <details><summary>Is Oinkster affiliated with Minecraft?</summary><p>No. Oinkster is an independent project and is not affiliated with, endorsed by, or sponsored by Microsoft or Mojang Studios.</p></details>
-            </div>
+        <section class="block faq" aria-labelledby="faq-title">
+            <h2 id="faq-title">Questions</h2>
+            <details>
+                <summary>Is this allowed on servers?</summary>
+                <p>Oinkster is built around information and comfort: HUDs, input display, visual tweaks. It doesn't aim for you, see through walls or move for you. For servers that ban specific tools, such as The Hive and CubeCraft banning click-limit mods, Oinkster turns those mods off for you while you're connected. Rules change, so check the server's own list too.</p>
+            </details>
+            <details>
+                <summary>Why only one Minecraft version?</summary>
+                <p>The client reads parts of the game's memory that move around between Minecraft updates. Loading it into a different version could crash the game, so the launcher refuses until a matching update is out.</p>
+            </details>
+            <details>
+                <summary>What does "beta" mean here?</summary>
+                <p>Everything listed works, but it hasn't been played by many people yet. Settings are saved between versions, so you won't lose your HUD layout when updates come out.</p>
+            </details>
+            <details>
+                <summary>Can I build it myself?</summary>
+                <p>Yes. The <a href="https://github.com/Turbored80-MC/oinkster-client#building">README on GitHub</a> lists what you need: Visual Studio 2022, CMake and the .NET 10 SDK.</p>
+            </details>
+            <details>
+                <summary>Is Oinkster made by Mojang or Microsoft?</summary>
+                <p>No. Oinkster is an independent project and isn't affiliated with, endorsed by, or sponsored by Mojang Studios or Microsoft.</p>
+            </details>
         </section>
     </main>
 
-    <footer>
-        <a class="brand footer-brand" href="#top"><img src="assets/oinkster-logo.png" alt="" width="38" height="38"><span>Oinkster</span></a>
-        <p>Built for your world. <span>© <span id="current-year">2026</span> Oinkster.</span></p>
-        <p class="legal">Not an official Minecraft product. Not approved by or associated with Mojang Studios or Microsoft.</p>
+    <footer class="site-footer">
+        <div class="footer-inner">
+            <a class="brand" href="./"><img src="assets/pig-64.png" alt="" width="32" height="32"><span>Oinkster</span></a>
+            <nav aria-label="Footer">
+                <a href="https://github.com/Turbored80-MC/oinkster-client">Client source</a>
+                <a href="https://github.com/Turbored80-MC/oinkster-client-website">Website source</a>
+                <a href="bugs.html">Report a bug</a>
+                <a href="suggestions.html">Suggest an idea</a>
+            </nav>
+            <p class="legal">Not an official Minecraft product. Not approved by or associated with Mojang Studios or Microsoft.</p>
+        </div>
     </footer>
 
-    <script src="app.js" defer></script>
+    <script src="app.js" type="module"></script>
 </body>
 </html>

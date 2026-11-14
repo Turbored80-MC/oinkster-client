@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#bfe0f5">
+    <meta name="description" content="Got an idea for Oinkster? Suggest a mod or a change and it goes straight to the project's GitHub page.">
+    <title>Suggest an Idea · Oinkster</title>
+    <link rel="icon" href="favicon.ico" sizes="any">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:ital,wght@0,400;0,700;1,400&family=Pixelify+Sans:wght@500;700&display=swap">
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <a class="skip-link" href="#main">Skip to the form</a>
+
+    <div class="sky">
+        <header class="site-header">
+            <a class="brand" href="./">
+                <img src="assets/pig-64.png" alt="" width="36" height="36">
+                <span>Oinkster</span>
+            </a>
+            <nav aria-label="Main">
+                <a href="./#mods">Mods</a>
+                <a href="./#source">Source code</a>
+                <a href="./#download">Download</a>
+                <a href="bugs.html">Report a bug</a>
+                <a href="suggestions.html" aria-current="page">Suggest an idea</a>
+                <a href="https://github.com/Turbored80-MC/oinkster-client">GitHub</a>
+            </nav>
+        </header>
+        <div class="page-head">
+            <h1>Suggest an idea</h1>
+            <p>Want a new mod, or a change to one that's already there? Tell us about it. Your suggestion becomes a public issue on the Oinkster GitHub page, so other players can see it and add their thoughts.</p>
+        </div>
+        <div class="grass" aria-hidden="true"></div>
+    </div>
+
+    <main id="main">
+        <div class="report">
+            <form id="suggestion-form" novalidate>
+                <div class="field">
+                    <label for="idea-title">Short summary</label>
+                    <input id="idea-title" name="title" type="text" maxlength="120" required placeholder="A toggle to hide the armor HUD in the nether">
+                </div>
+
+                <div class="field">
+                    <label for="idea-kind">What's it about?</label>
+                    <select id="idea-kind" name="kind">
+                        <option>New mod</option>
+                        <option>Change to a mod</option>
+                        <option>Launcher</option>
+                        <option>Website</option>
+                        <option>Something else</option>
+                    </select>
+                </div>
+
+                <div class="field">
+                    <label for="idea-idea">What's your idea?</label>
+                    <p class="hint" id="idea-idea-hint">Describe what it would do and how you'd use it in game.</p>
+                    <textarea id="idea-idea" name="idea" maxlength="3000" required aria-describedby="idea-idea-hint"></textarea>
+                </div>
+
+                <div class="field">
+                    <label for="idea-why">What would it help with?</label>
+                    <p class="hint" id="idea-why-hint">Optional. The problem it solves, or when you'd want it.</p>
+                    <textarea id="idea-why" name="why" maxlength="2000" aria-describedby="idea-why-hint"></textarea>
+                </div>
+
+                <div class="field">
+                    <label for="idea-contact">Discord or GitHub name (optional)</label>
+                    <p class="hint" id="idea-contact-hint">Only if you're happy for it to appear on the public issue. Don't post your email.</p>
+                    <input id="idea-contact" name="contact" type="text" maxlength="60" aria-describedby="idea-contact-hint">
+                </div>
+
+                <!-- Left empty by people; bots tend to fill it in. -->
+                <div class="trap" aria-hidden="true">
+                    <label for="idea-website">Leave this empty</label>
+                    <input id="idea-website" name="website" type="text" tabindex="-1" autocomplete="off">
+                </div>
+
+                <p class="form-status" id="form-status" role="status" hidden></p>
+                <button class="button button-primary" type="submit" id="idea-submit">Send suggestion</button>
+            </form>
+
+            <aside aria-labelledby="tips-title">
+                <h2 id="tips-title">Good suggestions</h2>
+                <ul>
+                    <li>Stick to one idea per suggestion, so each can be tracked on its own.</li>
+                    <li>Check the <a href="https://github.com/Turbored80-MC/oinkster-client/issues?q=label%3Aenhancement">existing suggestions</a> first. If yours is there, leave a 👍 on it instead.</li>
+                    <li>Oinkster sticks to fair-play features, so ideas that give an unfair edge on servers won't be added.</li>
+                </ul>
+                <h2>Keep it clean</h2>
+                <p>Suggestions with swearing or slurs are rejected, even when they're spelled with symbols.</p>
+            </aside>
+        </div>
+    </main>
+
+    <footer class="site-footer">
+        <div class="footer-inner">
+            <a class="brand" href="./"><img src="assets/pig-64.png" alt="" width="32" height="32"><span>Oinkster</span></a>
+            <nav aria-label="Footer">
+                <a href="https://github.com/Turbored80-MC/oinkster-client">Client source</a>
+                <a href="https://github.com/Turbored80-MC/oinkster-client-website">Website source</a>
+                <a href="https://github.com/Turbored80-MC/oinkster-client/issues">All issues</a>
+            </nav>
+            <p class="legal">Not an official Minecraft product. Not approved by or associated with Mojang Studios or Microsoft.</p>
+        </div>
+    </footer>
+
+    <script src="suggestions.js" type="module"></script>
+</body>
+</html>

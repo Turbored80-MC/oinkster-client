@@ -96,6 +96,11 @@ std::optional<D3D12_GPU_DESCRIPTOR_HANDLE> FrameBlendResources::PreviousFrame() 
     return srv_[(current_ + HistoryCount - 1) % HistoryCount];
 }
 
+std::optional<D3D12_GPU_DESCRIPTOR_HANDLE> FrameBlendResources::CurrentFrame() const noexcept {
+    if (!Ready()) return std::nullopt;
+    return srv_[current_];
+}
+
 void FrameBlendResources::RecordCapture(ID3D12GraphicsCommandList* commandList, ID3D12Resource* backBuffer) {
     if (!Ready() || !commandList || !backBuffer) {
         previousValid_ = false;

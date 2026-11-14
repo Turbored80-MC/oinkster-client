@@ -1,4 +1,5 @@
 #include "Oinkster/ResourcePackTelemetry.hpp"
+#include "Oinkster/CrosshairTexture.hpp"
 #include "Oinkster/Diagnostics.hpp"
 #include "Oinkster/ModuleManager.hpp"
 #include "Oinkster/SafeMemory.hpp"
@@ -29,7 +30,8 @@ namespace {
 //  - PackInstance+0x100 -> [ ] -> [+0x8] -> [ ] is the PackManifest (the pack
 //    telemetry lambda at RVA 0x8E8590); PackManifest::getName (RVA 0x18F1010)
 //    falls back to the raw std::string at +0x110; the pack type byte at +0x181
-//    is 6 for resource packs.
+//    is 6 for resource packs. The header uuid is the two qwords at +0x150
+//    and +0x158 (the same lambda formats them as "{:08x}-{:04x}-...").
 constexpr std::size_t Actor_Level = 0x1D8;
 constexpr std::size_t ILevel_ResourcePackManagerSlot = 0x8C8 / sizeof(void*);
 constexpr std::size_t Manager_Stacks = 0x98;
@@ -38,6 +40,7 @@ constexpr std::size_t PackInstanceSize = 0x128;
 constexpr std::size_t PackInstance_Pack = 0x100;
 constexpr std::size_t Manifest_Name = 0x110;
 constexpr std::size_t Manifest_Type = 0x181;
+constexpr std::size_t Manifest_Uuid = 0x150;
 constexpr std::uint8_t ResourcePackType = 6;
 constexpr std::size_t LevelStack = 0;
 constexpr std::size_t GlobalStack = 2;
@@ -98,8 +101,9 @@ const void* ReadManager(const void* actor) noexcept {
     return manager;
 }
 
-// Appends the resource packs of one stack; false on any implausible read.
-bool ReadStack(const void* manager, std::size_t type, std::vector<ResourcePackInfo>& packs) {
+// Appends the resource packs of one stack (and their uuids, in the same
+// order); false on any implausible read.
+bool ReadStack(const void* manager, std::size_t type, std::vector<ResourcePackInfo>& packs, std::vector<std::string>& uuids) {
     const void* stack{};
     if (!SafeMemory::ReadField(manager, Manager_Stacks + type * sizeof(void*), stack)) return false;
     if (!stack) return true;  // an unused stack
@@ -124,6 +128,11 @@ bool ReadStack(const void* manager, std::size_t type, std::vector<ResourcePackIn
         std::uint8_t packType{};
         if (!SafeMemory::ReadField(manifest, Manifest_Type, packType)) return false;
         if (packType != ResourcePackType) continue;
+        std::array<std::uint64_t, 2> uuid{};
+        if (SafeMemory::ReadField(manifest, Manifest_Uuid, uuid) && (uuid[0] != 0 || uuid[1] != 0)
+            && uuids.size() < MaxPacksPerStack * 2) {
+            uuids.push_back(CrosshairTexture::FormatPackUuid(uuid[0], uuid[1]));
+        }
         std::string name;
         if (!SafeMemory::ReadMsvcString(manifest, Manifest_Name, name, 128)) return false;
         auto display = Modules::CleanWorldName(name);
@@ -146,13 +155,17 @@ void Attach(ModuleManager& modules) noexcept {
                 + std::wstring(SupportedBuild::DisplayVersion) + L"."}
             : CapabilityStatus{CapabilityState::Unavailable, L"Minecraft's code section could not be located."});
     } catch (...) {}
-    if (haveText) moduleManager.store(&modules, std::memory_order_release);
+    if (!haveText) return;
+    CrosshairTexture::Start();
+    moduleManager.store(&modules, std::memory_order_release);
 }
 
 void Detach() noexcept {
     auto* modules = moduleManager.exchange(nullptr, std::memory_order_acq_rel);
     if (!modules) return;
+    CrosshairTexture::Stop();
     try {
+        modules->Publish(GameCrosshairEvent{SteadyClock::now(), nullptr});
         modules->SetCapability(Capability::ResourcePacks, {CapabilityState::Unavailable, L"World telemetry was detached."});
     } catch (...) {}
 }
@@ -166,7 +179,11 @@ void Observe(const void* actor, SteadyTime now) noexcept {
         if (!manager) return;
         ResourcePackState state;
         state.capturedAt = now;
-        if (!ReadStack(manager, LevelStack, state.activePacks) || !ReadStack(manager, GlobalStack, state.activePacks)) return;
+        std::vector<std::string> uuids;
+        if (!ReadStack(manager, LevelStack, state.activePacks, uuids) || !ReadStack(manager, GlobalStack, state.activePacks, uuids)) return;
+        // The crosshair redrawn in third person comes from the same stacks.
+        CrosshairTexture::Request(std::move(uuids));
+        modules->Publish(GameCrosshairEvent{now, CrosshairTexture::Current()});
         if (!validated) {
             validated = true;
             modules->SetCapability(Capability::ResourcePacks, {CapabilityState::Available, {}});

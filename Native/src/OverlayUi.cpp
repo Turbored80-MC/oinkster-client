@@ -3,10 +3,18 @@
 #include "Oinkster/ModuleManager.hpp"
 #include "Oinkster/Dx12Overlay.hpp"
 #include "Oinkster/Diagnostics.hpp"
-#include "Oinkster/MouseInputBlocker.hpp"
+#include "Oinkster/ReplayInjector.hpp"
+#include "Oinkster/ReplayWorld.hpp"
+#include "Oinkster/ReplayTimeline.hpp"
+#include "Oinkster/SettingsStore.hpp"
+#include "Oinkster/UserResourcePacks.hpp"
+#include "Oinkster/ResourcePackReloadAdapter.hpp"
+#include "Oinkster/WorldTelemetry.hpp"
 #include "Oinkster/SkinHead.hpp"
+#include "Oinkster/VideoRecorder.hpp"
 #include "Oinkster/Modules/HudFormat.hpp"
 #include <Windows.h>
+#include <shellapi.h>
 #include <imgui.h>
 #include <algorithm>
 #include <array>
@@ -16,9 +24,13 @@
 #include <cmath>
 #include <cstring>
 #include <cstdint>
+#include <ctime>
+#include <filesystem>
+#include <functional>
 #include <format>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -28,7 +40,7 @@ namespace Oinkster::OverlayUi {
 namespace {
 using Clock = std::chrono::steady_clock;
 
-enum class Section { Home, Modules, Hud, Settings };
+enum class Section { Home, Modules, Profiles, Hud, Settings };
 enum class ControlCapture { None, Menu, Unload };
 enum class HubIcon { Pencil, Modules, Settings };
 
@@ -61,12 +73,26 @@ Clock::time_point sessionStarted{};
 std::atomic_bool sessionActive{};
 ControlCapture controlCapture{};
 std::string controlMessage;
-bool showCapabilities{};
 SkinHeadTexture playerHeadTexture{};
 std::uint64_t playerHeadRevision{};
 bool playerHeadReady{};
 std::mutex playerHeadMutex;
 bool menuWasVisible{};
+bool profilesLoaded{};
+std::vector<std::string> profileNames;
+std::string activeProfile;
+std::string pendingDeleteProfile;
+std::string profileMessage;
+bool profileMessageIsError{};
+std::array<char, 33> newProfileName{};
+std::optional<UserResourcePacks::Snapshot> packSnapshot;
+std::vector<std::string> stagedPackUuids;
+std::array<char, 96> packSearch{};
+Clock::time_point packFileCheckedAt{};
+bool packEditsDirty{};
+bool packFileConflict{};
+std::string packMessage;
+bool packMessageIsError{};
 float headYaw{};
 float headPitch{8.0F};
 float headYawVelocity{};
@@ -87,6 +113,1655 @@ std::string Narrow(std::wstring_view value) {
     result.reserve(value.size());
     for (const auto character : value) result.push_back(character <= 0x7f ? static_cast<char>(character) : '?');
     return result;
+}
+
+// Start / Pause / Mark / Finish / Discard for the active recorder. Shared by
+// the pause-menu panel and the Recorder card on the Replays page.
+void DrawRecorderControls(IReplayControlModule& replay, SteadyTime now, float buttonWidth) {
+    const auto snapshot = replay.ReplaySnapshot(now);
+    const bool canStart = snapshot.canStart;
+    const auto seconds = snapshot.elapsed.count() / 1000;
+    const auto stateLabel = snapshot.state == ReplayControlState::Recording ? "RECORDING"
+        : snapshot.state == ReplayControlState::Paused ? "PAUSED"
+        : snapshot.state == ReplayControlState::Error ? "ERROR" : "READY";
+    ImGui::TextColored(snapshot.state == ReplayControlState::Recording ? ImVec4(0.95F, 0.35F, 0.45F, 1.0F)
+        : ImVec4(0.72F, 0.74F, 0.77F, 1.0F), "%s  %02lld:%02lld  Marks %zu", stateLabel,
+        static_cast<long long>(seconds / 60), static_cast<long long>(seconds % 60), snapshot.markers);
+    const bool idle = snapshot.state == ReplayControlState::Idle || snapshot.state == ReplayControlState::Error;
+    const bool active = snapshot.state == ReplayControlState::Recording || snapshot.state == ReplayControlState::Paused;
+    const char* detail = snapshot.detail.c_str();
+    if (detail[0] != '\0') {
+        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + buttonWidth * 2.0F + 12.0F);
+        ImGui::TextDisabled("%s", detail);
+        ImGui::PopTextWrapPos();
+    }
+
+    const char* primary = snapshot.state == ReplayControlState::Recording ? "Pause"
+        : snapshot.state == ReplayControlState::Paused ? "Resume" : "Start";
+    ImGui::BeginDisabled(idle && !canStart);
+    if (ImGui::Button(primary, ImVec2(buttonWidth, 31.0F))) {
+        if (idle) (void)replay.StartReplay(now); else (void)replay.ToggleReplayPause(now);
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!active);
+    if (ImGui::Button("Mark", ImVec2(buttonWidth, 31.0F))) (void)replay.MarkReplay(now);
+    ImGui::EndDisabled();
+
+    ImGui::BeginDisabled(!active);
+    if (ImGui::Button("Finish", ImVec2(buttonWidth, 31.0F))) (void)replay.FinishReplay(now);
+    ImGui::SameLine();
+    if (ImGui::Button("Discard", ImVec2(buttonWidth, 31.0F))) ImGui::OpenPopup("Discard recording?");
+    ImGui::EndDisabled();
+    if (ImGui::BeginPopupModal("Discard recording?", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextUnformatted("Delete this unfinished recording?");
+        if (ImGui::Button("Keep", ImVec2(100.0F, 0.0F))) ImGui::CloseCurrentPopup();
+        ImGui::SameLine();
+        if (ImGui::Button("Discard", ImVec2(100.0F, 0.0F))) {
+            (void)replay.DiscardReplay();
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+}
+
+ImU32 WithAlpha(ImU32 color, float alpha);
+bool PrimaryButton(const char* label, ImVec2 size);
+
+std::string ClockText(std::uint64_t micros) {
+    const auto seconds = micros / 1'000'000;
+    return std::format("{:02}:{:02}", seconds / 60, seconds % 60);
+}
+
+void ExitReplayButton(const char* id, float width, float height);
+
+// Playback controls shown beside Minecraft's pause menu while watching.
+void DrawPlaybackControls() {
+    const auto status = ReplayInjector::CurrentStatus();
+    ImGui::TextColored(ImVec4(0.95F, 0.55F, 0.70F, 1.0F), "%s  %s / %s", status.paused ? "PAUSED" : "WATCHING",
+        ClockText(status.positionMicros).c_str(), ClockText(status.lengthMicros).c_str());
+    ImGui::TextDisabled("%s", status.phaseText.c_str());
+    if (ImGui::Button(status.paused ? "Play" : "Pause", ImVec2(124.0F, 31.0F))) ReplayInjector::SetPaused(!status.paused);
+    ImGui::SameLine();
+    if (ImGui::Button(std::format("Speed {}x", status.speed).c_str(), ImVec2(124.0F, 31.0F))) {
+        constexpr std::array<float, 4> Speeds{0.5F, 1.0F, 2.0F, 4.0F};
+        const auto current = std::ranges::find(Speeds, status.speed);
+        ReplayInjector::SetSpeed(current == Speeds.end() || current + 1 == Speeds.end() ? Speeds[0] : *(current + 1));
+    }
+    ExitReplayButton("panel-exit", 124.0F, 31.0F);
+}
+
+// --- Replay editor dock ----------------------------------------------------
+// The bottom timeline while a replay plays, laid out like Playback's editor:
+// a toolbar (timeline zoom, transport, time), an overview strip, a ruler and
+// track lanes under one orange playhead. It is interactive while Minecraft's
+// pause screen is open (the cursor is free there); during playback a thin
+// read-only bar takes its place.
+namespace Dock {
+// The Oinkster ramp (see the palette at the top of this file).
+constexpr ImU32 Panel = IM_COL32(24, 18, 22, 246);
+constexpr ImU32 Header = Rail;
+constexpr ImU32 Lane = Surface;
+constexpr ImU32 LaneAlt = IM_COL32(43, 32, 39, 255);
+constexpr ImU32 Line = Stroke;
+constexpr ImU32 Tick = IM_COL32(112, 86, 100, 255);
+constexpr ImU32 Label = Muted;
+constexpr ImU32 Time = Pink;
+constexpr ImU32 Mark = Secondary;
+constexpr ImU32 Playhead = Pink;
+constexpr ImU32 PinkHover = IM_COL32(248, 164, 196, 255);
+constexpr ImU32 Button = SurfaceRaised;
+constexpr ImU32 ButtonHover = IM_COL32(66, 46, 57, 255);
+constexpr float ToolbarHeight = 36.0F;
+constexpr float OverviewHeight = 18.0F;
+constexpr float RulerHeight = 26.0F;
+constexpr float TrackHeight = 26.0F;
+constexpr float LayersWidth = 150.0F;
+constexpr float StepMicros = 5'000'000.0F;
+constexpr std::array<float, 5> Speeds{0.25F, 0.5F, 1.0F, 2.0F, 4.0F};
+
+// Visible fraction of the clip is 1/zoom; scroll is the visible start (0-1).
+float zoom = 1.0F;
+float scroll = 0.0F;
+// A drag previews here and seeks on release, so dragging backwards does not
+// rebuild the world on every frame.
+std::optional<std::uint64_t> dragTarget;
+
+enum class Icon { Start, Back, Play, Pause, Forward, End };
+
+std::string Timecode(std::uint64_t micros) {
+    const auto hundredths = micros / 10'000;
+    return std::format("{:02}:{:02}.{:02}", hundredths / 6000, (hundredths / 100) % 60, hundredths % 100);
+}
+
+void DrawIcon(ImDrawList* draw, Icon icon, ImVec2 center, float size, ImU32 color) {
+    const float h = size * 0.5F;
+    const auto triangle = [&](float x, bool right) {
+        const float d = right ? h : -h;
+        draw->AddTriangleFilled(ImVec2(x - d * 0.8F, center.y - h), ImVec2(x - d * 0.8F, center.y + h),
+            ImVec2(x + d * 0.8F, center.y), color);
+    };
+    switch (icon) {
+    case Icon::Play: triangle(center.x + 1.0F, true); break;
+    case Icon::Pause:
+        draw->AddRectFilled(ImVec2(center.x - h * 0.8F, center.y - h), ImVec2(center.x - h * 0.2F, center.y + h), color, 1.0F);
+        draw->AddRectFilled(ImVec2(center.x + h * 0.2F, center.y - h), ImVec2(center.x + h * 0.8F, center.y + h), color, 1.0F);
+        break;
+    case Icon::Back: triangle(center.x - h * 0.45F, false); triangle(center.x + h * 0.55F, false); break;
+    case Icon::Forward: triangle(center.x - h * 0.55F, true); triangle(center.x + h * 0.45F, true); break;
+    case Icon::Start:
+        draw->AddRectFilled(ImVec2(center.x - h, center.y - h), ImVec2(center.x - h * 0.65F, center.y + h), color);
+        triangle(center.x + h * 0.25F, false);
+        break;
+    case Icon::End:
+        triangle(center.x - h * 0.25F, true);
+        draw->AddRectFilled(ImVec2(center.x + h * 0.65F, center.y - h), ImVec2(center.x + h, center.y + h), color);
+        break;
+    }
+}
+
+bool IconButton(const char* id, Icon icon, float size, bool accent = false) {
+    const ImVec2 position = ImGui::GetCursorScreenPos();
+    const bool clicked = ImGui::InvisibleButton(id, ImVec2(size, size));
+    const bool hovered = ImGui::IsItemHovered();
+    auto* draw = ImGui::GetWindowDrawList();
+    if (accent || hovered) {
+        draw->AddRectFilled(position, ImVec2(position.x + size, position.y + size),
+            accent ? (hovered ? PinkHover : Pink) : ButtonHover, 6.0F);
+    }
+    DrawIcon(draw, icon, ImVec2(position.x + size * 0.5F, position.y + size * 0.5F), size * 0.36F,
+        accent ? Canvas : hovered ? Text : Secondary);
+    return clicked;
+}
+
+bool TextButton(const char* label, float width, float height) {
+    ImGui::PushStyleColor(ImGuiCol_Button, ToVec4(Button));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ToVec4(ButtonHover));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ToVec4(Line));
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 5.0F);
+    const bool clicked = ImGui::Button(label, ImVec2(width, height));
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor(3);
+    return clicked;
+}
+
+// A tick spacing that keeps labels about 90px apart.
+std::uint64_t TickStep(double visibleMicros, float width) {
+    constexpr std::array<std::uint64_t, 10> steps{100'000, 250'000, 500'000, 1'000'000, 2'000'000, 5'000'000,
+        10'000'000, 30'000'000, 60'000'000, 300'000'000};
+    const double wanted = visibleMicros * 90.0 / std::max(1.0F, width);
+    for (const auto step : steps) {
+        if (static_cast<double>(step) >= wanted) return step;
+    }
+    return steps.back();
+}
+
+void ClampView() {
+    zoom = std::clamp(zoom, 1.0F, 64.0F);
+    scroll = std::clamp(scroll, 0.0F, 1.0F - 1.0F / zoom);
+}
+
+// Keeps the playhead in view while it plays past the visible window.
+void Follow(double fraction) {
+    const float visible = 1.0F / zoom;
+    if (fraction < scroll || fraction > scroll + visible) scroll = static_cast<float>(fraction) - visible * 0.1F;
+    ClampView();
+}
+}
+
+// "Exit replay", then "Confirm exit" for a few seconds; the second click
+// leaves the replay world. Shared by the pause-screen dock and the editor.
+Clock::time_point replayExitArmedAt{};
+
+void ExitReplayButton(const char* id, float width, float height) {
+    const auto now = Clock::now();
+    const bool armed = now - replayExitArmedAt < std::chrono::seconds(3);
+    if (armed) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ToVec4(Canvas));
+        ImGui::PushStyleColor(ImGuiCol_Button, ToVec4(Amber));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ToVec4(Amber));
+    }
+    const bool clicked = Dock::TextButton(std::format("{}##{}", armed ? "Confirm exit" : "Exit replay", id).c_str(), width, height);
+    if (armed) ImGui::PopStyleColor(3);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Leave the replay and go back to the menu");
+    if (!clicked) return;
+    if (armed) {
+        replayExitArmedAt = {};
+        ReplayInjector::Exit();
+    } else {
+        replayExitArmedAt = now;
+    }
+}
+
+void DrawReplayDock(const ReplayInjector::Status& status) {
+    const auto display = ImGui::GetIO().DisplaySize;
+    const float tracks = 2.0F;
+    const float height = Dock::ToolbarHeight + Dock::OverviewHeight + Dock::RulerHeight + Dock::TrackHeight * (tracks + 1.0F) + 8.0F;
+    ImGui::SetNextWindowPos(ImVec2(0.0F, display.y - height), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(display.x, height), ImGuiCond_Always);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0F, 0.0F));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0F);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0F);
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(4.0F, 0.0F));
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ToVec4(Dock::Panel));
+    ImGui::Begin("##replay-dock", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove
+        | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+    auto* draw = ImGui::GetWindowDrawList();
+    const ImVec2 origin = ImGui::GetWindowPos();
+    const float width = display.x;
+    const double length = static_cast<double>(std::max<std::uint64_t>(status.lengthMicros, 1));
+    const auto shown = Dock::dragTarget.value_or(status.positionMicros);
+    ImFont* font = CompactFont();
+
+    // Toolbar.
+    draw->AddRectFilled(origin, ImVec2(origin.x + width, origin.y + Dock::ToolbarHeight), Dock::Header);
+    draw->AddLine(ImVec2(origin.x, origin.y + Dock::ToolbarHeight), ImVec2(origin.x + width, origin.y + Dock::ToolbarHeight), Dock::Line);
+    const float rowY = origin.y + 5.0F;
+    ImGui::SetCursorScreenPos(ImVec2(origin.x + 10.0F, rowY));
+    if (Dock::TextButton("-##zoom-out", 26.0F, 26.0F)) Dock::zoom /= 1.5F;
+    ImGui::SameLine();
+    ImGui::SetCursorScreenPos(ImVec2(ImGui::GetCursorScreenPos().x, rowY + 5.0F));
+    ImGui::TextColored(ToVec4(Dock::Time), "%.1fx", Dock::zoom);
+    ImGui::SameLine();
+    ImGui::SetCursorScreenPos(ImVec2(ImGui::GetCursorScreenPos().x + 2.0F, rowY));
+    if (Dock::TextButton("+##zoom-in", 26.0F, 26.0F)) Dock::zoom *= 1.5F;
+    ImGui::SameLine();
+    if (Dock::TextButton("FIT", 40.0F, 26.0F)) {
+        Dock::zoom = 1.0F;
+        Dock::scroll = 0.0F;
+    }
+
+    // Transport, centred, with the current time to its left.
+    constexpr float IconSize = 26.0F;
+    const float transportWidth = IconSize * 5.0F + 4.0F * 4.0F;
+    const float transportX = origin.x + (width - transportWidth) * 0.5F;
+    const std::string current = Dock::Timecode(shown);
+    const ImVec2 currentSize = font->CalcTextSizeA(font->FontSize, FLT_MAX, 0.0F, current.c_str());
+    draw->AddText(font, font->FontSize, ImVec2(transportX - currentSize.x - 16.0F, rowY + 13.0F - currentSize.y * 0.5F),
+        Dock::Time, current.c_str());
+    const auto seek = [&](double micros) {
+        ReplayInjector::Seek(static_cast<std::uint64_t>(std::clamp(micros, 0.0, length)));
+    };
+    ImGui::SetCursorScreenPos(ImVec2(transportX, rowY));
+    if (Dock::IconButton("##start", Dock::Icon::Start, IconSize)) seek(0.0);
+    ImGui::SameLine();
+    if (Dock::IconButton("##back", Dock::Icon::Back, IconSize)) seek(static_cast<double>(status.positionMicros) - Dock::StepMicros);
+    ImGui::SameLine();
+    if (Dock::IconButton("##play", status.paused ? Dock::Icon::Play : Dock::Icon::Pause, IconSize, true)) {
+        ReplayInjector::SetPaused(!status.paused);
+    }
+    ImGui::SameLine();
+    if (Dock::IconButton("##forward", Dock::Icon::Forward, IconSize)) seek(static_cast<double>(status.positionMicros) + Dock::StepMicros);
+    ImGui::SameLine();
+    if (Dock::IconButton("##end", Dock::Icon::End, IconSize)) seek(length);
+
+    // Speed and total length, right-aligned.
+    const std::string total = Dock::Timecode(status.lengthMicros);
+    const ImVec2 totalSize = font->CalcTextSizeA(font->FontSize, FLT_MAX, 0.0F, total.c_str());
+    draw->AddText(font, font->FontSize, ImVec2(origin.x + width - totalSize.x - 14.0F, rowY + 13.0F - totalSize.y * 0.5F),
+        Dock::Label, total.c_str());
+    ImGui::SetCursorScreenPos(ImVec2(origin.x + width - totalSize.x - 14.0F - 12.0F - 70.0F - 8.0F - 96.0F, rowY));
+    ExitReplayButton("dock-exit", 96.0F, 26.0F);
+    ImGui::SetCursorScreenPos(ImVec2(origin.x + width - totalSize.x - 14.0F - 12.0F - 70.0F, rowY));
+    if (Dock::TextButton(std::format("{}x speed##speed", status.speed).c_str(), 70.0F, 26.0F)) {
+        const auto found = std::ranges::find(Dock::Speeds, status.speed);
+        ReplayInjector::SetSpeed(found == Dock::Speeds.end() || found + 1 == Dock::Speeds.end() ? Dock::Speeds[0] : *(found + 1));
+    }
+
+    // Timeline geometry: everything right of the layer column.
+    const float laneLeft = origin.x + Dock::LayersWidth;
+    const float laneRight = origin.x + width - 12.0F;
+    const float laneWidth = std::max(1.0F, laneRight - laneLeft);
+    Dock::ClampView();
+    const double visibleStart = static_cast<double>(Dock::scroll) * length;
+    const double visibleLength = length / static_cast<double>(Dock::zoom);
+    const auto toX = [&](double micros) { return laneLeft + static_cast<float>((micros - visibleStart) / visibleLength) * laneWidth; };
+    const auto toMicros = [&](float x) { return visibleStart + static_cast<double>((x - laneLeft) / laneWidth) * visibleLength; };
+    if (!Dock::dragTarget && !status.paused) Dock::Follow(static_cast<double>(status.positionMicros) / length);
+
+    // Overview strip: the whole clip, with the visible window highlighted.
+    const float overviewY = origin.y + Dock::ToolbarHeight + 4.0F;
+    const ImVec2 overviewMin(laneLeft, overviewY);
+    const ImVec2 overviewMax(laneRight, overviewY + Dock::OverviewHeight - 6.0F);
+    draw->AddRectFilled(overviewMin, overviewMax, Dock::Lane, 3.0F);
+    draw->AddRectFilled(ImVec2(laneLeft + laneWidth * Dock::scroll, overviewMin.y),
+        ImVec2(laneLeft + laneWidth * (Dock::scroll + 1.0F / Dock::zoom), overviewMax.y), Dock::Line, 3.0F);
+    const float overviewHead = laneLeft + laneWidth * static_cast<float>(static_cast<double>(shown) / length);
+    draw->AddLine(ImVec2(overviewHead, overviewMin.y), ImVec2(overviewHead, overviewMax.y), Dock::Playhead, 2.0F);
+    ImGui::SetCursorScreenPos(overviewMin);
+    ImGui::InvisibleButton("##overview", ImVec2(laneWidth, overviewMax.y - overviewMin.y));
+    if (ImGui::IsItemActive()) {
+        const float fraction = std::clamp((ImGui::GetIO().MousePos.x - laneLeft) / laneWidth, 0.0F, 1.0F);
+        Dock::dragTarget = static_cast<std::uint64_t>(fraction * length);
+    }
+    if (ImGui::IsItemDeactivated() && Dock::dragTarget) {
+        ReplayInjector::Seek(*Dock::dragTarget);
+        Dock::dragTarget.reset();
+    }
+
+    // Ruler.
+    const float rulerY = origin.y + Dock::ToolbarHeight + Dock::OverviewHeight;
+    draw->AddRectFilled(ImVec2(origin.x, rulerY), ImVec2(origin.x + width, rulerY + Dock::RulerHeight), Dock::Header);
+    draw->AddText(font, font->FontSize, ImVec2(origin.x + 12.0F, rulerY + 6.0F), Dock::Label, "Layers");
+    const auto step = Dock::TickStep(visibleLength, laneWidth);
+    draw->PushClipRect(ImVec2(laneLeft - 1.0F, rulerY), ImVec2(laneRight + 40.0F, origin.y + height), true);
+    for (auto t = static_cast<std::uint64_t>(visibleStart / static_cast<double>(step)) * step;
+         static_cast<double>(t) <= visibleStart + visibleLength; t += step) {
+        const float x = toX(static_cast<double>(t));
+        draw->AddLine(ImVec2(x, rulerY + Dock::RulerHeight - 7.0F), ImVec2(x, rulerY + Dock::RulerHeight), Dock::Tick);
+        const std::string label = Dock::Timecode(t);
+        draw->AddText(font, font->FontSize * 0.9F, ImVec2(x + 3.0F, rulerY + 4.0F), Dock::Label, label.c_str());
+        for (int minor = 1; minor < 4; ++minor) {
+            const float mx = toX(static_cast<double>(t) + static_cast<double>(step) * minor / 4.0);
+            draw->AddLine(ImVec2(mx, rulerY + Dock::RulerHeight - 4.0F), ImVec2(mx, rulerY + Dock::RulerHeight), Dock::Line);
+        }
+    }
+    draw->PopClipRect();
+
+    // Tracks: the recording player's span and the recording's marks.
+    const float tracksY = rulerY + Dock::RulerHeight;
+    const std::array<const char*, 2> names{"Player", "Marks"};
+    for (std::size_t index = 0; index < names.size(); ++index) {
+        const float y = tracksY + Dock::TrackHeight * static_cast<float>(index);
+        draw->AddRectFilled(ImVec2(origin.x, y), ImVec2(origin.x + width, y + Dock::TrackHeight), index % 2 ? Dock::LaneAlt : Dock::Lane);
+        draw->AddLine(ImVec2(origin.x, y + Dock::TrackHeight), ImVec2(origin.x + width, y + Dock::TrackHeight), Dock::Line);
+        draw->AddCircleFilled(ImVec2(origin.x + 16.0F, y + Dock::TrackHeight * 0.5F), 3.0F, index == 0 ? Pink : Dock::Mark);
+        draw->AddText(font, font->FontSize, ImVec2(origin.x + 26.0F, y + 5.0F), Text, names[index]);
+    }
+    draw->AddLine(ImVec2(laneLeft, rulerY), ImVec2(laneLeft, tracksY + Dock::TrackHeight * 2.0F), Dock::Line);
+    draw->PushClipRect(ImVec2(laneLeft, tracksY), ImVec2(laneRight, tracksY + Dock::TrackHeight * 2.0F), true);
+    draw->AddRectFilled(ImVec2(toX(0.0), tracksY + 6.0F), ImVec2(toX(length), tracksY + Dock::TrackHeight - 6.0F),
+        WithAlpha(Pink, 0.45F), 4.0F);
+    for (const auto& mark : status.marks) {
+        const float x = toX(static_cast<double>(mark.positionMicros));
+        const float cy = tracksY + Dock::TrackHeight * 1.5F;
+        draw->AddQuadFilled(ImVec2(x, cy - 6.0F), ImVec2(x + 6.0F, cy), ImVec2(x, cy + 6.0F), ImVec2(x - 6.0F, cy), Dock::Mark);
+        if (ImGui::IsMouseHoveringRect(ImVec2(x - 7.0F, cy - 7.0F), ImVec2(x + 7.0F, cy + 7.0F))) {
+            ImGui::SetTooltip("%s  %s", mark.label.c_str(), Dock::Timecode(mark.positionMicros).c_str());
+        }
+    }
+    draw->PopClipRect();
+
+    // Scrubbing on the ruler and lanes; Ctrl+wheel zooms around the cursor.
+    const float scrubHeight = Dock::RulerHeight + Dock::TrackHeight * 2.0F;
+    ImGui::SetCursorScreenPos(ImVec2(laneLeft, rulerY));
+    ImGui::InvisibleButton("##scrub", ImVec2(laneWidth, scrubHeight));
+    const bool scrubHovered = ImGui::IsItemHovered();
+    if (ImGui::IsItemActive()) {
+        Dock::dragTarget = static_cast<std::uint64_t>(std::clamp(toMicros(ImGui::GetIO().MousePos.x), 0.0, length));
+    }
+    if (ImGui::IsItemDeactivated() && Dock::dragTarget) {
+        ReplayInjector::Seek(*Dock::dragTarget);
+        Dock::dragTarget.reset();
+    }
+    if (scrubHovered && ImGui::GetIO().KeyCtrl && ImGui::GetIO().MouseWheel != 0.0F) {
+        const double pivot = toMicros(ImGui::GetIO().MousePos.x) / length;
+        const float pivotOffset = static_cast<float>(pivot) - Dock::scroll;
+        const float before = Dock::zoom;
+        Dock::zoom *= ImGui::GetIO().MouseWheel > 0.0F ? 1.25F : 0.8F;
+        Dock::ClampView();
+        Dock::scroll = static_cast<float>(pivot) - pivotOffset * before / Dock::zoom;
+        Dock::ClampView();
+    } else if (scrubHovered && ImGui::GetIO().MouseWheel != 0.0F) {
+        Dock::scroll -= ImGui::GetIO().MouseWheel * 0.1F / Dock::zoom;
+        Dock::ClampView();
+    }
+
+    // Playhead across ruler and lanes, with a handle on the ruler.
+    const float headX = toX(static_cast<double>(shown));
+    if (headX >= laneLeft - 1.0F && headX <= laneRight + 1.0F) {
+        draw->AddLine(ImVec2(headX, rulerY), ImVec2(headX, tracksY + Dock::TrackHeight * 2.0F), Dock::Playhead, 2.0F);
+        draw->AddTriangleFilled(ImVec2(headX - 6.0F, rulerY), ImVec2(headX + 6.0F, rulerY), ImVec2(headX, rulerY + 8.0F), Dock::Playhead);
+    }
+
+    ImGui::End();
+    ImGui::PopStyleColor();
+    ImGui::PopStyleVar(4);
+}
+
+// --- Replay editor -----------------------------------------------------------
+// The full-screen editor that opens when a replay world is joined, laid out
+// like Playback's: a title bar, an icon rail, a keyframe panel on the left,
+// the game (the last raw frame, scaled) in a viewport on the right with the
+// transport under it, and the timeline across the bottom. Keyframes are not
+// implemented yet, so their controls are drawn disabled.
+namespace Editor {
+constexpr ImU32 Backdrop = IM_COL32(18, 13, 16, 255);
+constexpr ImU32 Bar = Rail;
+constexpr ImU32 PanelFill = Surface;
+constexpr ImU32 Accent = Pink;
+constexpr ImU32 Disabled = IM_COL32(98, 78, 89, 255);
+constexpr float TitleHeight = 30.0F;
+constexpr float RailWidth = 36.0F;
+constexpr float TransportHeight = 40.0F;
+constexpr float RowHeight = 28.0F;
+constexpr float LayersWidth = 150.0F;
+
+enum class Glyph { Keyframes, Person, Gear, Info, Plus, Pointer, Undo, Trash, Eye, Lock, ZoomIn, ZoomOut, Prev, Next, Close };
+
+void DrawGlyph(ImDrawList* draw, Glyph glyph, ImVec2 c, float r, ImU32 color) {
+    switch (glyph) {
+    case Glyph::Keyframes:
+        draw->AddQuadFilled(ImVec2(c.x, c.y - r), ImVec2(c.x + r, c.y), ImVec2(c.x, c.y + r), ImVec2(c.x - r, c.y), color);
+        break;
+    case Glyph::Person:
+        draw->AddCircle(ImVec2(c.x, c.y - r * 0.35F), r * 0.38F, color, 16, 1.6F);
+        draw->PathArcTo(ImVec2(c.x, c.y + r * 0.95F), r * 0.75F, 3.14159F * 1.08F, 3.14159F * 1.92F, 16);
+        draw->PathStroke(color, ImDrawFlags_None, 1.6F);
+        break;
+    case Glyph::Gear:
+        for (int tooth = 0; tooth < 8; ++tooth) {
+            const float angle = static_cast<float>(tooth) * 3.14159F / 4.0F;
+            draw->AddLine(ImVec2(c.x + std::cos(angle) * r * 0.55F, c.y + std::sin(angle) * r * 0.55F),
+                ImVec2(c.x + std::cos(angle) * r * 0.95F, c.y + std::sin(angle) * r * 0.95F), color, 2.4F);
+        }
+        draw->AddCircle(c, r * 0.6F, color, 16, 1.8F);
+        draw->AddCircleFilled(c, r * 0.22F, color);
+        break;
+    case Glyph::Info:
+        draw->AddCircle(c, r * 0.9F, color, 20, 1.5F);
+        draw->AddCircleFilled(ImVec2(c.x, c.y - r * 0.4F), 1.3F, color);
+        draw->AddLine(ImVec2(c.x, c.y - r * 0.1F), ImVec2(c.x, c.y + r * 0.5F), color, 1.6F);
+        break;
+    case Glyph::Plus:
+        draw->AddLine(ImVec2(c.x - r * 0.7F, c.y), ImVec2(c.x + r * 0.7F, c.y), color, 1.8F);
+        draw->AddLine(ImVec2(c.x, c.y - r * 0.7F), ImVec2(c.x, c.y + r * 0.7F), color, 1.8F);
+        break;
+    case Glyph::Pointer:
+        draw->AddTriangleFilled(ImVec2(c.x - r * 0.5F, c.y - r * 0.8F), ImVec2(c.x - r * 0.5F, c.y + r * 0.5F),
+            ImVec2(c.x + r * 0.5F, c.y + r * 0.1F), color);
+        draw->AddLine(ImVec2(c.x - r * 0.1F, c.y + r * 0.1F), ImVec2(c.x + r * 0.3F, c.y + r * 0.8F), color, 1.8F);
+        break;
+    case Glyph::Undo:
+        draw->PathArcTo(c, r * 0.6F, 3.14159F * 1.1F, 3.14159F * 2.6F, 16);
+        draw->PathStroke(color, ImDrawFlags_None, 1.6F);
+        draw->AddTriangleFilled(ImVec2(c.x - r * 0.95F, c.y - r * 0.45F), ImVec2(c.x - r * 0.25F, c.y - r * 0.45F),
+            ImVec2(c.x - r * 0.6F, c.y + r * 0.1F), color);
+        break;
+    case Glyph::Trash:
+        draw->AddRect(ImVec2(c.x - r * 0.5F, c.y - r * 0.45F), ImVec2(c.x + r * 0.5F, c.y + r * 0.85F), color, 1.5F, 0, 1.5F);
+        draw->AddLine(ImVec2(c.x - r * 0.75F, c.y - r * 0.6F), ImVec2(c.x + r * 0.75F, c.y - r * 0.6F), color, 1.6F);
+        draw->AddLine(ImVec2(c.x - r * 0.2F, c.y - r * 0.85F), ImVec2(c.x + r * 0.2F, c.y - r * 0.85F), color, 1.6F);
+        break;
+    case Glyph::Eye:
+        draw->PathArcTo(ImVec2(c.x, c.y + r * 0.9F), r * 1.25F, 3.14159F * 1.23F, 3.14159F * 1.77F, 12);
+        draw->PathArcTo(ImVec2(c.x, c.y - r * 0.9F), r * 1.25F, 3.14159F * 0.23F, 3.14159F * 0.77F, 12);
+        draw->PathStroke(color, ImDrawFlags_Closed, 1.4F);
+        draw->AddCircleFilled(c, r * 0.28F, color);
+        break;
+    case Glyph::Lock:
+        draw->AddRectFilled(ImVec2(c.x - r * 0.55F, c.y - r * 0.1F), ImVec2(c.x + r * 0.55F, c.y + r * 0.75F), color, 1.5F);
+        draw->PathArcTo(ImVec2(c.x, c.y - r * 0.15F), r * 0.36F, 3.14159F, 3.14159F * 2.0F, 10);
+        draw->PathStroke(color, ImDrawFlags_None, 1.5F);
+        break;
+    case Glyph::ZoomIn:
+    case Glyph::ZoomOut:
+        draw->AddCircle(ImVec2(c.x - r * 0.15F, c.y - r * 0.15F), r * 0.55F, color, 16, 1.5F);
+        draw->AddLine(ImVec2(c.x + r * 0.25F, c.y + r * 0.25F), ImVec2(c.x + r * 0.8F, c.y + r * 0.8F), color, 1.8F);
+        draw->AddLine(ImVec2(c.x - r * 0.42F, c.y - r * 0.15F), ImVec2(c.x + r * 0.12F, c.y - r * 0.15F), color, 1.3F);
+        if (glyph == Glyph::ZoomIn) {
+            draw->AddLine(ImVec2(c.x - r * 0.15F, c.y - r * 0.42F), ImVec2(c.x - r * 0.15F, c.y + r * 0.12F), color, 1.3F);
+        }
+        break;
+    case Glyph::Prev:
+        draw->AddLine(ImVec2(c.x + r * 0.25F, c.y - r * 0.55F), ImVec2(c.x - r * 0.25F, c.y), color, 1.7F);
+        draw->AddLine(ImVec2(c.x - r * 0.25F, c.y), ImVec2(c.x + r * 0.25F, c.y + r * 0.55F), color, 1.7F);
+        break;
+    case Glyph::Next:
+        draw->AddLine(ImVec2(c.x - r * 0.25F, c.y - r * 0.55F), ImVec2(c.x + r * 0.25F, c.y), color, 1.7F);
+        draw->AddLine(ImVec2(c.x + r * 0.25F, c.y), ImVec2(c.x - r * 0.25F, c.y + r * 0.55F), color, 1.7F);
+        break;
+    case Glyph::Close:
+        draw->AddLine(ImVec2(c.x - r * 0.55F, c.y - r * 0.55F), ImVec2(c.x + r * 0.55F, c.y + r * 0.55F), color, 1.6F);
+        draw->AddLine(ImVec2(c.x + r * 0.55F, c.y - r * 0.55F), ImVec2(c.x - r * 0.55F, c.y + r * 0.55F), color, 1.6F);
+        break;
+    }
+}
+
+// A square glyph button. Disabled buttons still show their tooltip.
+bool GlyphButton(const char* id, Glyph glyph, ImVec2 position, float size, const char* tooltip,
+    bool enabled = true, bool active = false) {
+    ImGui::SetCursorScreenPos(position);
+    const bool clicked = ImGui::InvisibleButton(id, ImVec2(size, size)) && enabled;
+    const bool hovered = ImGui::IsItemHovered();
+    auto* draw = ImGui::GetWindowDrawList();
+    if (active) draw->AddRectFilled(position, ImVec2(position.x + size, position.y + size), Accent, 5.0F);
+    else if (hovered && enabled) draw->AddRectFilled(position, ImVec2(position.x + size, position.y + size), Dock::ButtonHover, 5.0F);
+    const ImU32 color = active ? Canvas : !enabled ? Disabled : hovered ? Text : Dock::Label;
+    DrawGlyph(draw, glyph, ImVec2(position.x + size * 0.5F, position.y + size * 0.5F), size * 0.3F, color);
+    if (hovered && tooltip) ImGui::SetTooltip("%s", tooltip);
+    return clicked;
+}
+
+}
+
+// Camera keyframe editing, shared by the editor and the hotbar: an undo
+// history of whole paths, the selected keyframe, a timeline drag, and a short
+// notice when a keyframe could not be added.
+namespace Keyframes {
+constexpr std::size_t UndoDepth = 64;
+constexpr auto NoticeDuration = std::chrono::milliseconds(2200);
+std::vector<ReplayCameraPath::Path> undo;
+std::optional<std::size_t> selected;
+std::optional<std::size_t> dragging;
+bool dragMoved{};
+std::string notice;
+Clock::time_point noticeAt{};
+
+void Notify(std::string text) {
+    notice = std::move(text);
+    noticeAt = Clock::now();
+}
+
+void Commit(const ReplayCameraPath::Path& before, ReplayCameraPath::Path after) {
+    if (before == after) return;
+    undo.push_back(before);
+    if (undo.size() > UndoDepth) undo.erase(undo.begin());
+    ReplayInjector::SetCameraPath(std::move(after));
+}
+
+// Pins the current view to the playhead. False (with a notice) if it can't.
+bool AddHere(const ReplayInjector::Status& status) {
+    if (!status.playing) {
+        Notify("The replay isn't playing yet");
+        return false;
+    }
+    const auto view = WorldTelemetry::LatestView();
+    if (!view || !view->yawDegrees || !view->pitchDegrees) {
+        Notify("Can't tell where the camera is yet");
+        return false;
+    }
+    const auto before = ReplayInjector::CameraPath();
+    auto after = before;
+    selected = after.Add({status.positionMicros, view->eye, *view->yawDegrees, *view->pitchDegrees});
+    Notify(std::format("Keyframe {} of {} at {}", *selected + 1, after.Size(), Dock::Timecode(status.positionMicros)));
+    Commit(before, std::move(after));
+    return true;
+}
+
+void RemoveSelected() {
+    const auto before = ReplayInjector::CameraPath();
+    if (!selected || *selected >= before.Size()) {
+        selected.reset();
+        return;
+    }
+    auto after = before;
+    after.Remove(*selected);
+    selected.reset();
+    Commit(before, std::move(after));
+}
+
+void Undo() {
+    if (undo.empty()) return;
+    auto previous = std::move(undo.back());
+    undo.pop_back();
+    selected.reset();
+    ReplayInjector::SetCameraPath(std::move(previous));
+}
+
+// A new replay starts a new history.
+void Reset() {
+    undo.clear();
+    selected.reset();
+    dragging.reset();
+    notice.clear();
+}
+
+bool NoticeShowing(Clock::time_point now) { return !notice.empty() && now - noticeAt < NoticeDuration; }
+
+void SetEase(std::size_t index, ReplayCameraPath::Ease ease) {
+    const auto before = ReplayInjector::CameraPath();
+    auto after = before;
+    after.SetEase(index, ease);
+    Commit(before, std::move(after));
+}
+}
+
+// Rendering a video: jump to the first keyframe and hold there while the
+// world rebuilds, then record the game while the camera flies the path, and
+// stop at the last keyframe. The recorder captures the game's frame before
+// any Oinkster overlay, so nothing drawn here ends up in the video.
+namespace Render {
+enum class Stage { Idle, Preparing, Recording };
+constexpr auto SettleTime = std::chrono::milliseconds(1500);
+Stage stage{Stage::Idle};
+Clock::time_point since{};
+std::uint64_t startMicros{};
+std::uint64_t endMicros{};
+bool awaitingResult{};
+
+std::filesystem::path VideoDirectory() {
+    wchar_t localAppData[32768]{};
+    const auto length = GetEnvironmentVariableW(L"LOCALAPPDATA", localAppData, static_cast<DWORD>(std::size(localAppData)));
+    if (length > 0 && length < std::size(localAppData)) {
+        return std::filesystem::path(localAppData) / L"Oinkster" / L"Client" / L"videos";
+    }
+    return std::filesystem::temp_directory_path() / L"Oinkster" / L"videos";
+}
+
+// <replay name> <date> <time>.mp4
+std::filesystem::path NextVideoFile() {
+    const auto replay = ReplayInjector::WatchedReplay();
+    const std::wstring stem = replay.empty() ? std::wstring(L"replay") : replay.stem().wstring();
+    const std::time_t now = std::time(nullptr);
+    std::tm local{};
+    (void)localtime_s(&local, &now);
+    return VideoDirectory() / std::format(L"{} {:04}-{:02}-{:02} {:02}.{:02}.{:02}.mp4", stem, local.tm_year + 1900, local.tm_mon + 1,
+        local.tm_mday, local.tm_hour, local.tm_min, local.tm_sec);
+}
+
+bool Busy() noexcept { return stage != Stage::Idle; }
+
+bool Begin(const ReplayCameraPath::Path& path) {
+    if (path.Size() < 2 || stage != Stage::Idle || VideoRecorder::Recording() || VideoRecorder::Current().finishing) return false;
+    startMicros = path.Keyframes().front().micros;
+    endMicros = path.Keyframes().back().micros;
+    ReplayInjector::SetPaused(true);
+    ReplayInjector::SetSpeed(1.0F);
+    ReplayInjector::Seek(startMicros);
+    ReplayInjector::PlayCameraPath(true);
+    stage = Stage::Preparing;
+    since = Clock::now();
+    Keyframes::Notify("Getting the first shot ready...");
+    return true;
+}
+
+void Finish(bool stopPath) {
+    if (stage == Stage::Recording) {
+        VideoRecorder::Stop();
+        awaitingResult = true;
+    }
+    if (stopPath) ReplayInjector::PlayCameraPath(false);
+    ReplayInjector::SetPaused(true);
+    stage = Stage::Idle;
+}
+
+// Once a frame.
+void Update(const ReplayInjector::Status& status) {
+    const auto now = Clock::now();
+    if (stage != Stage::Idle && !status.running) {
+        if (stage == Stage::Recording) {
+            VideoRecorder::Stop();
+            awaitingResult = true;
+        }
+        stage = Stage::Idle;
+    } else if (stage == Stage::Preparing) {
+        // Shift (or following a player) during the wait cancels.
+        if (!status.cameraPathPlaying) {
+            stage = Stage::Idle;
+        } else if (now - since >= SettleTime) {
+            std::string error;
+            if (!VideoRecorder::Start(NextVideoFile(), error)) {
+                Keyframes::Notify(error);
+                Finish(true);
+            } else {
+                ReplayInjector::SetPaused(false);
+                stage = Stage::Recording;
+                since = now;
+            }
+        }
+    } else if (stage == Stage::Recording) {
+        if (!status.cameraPathPlaying) Finish(false);
+        else if (status.positionMicros >= endMicros || status.positionMicros >= status.lengthMicros || !VideoRecorder::Recording()) Finish(true);
+    }
+    if (awaitingResult) {
+        const auto recorded = VideoRecorder::Current();
+        if (!recorded.recording && !recorded.finishing) {
+            awaitingResult = false;
+            Keyframes::Notify(recorded.error.empty()
+                ? std::format("Saved \"{}\" to the videos folder", Narrow(recorded.file.filename().wstring()))
+                : recorded.error);
+        }
+    }
+}
+
+// A small REC badge, top left. The recording never contains it.
+void DrawBadge() {
+    if (stage == Stage::Idle && !VideoRecorder::Current().finishing) return;
+    auto* draw = ImGui::GetForegroundDrawList();
+    ImFont* font = CompactFont();
+    const auto recorded = VideoRecorder::Current();
+    const std::string text = stage == Stage::Preparing ? std::string("Getting ready to record...")
+        : stage == Stage::Recording ? std::format("REC  {}  /  {}   Shift to stop", Dock::Timecode(static_cast<std::uint64_t>(recorded.seconds * 1'000'000.0)),
+            Dock::Timecode(endMicros - startMicros))
+        : std::string("Saving the video...");
+    const ImVec2 size = font->CalcTextSizeA(font->FontSize, FLT_MAX, 0.0F, text.c_str());
+    const ImVec2 min(14.0F, 14.0F);
+    const ImVec2 max(min.x + size.x + 34.0F, min.y + size.y + 14.0F);
+    draw->AddRectFilled(min, max, WithAlpha(Canvas, 0.88F), 8.0F);
+    const bool blink = stage != Stage::Recording || std::fmod(std::chrono::duration<double>(Clock::now().time_since_epoch()).count(), 1.0) < 0.6;
+    if (blink) draw->AddCircleFilled(ImVec2(min.x + 14.0F, (min.y + max.y) * 0.5F), 5.0F, stage == Stage::Recording ? IM_COL32(230, 70, 80, 255) : Amber);
+    draw->AddText(font, font->FontSize, ImVec2(min.x + 26.0F, min.y + 7.0F), Text, text.c_str());
+}
+}
+
+void DrawReplayEditor(const FrameInfo& frame, DrawResult& result) {
+    if (!ReplayInjector::Running()) {
+        result.closeRequested = true;
+        return;
+    }
+    const auto status = ReplayInjector::CurrentStatus();
+    const auto display = ImGui::GetIO().DisplaySize;
+    const double length = static_cast<double>(std::max<std::uint64_t>(status.lengthMicros, 1));
+    const auto shown = Dock::dragTarget.value_or(status.positionMicros);
+    const auto seek = [&](double micros) {
+        ReplayInjector::Seek(static_cast<std::uint64_t>(std::clamp(micros, 0.0, length)));
+    };
+    const auto cameraPath = ReplayInjector::CameraPath();
+    const auto& keyframes = cameraPath.Keyframes();
+    if (Keyframes::selected && *Keyframes::selected >= keyframes.size()) Keyframes::selected.reset();
+
+    // Keyboard: Esc leaves the editor (the replay keeps playing), Space
+    // plays/pauses, Left/Right step; N adds a keyframe, Delete removes the
+    // selected one, Ctrl+Z undoes.
+    if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) result.closeRequested = true;
+    if (ImGui::IsKeyPressed(ImGuiKey_N, false)) (void)Keyframes::AddHere(status);
+    if (ImGui::IsKeyPressed(ImGuiKey_Delete, false)) Keyframes::RemoveSelected();
+    if (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Z, false)) Keyframes::Undo();
+    if (ImGui::IsKeyPressed(ImGuiKey_Space, false)) ReplayInjector::SetPaused(!status.paused);
+    if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow)) seek(static_cast<double>(status.positionMicros) - Dock::StepMicros);
+    if (ImGui::IsKeyPressed(ImGuiKey_RightArrow)) seek(static_cast<double>(status.positionMicros) + Dock::StepMicros);
+
+    ImGui::SetNextWindowPos(ImVec2(0.0F, 0.0F), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(display, ImGuiCond_Always);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0F, 0.0F));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0F);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0F);
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(4.0F, 0.0F));
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ToVec4(Editor::Backdrop));
+    ImGui::Begin("##replay-editor", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove
+        | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoBringToFrontOnFocus);
+    auto* draw = ImGui::GetWindowDrawList();
+    ImFont* font = CompactFont();
+    const float W = display.x;
+    const float H = display.y;
+    const auto textAt = [&](ImVec2 position, ImU32 color, const std::string& text, ImFont* with = nullptr) {
+        ImFont* used = with ? with : font;
+        draw->AddText(used, used->FontSize, position, color, text.c_str());
+    };
+    const auto textSize = [&](const std::string& text, ImFont* with = nullptr) {
+        ImFont* used = with ? with : font;
+        return used->CalcTextSizeA(used->FontSize, FLT_MAX, 0.0F, text.c_str());
+    };
+
+    // Geometry.
+    const float timelineHeight = std::clamp(H * 0.2F, 150.0F, 260.0F);
+    const float timelineTop = H - timelineHeight;
+    const float leftX = Editor::RailWidth;
+    const float leftWidth = std::clamp(W * 0.36F, 280.0F, 640.0F);
+    const float rightX = leftX + leftWidth;
+    const float bodyTop = Editor::TitleHeight;
+
+    // Title bar.
+    draw->AddRectFilled(ImVec2(0.0F, 0.0F), ImVec2(W, Editor::TitleHeight), Editor::Bar);
+    draw->AddLine(ImVec2(0.0F, Editor::TitleHeight), ImVec2(W, Editor::TitleHeight), Dock::Line);
+    const std::string keyframeCount = std::format("Keyframes: {}", keyframes.size());
+    textAt(ImVec2(leftX + 10.0F, (Editor::TitleHeight - textSize(keyframeCount, BodyFont()).y) * 0.5F), Text, keyframeCount, BodyFont());
+    const std::string title = "Replay Playback";
+    const ImVec2 titleSize = textSize(title);
+    textAt(ImVec2((W - titleSize.x) * 0.5F, (Editor::TitleHeight - titleSize.y) * 0.5F), Dock::Label, title);
+    if (Editor::GlyphButton("##editor-close", Editor::Glyph::Close, ImVec2(W - 30.0F, 3.0F), 24.0F,
+        "Close the editor (Esc). The replay keeps playing; K reopens it.")) {
+        result.closeRequested = true;
+    }
+    const std::string speedText = status.paused ? "PAUSED" : std::format("{}x", status.speed);
+    const ImVec2 speedSize = textSize(speedText);
+    textAt(ImVec2(W - 42.0F - speedSize.x, (Editor::TitleHeight - speedSize.y) * 0.5F), status.paused ? Amber : Dock::Label, speedText);
+    ImGui::SetCursorScreenPos(ImVec2(W - 42.0F - speedSize.x - 14.0F - 100.0F, 4.0F));
+    ExitReplayButton("editor-exit", 100.0F, Editor::TitleHeight - 8.0F);
+    {
+        const bool rendering = Render::Busy();
+        const bool canRender = rendering || keyframes.size() >= 2;
+        ImGui::SetCursorScreenPos(ImVec2(W - 42.0F - speedSize.x - 14.0F - 100.0F - 8.0F - 112.0F, 4.0F));
+        ImGui::BeginDisabled(!canRender);
+        if (rendering ? Dock::TextButton("Stop render##render", 112.0F, Editor::TitleHeight - 8.0F)
+                      : PrimaryButton("Render video##render", ImVec2(112.0F, Editor::TitleHeight - 8.0F))) {
+            if (rendering) {
+                Render::Finish(true);
+            } else if (Render::Begin(cameraPath)) {
+                // Watch it happen in the game; the video won't contain the editor anyway.
+                result.closeRequested = true;
+            }
+        }
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+            ImGui::SetTooltip("%s", canRender
+                ? "Fly the camera path from the first keyframe to the last and save it as an MP4 (videos folder)"
+                : "Add two or more keyframes first");
+        }
+    }
+
+    // Icon rail.
+    draw->AddRectFilled(ImVec2(0.0F, bodyTop), ImVec2(Editor::RailWidth, H), Editor::Bar);
+    draw->AddLine(ImVec2(Editor::RailWidth, bodyTop), ImVec2(Editor::RailWidth, H), Dock::Line);
+    constexpr float RailButton = 26.0F;
+    const float railX = (Editor::RailWidth - RailButton) * 0.5F;
+    float railY = bodyTop + 8.0F;
+    (void)Editor::GlyphButton("##rail-editor", Editor::Glyph::Keyframes, ImVec2(railX, railY), RailButton, "Replay editor", true, true);
+    railY += RailButton + 6.0F;
+    (void)Editor::GlyphButton("##rail-camera", Editor::Glyph::Person, ImVec2(railX, railY), RailButton,
+        "Spectating the recording player", false);
+    railY += RailButton + 6.0F;
+    if (Editor::GlyphButton("##rail-settings", Editor::Glyph::Gear, ImVec2(railX, railY), RailButton, "Oinkster menu")) {
+        result.openClickGui = true;
+    }
+    railY += RailButton + 6.0F;
+    (void)Editor::GlyphButton("##rail-info", Editor::Glyph::Info, ImVec2(railX, railY), RailButton,
+        "Space  play / pause\nLeft / Right  step 5 s\nN  add a camera keyframe here\nDelete  remove the selected keyframe\n"
+        "Ctrl + Z  undo\nCtrl + wheel  zoom the timeline\nEsc  close the editor\nK  reopen it");
+    float railBottom = H - 8.0F - RailButton;
+    if (Editor::GlyphButton("##rail-trash", Editor::Glyph::Trash, ImVec2(railX, railBottom), RailButton,
+        "Delete the selected keyframe (Delete)", Keyframes::selected.has_value())) {
+        Keyframes::RemoveSelected();
+    }
+    railBottom -= RailButton + 6.0F;
+    if (Editor::GlyphButton("##rail-undo", Editor::Glyph::Undo, ImVec2(railX, railBottom), RailButton, "Undo (Ctrl+Z)",
+        !Keyframes::undo.empty())) {
+        Keyframes::Undo();
+    }
+    railBottom -= RailButton + 6.0F;
+    (void)Editor::GlyphButton("##rail-select", Editor::Glyph::Pointer, ImVec2(railX, railBottom), RailButton, "Select");
+    railBottom -= RailButton + 6.0F;
+    if (Editor::GlyphButton("##rail-add", Editor::Glyph::Plus, ImVec2(railX, railBottom), RailButton,
+        "Add a camera keyframe here: the current view at the playhead (N)", status.playing)) {
+        (void)Keyframes::AddHere(status);
+    }
+
+    // Left panel: the keyframe speed curve on top, playback settings below.
+    draw->AddRectFilled(ImVec2(leftX, bodyTop), ImVec2(rightX, timelineTop), Editor::PanelFill);
+    draw->AddLine(ImVec2(rightX, bodyTop), ImVec2(rightX, timelineTop), Dock::Line);
+    const ImVec2 curveMin(leftX + 8.0F, bodyTop + 8.0F);
+    const ImVec2 curveMax(rightX - 8.0F, bodyTop + std::max(140.0F, (timelineTop - bodyTop) * 0.55F));
+    draw->AddRectFilled(curveMin, curveMax, Dock::Lane, 4.0F);
+    for (int line = 1; line < 4; ++line) {
+        const float y = curveMin.y + (curveMax.y - curveMin.y) * static_cast<float>(line) / 4.0F;
+        draw->AddLine(ImVec2(curveMin.x + 6.0F, y), ImVec2(curveMax.x - 6.0F, y), WithAlpha(Dock::Line, 0.6F));
+    }
+    // The camera path seen from above (north up), its keyframes, and where
+    // the path puts the camera at the playhead.
+    textAt(ImVec2(curveMin.x + 10.0F, curveMin.y + 8.0F), Dock::Label, "CAMERA PATH  \xC2\xB7  TOP VIEW");
+    {
+        const ImVec2 plotMin(curveMin.x + 14.0F, curveMin.y + 18.0F + font->FontSize);
+        const ImVec2 plotMax(curveMax.x - 14.0F, curveMax.y - 12.0F);
+        if (keyframes.size() < 2) {
+            const std::array<const char*, 3> hint{
+                keyframes.empty() ? "No keyframes yet." : "One keyframe so far.",
+                "Fly the camera to a spot and press + or N to pin it here.",
+                "With two or more, press the lock to fly along them."};
+            float hintY = (plotMin.y + plotMax.y) * 0.5F - font->FontSize * 1.8F;
+            for (std::size_t line = 0; line < hint.size(); ++line) {
+                const ImVec2 size = textSize(hint[line]);
+                textAt(ImVec2((plotMin.x + plotMax.x - size.x) * 0.5F, hintY), line == 0 ? Secondary : Muted, hint[line]);
+                hintY += font->FontSize + 6.0F;
+            }
+        } else {
+            constexpr int Samples = 160;
+            const auto first = keyframes.front().micros;
+            const auto last = keyframes.back().micros;
+            std::vector<Vec3> samples;
+            samples.reserve(Samples + 1);
+            for (int index = 0; index <= Samples; ++index) {
+                const auto t = first + static_cast<std::uint64_t>(static_cast<double>(last - first) * index / Samples);
+                if (const auto pose = cameraPath.Evaluate(t)) samples.push_back(pose->eye);
+            }
+            double minX = samples.front().x, maxX = minX, minZ = samples.front().z, maxZ = minZ;
+            for (const auto& point : samples) {
+                minX = std::min(minX, point.x);
+                maxX = std::max(maxX, point.x);
+                minZ = std::min(minZ, point.z);
+                maxZ = std::max(maxZ, point.z);
+            }
+            const double spanX = std::max(maxX - minX, 4.0);
+            const double spanZ = std::max(maxZ - minZ, 4.0);
+            const double scale = std::min(static_cast<double>(plotMax.x - plotMin.x) / spanX,
+                static_cast<double>(plotMax.y - plotMin.y) / spanZ);
+            const double midX = (minX + maxX) * 0.5;
+            const double midZ = (minZ + maxZ) * 0.5;
+            const ImVec2 plotMid((plotMin.x + plotMax.x) * 0.5F, (plotMin.y + plotMax.y) * 0.5F);
+            const auto map = [&](const Vec3& point) {
+                return ImVec2(plotMid.x + static_cast<float>((point.x - midX) * scale), plotMid.y + static_cast<float>((point.z - midZ) * scale));
+            };
+            std::vector<ImVec2> line;
+            line.reserve(samples.size());
+            for (const auto& point : samples) line.push_back(map(point));
+            draw->AddPolyline(line.data(), static_cast<int>(line.size()), WithAlpha(Pink, 0.75F), ImDrawFlags_None, 2.0F);
+            for (std::size_t index = 0; index < keyframes.size(); ++index) {
+                const ImVec2 at = map(keyframes[index].eye);
+                const bool chosen = Keyframes::selected == index;
+                ImGui::SetCursorScreenPos(ImVec2(at.x - 7.0F, at.y - 7.0F));
+                ImGui::PushID(static_cast<int>(index));
+                if (ImGui::InvisibleButton("##plot-keyframe", ImVec2(14.0F, 14.0F))) {
+                    Keyframes::selected = index;
+                    seek(static_cast<double>(keyframes[index].micros));
+                }
+                const bool hovered = ImGui::IsItemHovered();
+                if (hovered) ImGui::SetTooltip("Keyframe %zu  %s", index + 1, Dock::Timecode(keyframes[index].micros).c_str());
+                ImGui::PopID();
+                const float radius = chosen || hovered ? 5.5F : 4.0F;
+                draw->AddQuadFilled(ImVec2(at.x, at.y - radius), ImVec2(at.x + radius, at.y), ImVec2(at.x, at.y + radius),
+                    ImVec2(at.x - radius, at.y), chosen ? Pink : Secondary);
+            }
+            if (const auto pose = cameraPath.Evaluate(shown)) {
+                // Bedrock yaw: 0 faces +Z (south, down here), 90 faces -X.
+                const ImVec2 at = map(pose->eye);
+                const double yaw = static_cast<double>(pose->yaw) * 3.14159265358979 / 180.0;
+                const ImVec2 facing(static_cast<float>(-std::sin(yaw)), static_cast<float>(std::cos(yaw)));
+                draw->AddLine(at, ImVec2(at.x + facing.x * 16.0F, at.y + facing.y * 16.0F), Text, 1.6F);
+                draw->AddCircleFilled(at, 4.0F, Text);
+            }
+        }
+    }
+
+    float panelY = curveMax.y + 14.0F;
+    textAt(ImVec2(leftX + 12.0F, panelY), Dock::Label, "PLAYBACK SPEED");
+    panelY += font->FontSize + 8.0F;
+    {
+        const float available = leftWidth - 24.0F;
+        const float buttonWidth = (available - 4.0F * static_cast<float>(Dock::Speeds.size() - 1)) / static_cast<float>(Dock::Speeds.size());
+        for (std::size_t index = 0; index < Dock::Speeds.size(); ++index) {
+            const float speed = Dock::Speeds[index];
+            const ImVec2 position(leftX + 12.0F + (buttonWidth + 4.0F) * static_cast<float>(index), panelY);
+            ImGui::SetCursorScreenPos(position);
+            const bool selected = status.speed == speed;
+            ImGui::PushID(static_cast<int>(index));
+            const bool clicked = ImGui::InvisibleButton("##speed", ImVec2(buttonWidth, 26.0F));
+            ImGui::PopID();
+            const bool hovered = ImGui::IsItemHovered();
+            draw->AddRectFilled(position, ImVec2(position.x + buttonWidth, position.y + 26.0F),
+                selected ? Editor::Accent : hovered ? Dock::ButtonHover : Dock::Button, 5.0F);
+            const std::string label = std::format("{}x", speed);
+            const ImVec2 size = textSize(label);
+            textAt(ImVec2(position.x + (buttonWidth - size.x) * 0.5F, position.y + 13.0F - size.y * 0.5F),
+                selected ? Canvas : hovered ? Text : Secondary, label);
+            if (clicked) ReplayInjector::SetSpeed(speed);
+        }
+    }
+    panelY += 40.0F;
+    // How the camera leaves the selected keyframe.
+    if (Keyframes::selected && *Keyframes::selected < keyframes.size()) {
+        const auto index = *Keyframes::selected;
+        textAt(ImVec2(leftX + 12.0F, panelY), Dock::Label, std::format("KEYFRAME {}  \xC2\xB7  {}  \xC2\xB7  MOVE TO THE NEXT", index + 1,
+            Dock::Timecode(keyframes[index].micros)));
+        panelY += font->FontSize + 8.0F;
+        using ReplayCameraPath::Ease;
+        constexpr std::array<std::pair<Ease, const char*>, 3> Options{{
+            {Ease::Smooth, "Smooth"}, {Ease::EaseInOut, "Ease in/out"}, {Ease::Cut, "Hold, then cut"}}};
+        constexpr std::array<const char*, 3> Help{"An even glide through the keyframes",
+            "Slows to a stop at this keyframe and the next", "Stays on this shot, then jumps to the next"};
+        const float available = leftWidth - 24.0F;
+        const float buttonWidth = (available - 8.0F) / 3.0F;
+        const bool last = index + 1 >= keyframes.size();
+        for (std::size_t option = 0; option < Options.size(); ++option) {
+            const ImVec2 position(leftX + 12.0F + (buttonWidth + 4.0F) * static_cast<float>(option), panelY);
+            ImGui::SetCursorScreenPos(position);
+            ImGui::PushID(static_cast<int>(option));
+            const bool clicked = ImGui::InvisibleButton("##ease", ImVec2(buttonWidth, 26.0F)) && !last;
+            ImGui::PopID();
+            const bool hovered = ImGui::IsItemHovered();
+            const bool chosen = keyframes[index].ease == Options[option].first;
+            draw->AddRectFilled(position, ImVec2(position.x + buttonWidth, position.y + 26.0F),
+                chosen && !last ? Editor::Accent : hovered && !last ? Dock::ButtonHover : Dock::Button, 5.0F);
+            const ImVec2 size = textSize(Options[option].second);
+            textAt(ImVec2(position.x + (buttonWidth - size.x) * 0.5F, position.y + 13.0F - size.y * 0.5F),
+                last ? Editor::Disabled : chosen ? Canvas : hovered ? Text : Secondary, Options[option].second);
+            if (hovered) ImGui::SetTooltip("%s", last ? "The last keyframe ends the path" : Help[option]);
+            if (clicked && !chosen) Keyframes::SetEase(index, Options[option].first);
+        }
+        panelY += 40.0F;
+    }
+    textAt(ImVec2(leftX + 12.0F, panelY), Dock::Label, "RECORDING");
+    panelY += font->FontSize + 8.0F;
+    textAt(ImVec2(leftX + 12.0F, panelY), Secondary, std::format("Length  {}", Dock::Timecode(status.lengthMicros)));
+    panelY += font->FontSize + 4.0F;
+    textAt(ImVec2(leftX + 12.0F, panelY), Secondary, std::format("Marks  {}", status.marks.size()));
+
+    panelY += font->FontSize + 18.0F;
+    textAt(ImVec2(leftX + 12.0F, panelY), Dock::Label, "PLAYERS");
+    panelY += font->FontSize + 8.0F;
+    const auto players = ReplayInjector::Players();
+    if (players.empty()) {
+        textAt(ImVec2(leftX + 12.0F, panelY), Muted, "No players have appeared yet.");
+    }
+    for (const auto& player : players) {
+        if (panelY + 26.0F > timelineTop - 8.0F) break;
+        const bool following = status.spectating && *status.spectating == player.name;
+        const std::string label = player.recorder ? player.name + "  (recording)" : player.name;
+        textAt(ImVec2(leftX + 12.0F, panelY + 13.0F - font->FontSize * 0.5F), following ? Pink : Text, label);
+        ImGui::PushID(static_cast<int>(player.runtimeId & 0x7FFFFFFF));
+        ImGui::SetCursorScreenPos(ImVec2(rightX - 12.0F - 64.0F - 6.0F - 44.0F, panelY));
+        if (Dock::TextButton("TP", 44.0F, 26.0F)) ReplayInjector::TeleportTo(player.runtimeId);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Teleport to %s", player.name.c_str());
+        ImGui::SetCursorScreenPos(ImVec2(rightX - 12.0F - 64.0F, panelY));
+        if (Dock::TextButton(following ? "Stop" : "View", 64.0F, 26.0F)) {
+            ReplayInjector::Spectate(following ? std::nullopt : std::optional<std::uint64_t>(player.runtimeId));
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip(following ? "Stop following" : "See through %s's eyes", player.name.c_str());
+        ImGui::PopID();
+        panelY += 32.0F;
+    }
+
+    // Viewport: the game frame scaled to fit, transport underneath.
+    const ImVec2 areaMin(rightX + 14.0F, bodyTop + 14.0F);
+    const ImVec2 areaMax(W - 14.0F, timelineTop - Editor::TransportHeight - 6.0F);
+    const float aspect = display.y > 0.0F ? display.x / display.y : 16.0F / 9.0F;
+    float viewWidth = std::max(1.0F, areaMax.x - areaMin.x);
+    float viewHeight = viewWidth / aspect;
+    if (viewHeight > areaMax.y - areaMin.y) {
+        viewHeight = std::max(1.0F, areaMax.y - areaMin.y);
+        viewWidth = viewHeight * aspect;
+    }
+    const ImVec2 viewMin(areaMin.x + (areaMax.x - areaMin.x - viewWidth) * 0.5F, areaMin.y + (areaMax.y - areaMin.y - viewHeight) * 0.5F);
+    const ImVec2 viewMax(viewMin.x + viewWidth, viewMin.y + viewHeight);
+    draw->AddRectFilled(viewMin, viewMax, IM_COL32(0, 0, 0, 255));
+    if (frame.gameFrameTexture) {
+        draw->AddImage(reinterpret_cast<ImTextureID>(*frame.gameFrameTexture), viewMin, viewMax);
+    }
+    if (!status.playing || !frame.gameFrameTexture) {
+        const std::string waiting = status.playing ? std::string("Waiting for the game...") : status.phaseText;
+        const ImVec2 size = textSize(waiting);
+        textAt(ImVec2((viewMin.x + viewMax.x - size.x) * 0.5F, (viewMin.y + viewMax.y - size.y) * 0.5F), Dock::Label, waiting);
+    }
+    draw->AddRect(viewMin, viewMax, Dock::Line);
+    if (Keyframes::NoticeShowing(Clock::now())) {
+        const ImVec2 size = textSize(Keyframes::notice);
+        const ImVec2 at(viewMax.x - size.x - 12.0F, viewMin.y + 8.0F);
+        draw->AddRectFilled(ImVec2(at.x - 8.0F, at.y - 4.0F), ImVec2(at.x + size.x + 8.0F, at.y + size.y + 4.0F), WithAlpha(Canvas, 0.85F), 6.0F);
+        textAt(at, Pink, Keyframes::notice);
+    }
+    if (const auto view = WorldTelemetry::LatestView(); view && frame.gameFrameTexture) {
+        const std::string where = status.spectating
+            ? std::format("Viewing {}", *status.spectating)
+            : std::format("Position: {:.0f}, {:.0f}, {:.0f}", view->eye.x, view->eye.y - 1.62, view->eye.z);
+        textAt(ImVec2(viewMin.x + 11.0F, viewMin.y + 9.0F), IM_COL32(0, 0, 0, 170), where);
+        textAt(ImVec2(viewMin.x + 10.0F, viewMin.y + 8.0F), Text, where);
+    }
+
+    const float transportY = viewMax.y + (Editor::TransportHeight - 26.0F) * 0.5F + 2.0F;
+    const std::string current = Dock::Timecode(shown);
+    textAt(ImVec2(viewMin.x, transportY + 13.0F - textSize(current).y * 0.5F), Dock::Time, current);
+    const std::string total = Dock::Timecode(status.lengthMicros);
+    textAt(ImVec2(viewMax.x - textSize(total).x, transportY + 13.0F - textSize(total).y * 0.5F), Dock::Label, total);
+    {
+        constexpr float IconSize = 26.0F;
+        constexpr float Gap = 4.0F;
+        const float transportWidth = IconSize * 8.0F + Gap * 7.0F + 8.0F;
+        float x = (viewMin.x + viewMax.x - transportWidth) * 0.5F;
+        const auto place = [&] { ImGui::SetCursorScreenPos(ImVec2(x, transportY)); x += IconSize + Gap; };
+        place();
+        if (Dock::IconButton("##ed-start", Dock::Icon::Start, IconSize)) seek(0.0);
+        place();
+        if (Dock::IconButton("##ed-back", Dock::Icon::Back, IconSize)) seek(static_cast<double>(status.positionMicros) - Dock::StepMicros);
+        place();
+        if (Dock::IconButton("##ed-play", status.paused ? Dock::Icon::Play : Dock::Icon::Pause, IconSize, true)) {
+            ReplayInjector::SetPaused(!status.paused);
+        }
+        place();
+        if (Dock::IconButton("##ed-forward", Dock::Icon::Forward, IconSize)) seek(static_cast<double>(status.positionMicros) + Dock::StepMicros);
+        place();
+        if (Dock::IconButton("##ed-end", Dock::Icon::End, IconSize)) seek(length);
+        x += 8.0F;
+        // Previous / next recording mark.
+        const auto previousMark = std::ranges::find_if(status.marks.rbegin(), status.marks.rend(),
+            [&](const auto& mark) { return mark.positionMicros + 500'000 < status.positionMicros; });
+        const auto nextMark = std::ranges::find_if(status.marks,
+            [&](const auto& mark) { return mark.positionMicros > status.positionMicros + 500'000; });
+        if (Editor::GlyphButton("##ed-prev-mark", Editor::Glyph::Prev, ImVec2(x, transportY), IconSize, "Previous mark",
+            previousMark != status.marks.rend())) {
+            seek(static_cast<double>(previousMark->positionMicros));
+        }
+        x += IconSize + Gap;
+        if (Editor::GlyphButton("##ed-next-mark", Editor::Glyph::Next, ImVec2(x, transportY), IconSize, "Next mark",
+            nextMark != status.marks.end())) {
+            seek(static_cast<double>(nextMark->positionMicros));
+        }
+        x += IconSize + Gap;
+        const bool canFly = keyframes.size() >= 2 || status.cameraPathPlaying;
+        if (Editor::GlyphButton("##ed-lock", Editor::Glyph::Lock, ImVec2(x, transportY), IconSize,
+            status.cameraPathPlaying ? "Stop flying along the camera path"
+                : canFly ? "Fly the camera along the keyframes" : "Add two or more keyframes to fly along them",
+            canFly, status.cameraPathPlaying)) {
+            ReplayInjector::PlayCameraPath(!status.cameraPathPlaying);
+        }
+    }
+
+    // Timeline.
+    draw->AddRectFilled(ImVec2(leftX, timelineTop), ImVec2(W, H), Editor::Bar);
+    draw->AddLine(ImVec2(leftX, timelineTop), ImVec2(W, timelineTop), Dock::Line);
+    const float columnRight = leftX + Editor::LayersWidth;
+    const float laneLeft = columnRight + 6.0F;
+    const float laneRight = W - 12.0F;
+    const float laneWidth = std::max(1.0F, laneRight - laneLeft);
+
+    // Row 1: zoom controls in the layer column, the overview strip beside them.
+    const float row1 = timelineTop + 2.0F;
+    if (Editor::GlyphButton("##zoom-out", Editor::Glyph::ZoomOut, ImVec2(leftX + 6.0F, row1 + 2.0F), 24.0F, "Zoom out")) Dock::zoom /= 1.5F;
+    const std::string zoomText = std::format("{:.1f}x", Dock::zoom);
+    textAt(ImVec2(leftX + 34.0F, row1 + 14.0F - textSize(zoomText).y * 0.5F), Dock::Time, zoomText);
+    if (Editor::GlyphButton("##zoom-in", Editor::Glyph::ZoomIn, ImVec2(leftX + 40.0F + textSize(zoomText).x, row1 + 2.0F), 24.0F,
+        "Zoom in")) {
+        Dock::zoom *= 1.5F;
+    }
+    ImGui::SetCursorScreenPos(ImVec2(columnRight - 40.0F, row1 + 3.0F));
+    if (Dock::TextButton("FIT##timeline-fit", 34.0F, 22.0F)) {
+        Dock::zoom = 1.0F;
+        Dock::scroll = 0.0F;
+    }
+    Dock::ClampView();
+    const double visibleStart = static_cast<double>(Dock::scroll) * length;
+    const double visibleLength = length / static_cast<double>(Dock::zoom);
+    const auto toX = [&](double micros) { return laneLeft + static_cast<float>((micros - visibleStart) / visibleLength) * laneWidth; };
+    const auto toMicros = [&](float x) { return visibleStart + static_cast<double>((x - laneLeft) / laneWidth) * visibleLength; };
+    if (!Dock::dragTarget && !status.paused) Dock::Follow(static_cast<double>(status.positionMicros) / length);
+
+    const ImVec2 overviewMin(laneLeft, row1 + 6.0F);
+    const ImVec2 overviewMax(laneRight, row1 + Editor::RowHeight - 8.0F);
+    draw->AddRectFilled(overviewMin, overviewMax, Dock::Lane, 3.0F);
+    draw->AddRect(ImVec2(laneLeft + laneWidth * Dock::scroll, overviewMin.y),
+        ImVec2(laneLeft + laneWidth * (Dock::scroll + 1.0F / Dock::zoom), overviewMax.y), Dock::Tick, 3.0F);
+    for (const auto& mark : status.marks) {
+        const float x = laneLeft + laneWidth * static_cast<float>(static_cast<double>(mark.positionMicros) / length);
+        draw->AddLine(ImVec2(x, overviewMin.y + 2.0F), ImVec2(x, overviewMax.y - 2.0F), Dock::Mark);
+    }
+    const float overviewHead = laneLeft + laneWidth * static_cast<float>(static_cast<double>(shown) / length);
+    draw->AddLine(ImVec2(overviewHead, overviewMin.y - 2.0F), ImVec2(overviewHead, overviewMax.y + 2.0F), Dock::Playhead, 2.0F);
+    ImGui::SetCursorScreenPos(overviewMin);
+    ImGui::InvisibleButton("##ed-overview", ImVec2(laneWidth, std::max(1.0F, overviewMax.y - overviewMin.y)));
+    if (ImGui::IsItemActive()) {
+        const float fraction = std::clamp((ImGui::GetIO().MousePos.x - laneLeft) / laneWidth, 0.0F, 1.0F);
+        Dock::dragTarget = static_cast<std::uint64_t>(fraction * length);
+    }
+    if (ImGui::IsItemDeactivated() && Dock::dragTarget) {
+        ReplayInjector::Seek(*Dock::dragTarget);
+        Dock::dragTarget.reset();
+    }
+
+    // Row 2: "Layers" and the ruler.
+    const float rulerY = timelineTop + Editor::RowHeight;
+    draw->AddRectFilled(ImVec2(leftX, rulerY), ImVec2(W, rulerY + Dock::RulerHeight), Dock::Header);
+    draw->AddLine(ImVec2(leftX, rulerY), ImVec2(W, rulerY), Dock::Line);
+    textAt(ImVec2(leftX + 10.0F, rulerY + Dock::RulerHeight * 0.5F - font->FontSize * 0.5F), Dock::Label, "Layers");
+    const float lanesBottom = H;
+    const auto step = Dock::TickStep(visibleLength, laneWidth);
+    draw->PushClipRect(ImVec2(laneLeft - 1.0F, rulerY), ImVec2(laneRight + 40.0F, lanesBottom), true);
+    for (auto t = static_cast<std::uint64_t>(visibleStart / static_cast<double>(step)) * step;
+         static_cast<double>(t) <= visibleStart + visibleLength; t += step) {
+        const float x = toX(static_cast<double>(t));
+        draw->AddLine(ImVec2(x, rulerY + Dock::RulerHeight - 7.0F), ImVec2(x, rulerY + Dock::RulerHeight), Dock::Tick);
+        draw->AddText(font, font->FontSize * 0.9F, ImVec2(x + 3.0F, rulerY + 4.0F), Dock::Label, Dock::Timecode(t).c_str());
+        for (int minor = 1; minor < 4; ++minor) {
+            const float mx = toX(static_cast<double>(t) + static_cast<double>(step) * minor / 4.0);
+            draw->AddLine(ImVec2(mx, rulerY + Dock::RulerHeight - 4.0F), ImVec2(mx, rulerY + Dock::RulerHeight), Dock::Line);
+        }
+    }
+    draw->PopClipRect();
+
+    // Tracks: the camera keyframes and the recording's marks.
+    const float tracksY = rulerY + Dock::RulerHeight;
+    const std::array<std::string, 2> layers{std::format("Camera \xC2\xB7 {}", keyframes.size()),
+        std::format("Marks \xC2\xB7 {}", status.marks.size())};
+    for (std::size_t index = 0; index < layers.size(); ++index) {
+        const float y = tracksY + Dock::TrackHeight * static_cast<float>(index);
+        draw->AddRectFilled(ImVec2(leftX, y), ImVec2(W, y + Dock::TrackHeight), index % 2 ? Dock::LaneAlt : Dock::Lane);
+        draw->AddLine(ImVec2(leftX, y + Dock::TrackHeight), ImVec2(W, y + Dock::TrackHeight), Dock::Line);
+        const ImU32 layerColor = index != 0 ? Dock::Mark : status.cameraPathPlaying ? Pink
+            : keyframes.size() >= 2 ? Dock::Label : Editor::Disabled;
+        Editor::DrawGlyph(draw, index == 0 ? Editor::Glyph::Lock : Editor::Glyph::Keyframes,
+            ImVec2(leftX + 14.0F, y + Dock::TrackHeight * 0.5F), 6.0F, layerColor);
+        textAt(ImVec2(leftX + 26.0F, y + Dock::TrackHeight * 0.5F - font->FontSize * 0.5F), Text, layers[index]);
+        Editor::DrawGlyph(draw, Editor::Glyph::Eye, ImVec2(columnRight - 16.0F, y + Dock::TrackHeight * 0.5F), 6.5F, Dock::Label);
+    }
+    draw->AddLine(ImVec2(columnRight, rulerY), ImVec2(columnRight, lanesBottom), Dock::Line);
+    draw->PushClipRect(ImVec2(laneLeft, tracksY), ImVec2(laneRight, lanesBottom), true);
+    const float keyY = tracksY + Dock::TrackHeight * 0.5F;
+    if (keyframes.size() >= 2) {
+        draw->AddRectFilled(ImVec2(toX(static_cast<double>(keyframes.front().micros)), keyY - 2.0F),
+            ImVec2(toX(static_cast<double>(keyframes.back().micros)), keyY + 2.0F), WithAlpha(Pink, status.cameraPathPlaying ? 0.6F : 0.3F), 2.0F);
+    }
+    for (std::size_t index = 0; index < keyframes.size(); ++index) {
+        const bool dragged = Keyframes::dragging == index && Keyframes::dragMoved;
+        const float x = dragged ? std::clamp(ImGui::GetIO().MousePos.x, laneLeft, laneRight) : toX(static_cast<double>(keyframes[index].micros));
+        const bool chosen = Keyframes::selected == index;
+        const float r = chosen ? 7.0F : 6.0F;
+        draw->AddQuadFilled(ImVec2(x, keyY - r), ImVec2(x + r, keyY), ImVec2(x, keyY + r), ImVec2(x - r, keyY), chosen ? Pink : Secondary);
+        draw->AddQuad(ImVec2(x, keyY - r), ImVec2(x + r, keyY), ImVec2(x, keyY + r), ImVec2(x - r, keyY), Canvas, 1.2F);
+    }
+    for (const auto& mark : status.marks) {
+        const float x = toX(static_cast<double>(mark.positionMicros));
+        const float cy = tracksY + Dock::TrackHeight * 1.5F;
+        draw->AddQuadFilled(ImVec2(x, cy - 6.0F), ImVec2(x + 6.0F, cy), ImVec2(x, cy + 6.0F), ImVec2(x - 6.0F, cy), Dock::Mark);
+        if (ImGui::IsMouseHoveringRect(ImVec2(x - 7.0F, cy - 7.0F), ImVec2(x + 7.0F, cy + 7.0F))) {
+            ImGui::SetTooltip("%s  %s", mark.label.c_str(), Dock::Timecode(mark.positionMicros).c_str());
+        }
+    }
+    draw->PopClipRect();
+
+    // Scrubbing on the ruler and lanes; Ctrl+wheel zooms around the cursor.
+    ImGui::SetCursorScreenPos(ImVec2(laneLeft, rulerY));
+    ImGui::SetNextItemAllowOverlap();
+    ImGui::InvisibleButton("##ed-scrub", ImVec2(laneWidth, std::max(1.0F, lanesBottom - rulerY)));
+    const bool scrubHovered = ImGui::IsItemHovered();
+    if (ImGui::IsItemActive()) {
+        Dock::dragTarget = static_cast<std::uint64_t>(std::clamp(toMicros(ImGui::GetIO().MousePos.x), 0.0, length));
+    }
+    if (ImGui::IsItemDeactivated() && Dock::dragTarget) {
+        ReplayInjector::Seek(*Dock::dragTarget);
+        Dock::dragTarget.reset();
+    }
+    // Keyframes sit over the scrub area: a click selects one and jumps to it,
+    // a drag moves it in time.
+    for (std::size_t index = 0; index < keyframes.size(); ++index) {
+        const float x = toX(static_cast<double>(keyframes[index].micros));
+        if (x < laneLeft - 8.0F || x > laneRight + 8.0F) continue;
+        ImGui::SetCursorScreenPos(ImVec2(x - 8.0F, keyY - 8.0F));
+        ImGui::PushID(static_cast<int>(index));
+        ImGui::InvisibleButton("##keyframe", ImVec2(16.0F, 16.0F));
+        if (ImGui::IsItemActivated()) {
+            Keyframes::dragging = index;
+            Keyframes::dragMoved = false;
+            Keyframes::selected = index;
+        }
+        if (ImGui::IsItemActive() && std::abs(ImGui::GetMouseDragDelta(ImGuiMouseButton_Left).x) > 3.0F) Keyframes::dragMoved = true;
+        if (ImGui::IsItemDeactivated() && Keyframes::dragging == index) {
+            if (Keyframes::dragMoved) {
+                const auto target = static_cast<std::uint64_t>(std::clamp(toMicros(ImGui::GetIO().MousePos.x), 0.0, length));
+                auto after = cameraPath;
+                if (const auto moved = after.Retime(index, target)) {
+                    Keyframes::selected = *moved;
+                    Keyframes::Commit(cameraPath, std::move(after));
+                } else {
+                    Keyframes::Notify("Another keyframe is already there");
+                }
+            } else {
+                seek(static_cast<double>(keyframes[index].micros));
+            }
+            Keyframes::dragging.reset();
+        }
+        if (ImGui::IsItemHovered() && !ImGui::IsItemActive()) {
+            ImGui::SetTooltip("Keyframe %zu  %s\nDrag to move it in time; Delete removes it", index + 1,
+                Dock::Timecode(keyframes[index].micros).c_str());
+        }
+        ImGui::PopID();
+    }
+    if (scrubHovered && ImGui::GetIO().KeyCtrl && ImGui::GetIO().MouseWheel != 0.0F) {
+        const double pivot = toMicros(ImGui::GetIO().MousePos.x) / length;
+        const float pivotOffset = static_cast<float>(pivot) - Dock::scroll;
+        const float before = Dock::zoom;
+        Dock::zoom *= ImGui::GetIO().MouseWheel > 0.0F ? 1.25F : 0.8F;
+        Dock::ClampView();
+        Dock::scroll = static_cast<float>(pivot) - pivotOffset * before / Dock::zoom;
+        Dock::ClampView();
+    } else if (scrubHovered && ImGui::GetIO().MouseWheel != 0.0F) {
+        Dock::scroll -= ImGui::GetIO().MouseWheel * 0.1F / Dock::zoom;
+        Dock::ClampView();
+    }
+
+    // Playhead across the ruler and lanes.
+    const float headX = toX(static_cast<double>(shown));
+    if (headX >= laneLeft - 1.0F && headX <= laneRight + 1.0F) {
+        draw->AddLine(ImVec2(headX, rulerY), ImVec2(headX, lanesBottom), Dock::Playhead, 2.0F);
+        draw->AddTriangleFilled(ImVec2(headX - 6.0F, rulerY), ImVec2(headX + 6.0F, rulerY), ImVec2(headX, rulerY + 8.0F), Dock::Playhead);
+    }
+
+    ImGui::End();
+    ImGui::PopStyleColor();
+    ImGui::PopStyleVar(4);
+}
+
+// The replay hotbar, shown while a replay is watched with the camera: like
+// Minecraft's hotbar, the scroll wheel picks a slot and a left click uses it
+// (both taken from the game by the mouse feed hook), so the replay can be
+// paused, skipped and sped up without freeing the cursor. A right click on a
+// player follows their view, as in Java's spectator mode.
+namespace Hotbar {
+enum class Slot { Start, Back, PlayPause, Forward, Keyframe, Speed, Teleport, Editor, Exit };
+constexpr std::array<Slot, 9> Slots{Slot::Start, Slot::Back, Slot::PlayPause, Slot::Forward, Slot::Keyframe, Slot::Speed,
+    Slot::Teleport, Slot::Editor, Slot::Exit};
+constexpr auto ExitConfirmWindow = std::chrono::seconds(3);
+constexpr auto NoticeDuration = std::chrono::milliseconds(1800);
+int selected = 2;
+// With more than one player, Teleport opens a list to pick from; while it is
+// open the wheel and clicks drive the list instead of the slots. The last
+// row is Cancel.
+bool pickerOpen{};
+int pickerIndex{};
+// Exit needs a second click within ExitConfirmWindow.
+Clock::time_point exitArmedAt{};
+std::string notice;
+Clock::time_point noticeAt{};
+bool shiftWasDown{};
+constexpr auto CleanShotDelay = std::chrono::milliseconds(2500);
+bool wasFlying{};
+Clock::time_point flyingSince{};
+
+float NextSpeed(float speed) {
+    const auto found = std::ranges::find(Dock::Speeds, speed);
+    return found == Dock::Speeds.end() || found + 1 == Dock::Speeds.end() ? Dock::Speeds[0] : *(found + 1);
+}
+
+bool ExitArmed(Clock::time_point now) { return now - exitArmedAt < ExitConfirmWindow; }
+
+
+std::string Name(Slot slot, const ReplayInjector::Status& status, const std::vector<ReplayInjector::Player>& players,
+    Clock::time_point now) {
+    switch (slot) {
+    case Slot::Start: return "Jump to start";
+    case Slot::Back: return "Back 5 seconds";
+    case Slot::PlayPause: return status.paused ? "Play" : "Pause";
+    case Slot::Forward: return "Forward 5 seconds";
+    case Slot::Keyframe:
+        return status.cameraKeyframes == 0 ? std::string("Add a camera keyframe here")
+            : std::format("Add a camera keyframe here ({} so far)", status.cameraKeyframes);
+    case Slot::Speed: return std::format("Speed {}x  (click for {}x)", status.speed, NextSpeed(status.speed));
+    case Slot::Teleport:
+        if (players.empty()) return "Teleport (no players yet)";
+        if (players.size() == 1) return std::format("Teleport to {}", players.front().name);
+        return std::format("Teleport to a player... ({})", players.size());
+    case Slot::Editor: return "Open the replay editor";
+    case Slot::Exit: return ExitArmed(now) ? "Click again to exit the replay" : "Exit the replay";
+    }
+    return {};
+}
+
+void Use(Slot slot, const ReplayInjector::Status& status, const std::vector<ReplayInjector::Player>& players,
+    Clock::time_point now, DrawResult& result) {
+    const double length = static_cast<double>(status.lengthMicros);
+    const auto seek = [&](double micros) {
+        ReplayInjector::Seek(static_cast<std::uint64_t>(std::clamp(micros, 0.0, length)));
+    };
+    switch (slot) {
+    case Slot::Start: seek(0.0); break;
+    case Slot::Back: seek(static_cast<double>(status.positionMicros) - Dock::StepMicros); break;
+    case Slot::PlayPause: ReplayInjector::SetPaused(!status.paused); break;
+    case Slot::Forward: seek(static_cast<double>(status.positionMicros) + Dock::StepMicros); break;
+    case Slot::Keyframe: (void)Keyframes::AddHere(status); break;
+    case Slot::Speed: ReplayInjector::SetSpeed(NextSpeed(status.speed)); break;
+    case Slot::Teleport:
+        if (players.size() == 1) {
+            ReplayInjector::TeleportTo(players.front().runtimeId);
+        } else if (players.size() > 1) {
+            pickerOpen = true;
+            pickerIndex = 0;
+        }
+        break;
+    case Slot::Editor: result.openReplayEditor = true; break;
+    case Slot::Exit:
+        if (ExitArmed(now)) {
+            exitArmedAt = {};
+            ReplayInjector::Exit();
+        } else {
+            exitArmedAt = now;
+        }
+        break;
+    }
+}
+
+void Notice(std::string text, Clock::time_point now) {
+    notice = std::move(text);
+    noticeAt = now;
+}
+
+// Right click: stop following, or follow the player under the crosshair.
+void ViewAlongCrosshair(const ReplayInjector::Status& status, const std::vector<ReplayInjector::Player>& players,
+    Clock::time_point now) {
+    if (status.spectating) {
+        ReplayInjector::Spectate(std::nullopt);
+        return;
+    }
+    const auto view = WorldTelemetry::LatestView();
+    if (!view || !view->yawDegrees || !view->pitchDegrees) {
+        Notice("Can't tell where you're looking yet", now);
+        return;
+    }
+    const auto target = ReplayInjector::PlayerAlongRay(players, view->eye, *view->yawDegrees, *view->pitchDegrees);
+    if (!target) {
+        Notice("Right-click a player to see through their eyes", now);
+        return;
+    }
+    ReplayInjector::Spectate(target->runtimeId);
+}
+}
+
+void DrawReplayHotbar(const ReplayInjector::Status& status, const FrameInfo& frame, DrawResult& result) {
+    constexpr int SlotCount = static_cast<int>(Hotbar::Slots.size());
+    const auto now = Clock::now();
+    const auto players = ReplayInjector::Players();
+    const bool shiftDown = frame.keysDown && ((*frame.keysDown)[VK_SHIFT] || (*frame.keysDown)[VK_LSHIFT]);
+    const bool shiftPressed = shiftDown && !Hotbar::shiftWasDown;
+    Hotbar::shiftWasDown = shiftDown;
+    if (Hotbar::pickerOpen && players.size() < 2) Hotbar::pickerOpen = false;
+    if (Hotbar::pickerOpen) {
+        const int rows = static_cast<int>(players.size()) + 1;  // + Cancel
+        Hotbar::pickerIndex = ((Hotbar::pickerIndex - frame.replayHotbarScroll) % rows + rows) % rows;
+        const bool onPlayer = Hotbar::pickerIndex < static_cast<int>(players.size());
+        const auto& picked = players[static_cast<std::size_t>(std::min(Hotbar::pickerIndex, rows - 2))];
+        if (frame.replayHotbarClicks > 0) {
+            if (onPlayer) ReplayInjector::TeleportTo(picked.runtimeId);
+            Hotbar::pickerOpen = false;
+        } else if (frame.replayHotbarRightClicks > 0) {
+            if (onPlayer) ReplayInjector::Spectate(picked.runtimeId);
+            Hotbar::pickerOpen = false;
+        } else if (shiftPressed) {
+            Hotbar::pickerOpen = false;
+        }
+    } else {
+        // Scrolling down moves right, as in Minecraft.
+        if (frame.replayHotbarScroll != 0) {
+            Hotbar::selected = ((Hotbar::selected - frame.replayHotbarScroll) % SlotCount + SlotCount) % SlotCount;
+        }
+        const auto chosen = Hotbar::Slots[static_cast<std::size_t>(Hotbar::selected)];
+        if (chosen != Hotbar::Slot::Exit) Hotbar::exitArmedAt = {};
+        if (frame.replayHotbarClicks > 0) Hotbar::Use(chosen, status, players, now, result);
+        if (frame.replayHotbarRightClicks > 0) Hotbar::ViewAlongCrosshair(status, players, now);
+        // Sneak stops following, as in Java, and stops a camera path.
+        if (shiftPressed && status.spectating) ReplayInjector::Spectate(std::nullopt);
+        if (shiftPressed && status.cameraPathPlaying) ReplayInjector::PlayCameraPath(false);
+    }
+    const auto slot = Hotbar::Slots[static_cast<std::size_t>(Hotbar::selected)];
+    // Clean shot: while the camera flies its path, the hotbar says how to
+    // stop for a moment, then gets out of the picture.
+    if (status.cameraPathPlaying && !Hotbar::wasFlying) Hotbar::flyingSince = now;
+    Hotbar::wasFlying = status.cameraPathPlaying;
+    if (status.cameraPathPlaying && now - Hotbar::flyingSince > Hotbar::CleanShotDelay) return;
+
+    const auto display = ImGui::GetIO().DisplaySize;
+    auto* draw = ImGui::GetForegroundDrawList();
+    ImFont* font = CompactFont();
+    constexpr float SlotSize = 44.0F;
+    constexpr float Gap = 4.0F;
+    constexpr float Pad = 5.0F;
+    const float width = SlotSize * SlotCount + Gap * (SlotCount - 1) + Pad * 2.0F;
+    const ImVec2 min((display.x - width) * 0.5F, display.y - SlotSize - Pad * 2.0F - 26.0F);
+    const ImVec2 max(min.x + width, min.y + SlotSize + Pad * 2.0F);
+
+    // Following a player or a camera path: say so, top centre.
+    if (status.spectating || status.cameraPathPlaying) {
+        const std::string viewing = status.spectating ? std::format("Viewing {}", *status.spectating)
+            : std::string("Flying the camera path");
+        const char* stop = status.spectating ? "Shift or right-click to stop" : "Shift to stop";
+        ImFont* titleFace = TitleFont();
+        const ImVec2 size = titleFace->CalcTextSizeA(titleFace->FontSize, FLT_MAX, 0.0F, viewing.c_str());
+        const ImVec2 stopSize = font->CalcTextSizeA(font->FontSize, FLT_MAX, 0.0F, stop);
+        const ImVec2 boxMin((display.x - std::max(size.x, stopSize.x)) * 0.5F - 16.0F, 14.0F);
+        const ImVec2 boxMax((display.x + std::max(size.x, stopSize.x)) * 0.5F + 16.0F, 14.0F + size.y + stopSize.y + 18.0F);
+        draw->AddRectFilled(boxMin, boxMax, WithAlpha(Canvas, 0.85F), 8.0F);
+        draw->AddRect(boxMin, boxMax, WithAlpha(Pink, 0.6F), 8.0F);
+        draw->AddText(titleFace, titleFace->FontSize, ImVec2((display.x - size.x) * 0.5F, boxMin.y + 7.0F), Pink, viewing.c_str());
+        draw->AddText(font, font->FontSize, ImVec2((display.x - stopSize.x) * 0.5F, boxMin.y + 11.0F + size.y), Muted, stop);
+    }
+
+    // Time and progress above the slots.
+    const double length = static_cast<double>(std::max<std::uint64_t>(status.lengthMicros, 1));
+    const float fraction = std::clamp(static_cast<float>(static_cast<double>(status.positionMicros) / length), 0.0F, 1.0F);
+    const float progressY = min.y - 10.0F;
+    draw->AddRectFilled(ImVec2(min.x, progressY - 2.0F), ImVec2(max.x, progressY + 2.0F), WithAlpha(Canvas, 0.85F), 2.0F);
+    draw->AddRectFilled(ImVec2(min.x, progressY - 2.0F), ImVec2(min.x + width * fraction, progressY + 2.0F), Pink, 2.0F);
+    for (const auto& mark : status.marks) {
+        const float x = min.x + width * static_cast<float>(static_cast<double>(mark.positionMicros) / length);
+        draw->AddCircleFilled(ImVec2(x, progressY), 2.5F, Dock::Mark);
+    }
+    const std::string time = std::format("{} / {}", Dock::Timecode(status.positionMicros), Dock::Timecode(status.lengthMicros));
+    const ImVec2 timeSize = font->CalcTextSizeA(font->FontSize, FLT_MAX, 0.0F, time.c_str());
+    draw->AddText(font, font->FontSize, ImVec2(min.x, progressY - 6.0F - timeSize.y), Text, time.c_str());
+    if (status.paused || status.speed != 1.0F) {
+        const std::string state = status.paused ? std::string("PAUSED") : std::format("{}x", status.speed);
+        const ImVec2 stateSize = font->CalcTextSizeA(font->FontSize, FLT_MAX, 0.0F, state.c_str());
+        draw->AddText(font, font->FontSize, ImVec2(max.x - stateSize.x, progressY - 6.0F - stateSize.y),
+            status.paused ? Amber : Pink, state.c_str());
+    }
+
+    // The selected slot's name (or a short notice), centred above, like a
+    // held item's name.
+    // Keyframe notices (added, or why not) show the same way.
+    if (Keyframes::NoticeShowing(now) && Keyframes::noticeAt > Hotbar::noticeAt) Hotbar::Notice(Keyframes::notice, Keyframes::noticeAt);
+    const bool showNotice = !Hotbar::notice.empty() && now - Hotbar::noticeAt < Hotbar::NoticeDuration;
+    const std::string name = showNotice ? Hotbar::notice : Hotbar::Name(slot, status, players, now);
+    const ImU32 nameColor = showNotice || (slot == Hotbar::Slot::Exit && Hotbar::ExitArmed(now)) ? Amber : Text;
+    ImFont* nameFont = BodyFont();
+    const ImVec2 nameSize = nameFont->CalcTextSizeA(nameFont->FontSize, FLT_MAX, 0.0F, name.c_str());
+    const ImVec2 namePosition((display.x - nameSize.x) * 0.5F, progressY - 12.0F - timeSize.y - nameSize.y);
+    draw->AddText(nameFont, nameFont->FontSize, ImVec2(namePosition.x + 1.0F, namePosition.y + 1.0F), IM_COL32(0, 0, 0, 160), name.c_str());
+    draw->AddText(nameFont, nameFont->FontSize, namePosition, nameColor, name.c_str());
+
+    if (Hotbar::pickerOpen) {
+        constexpr int VisibleRows = 8;
+        constexpr float RowHeight = 28.0F;
+        const int rows = static_cast<int>(players.size()) + 1;
+        const int first = std::clamp(Hotbar::pickerIndex - VisibleRows / 2, 0, std::max(0, rows - VisibleRows));
+        const int shown = std::min(rows, VisibleRows);
+        const char* title = "Teleport to...";
+        const char* help = "Scroll: choose   Click: teleport   Right-click: their view   Shift: cancel";
+        ImFont* titleFace = BodyFont();
+        const float panelWidth = std::max(300.0F, font->CalcTextSizeA(font->FontSize, FLT_MAX, 0.0F, help).x + 28.0F);
+        const float panelHeight = 14.0F + titleFace->FontSize + 10.0F + RowHeight * static_cast<float>(shown) + 10.0F + font->FontSize + 12.0F;
+        const ImVec2 panelMin((display.x - panelWidth) * 0.5F, namePosition.y - 10.0F - panelHeight);
+        const ImVec2 panelMax(panelMin.x + panelWidth, panelMin.y + panelHeight);
+        draw->AddRectFilled(panelMin, panelMax, WithAlpha(Canvas, 0.94F), 10.0F);
+        draw->AddRect(panelMin, panelMax, WithAlpha(Pink, 0.5F), 10.0F);
+        draw->AddText(titleFace, titleFace->FontSize, ImVec2(panelMin.x + 14.0F, panelMin.y + 12.0F), Text, title);
+        float rowY = panelMin.y + 14.0F + titleFace->FontSize + 10.0F;
+        for (int row = first; row < first + shown; ++row) {
+            const bool cancel = row == rows - 1;
+            const bool current = row == Hotbar::pickerIndex;
+            const ImVec2 rowMin(panelMin.x + 8.0F, rowY);
+            const ImVec2 rowMax(panelMax.x - 8.0F, rowY + RowHeight - 3.0F);
+            if (current) {
+                draw->AddRectFilled(rowMin, rowMax, PinkDeep, 6.0F);
+                draw->AddRect(rowMin, rowMax, Pink, 6.0F, 0, 1.5F);
+            }
+            const float centerY = (rowMin.y + rowMax.y) * 0.5F;
+            const ImU32 color = current ? Pink : cancel ? Muted : Secondary;
+            Editor::DrawGlyph(draw, cancel ? Editor::Glyph::Close : Editor::Glyph::Person, ImVec2(rowMin.x + 16.0F, centerY), 7.0F, color);
+            std::string label = "Cancel";
+            if (!cancel) {
+                const auto& player = players[static_cast<std::size_t>(row)];
+                label = player.recorder ? player.name + "  (recording)" : player.name;
+                if (status.spectating && *status.spectating == player.name) label += "  - viewing";
+            }
+            draw->AddText(font, font->FontSize, ImVec2(rowMin.x + 32.0F, centerY - font->FontSize * 0.5F), current ? Text : color, label.c_str());
+            rowY += RowHeight;
+        }
+        if (first > 0) draw->AddText(font, font->FontSize, ImVec2(panelMax.x - 24.0F, panelMin.y + 12.0F), Muted, "^");
+        if (first + shown < rows) draw->AddText(font, font->FontSize, ImVec2(panelMax.x - 24.0F, rowY - 14.0F), Muted, "v");
+        draw->AddText(font, font->FontSize, ImVec2(panelMin.x + 14.0F, panelMax.y - font->FontSize - 10.0F), Muted, help);
+    }
+
+    // The slots.
+    draw->AddRectFilled(min, max, WithAlpha(Canvas, 0.9F), 8.0F);
+    draw->AddRect(min, max, Stroke, 8.0F);
+    for (int index = 0; index < SlotCount; ++index) {
+        const ImVec2 slotMin(min.x + Pad + (SlotSize + Gap) * static_cast<float>(index), min.y + Pad);
+        const ImVec2 slotMax(slotMin.x + SlotSize, slotMin.y + SlotSize);
+        const ImVec2 center((slotMin.x + slotMax.x) * 0.5F, (slotMin.y + slotMax.y) * 0.5F);
+        const bool isSelected = index == Hotbar::selected;
+        draw->AddRectFilled(slotMin, slotMax, isSelected ? PinkDeep : Surface, 6.0F);
+        if (isSelected) {
+            draw->AddRect(ImVec2(slotMin.x - 1.0F, slotMin.y - 1.0F), ImVec2(slotMax.x + 1.0F, slotMax.y + 1.0F), Pink, 7.0F, 0, 2.0F);
+        }
+        const ImU32 color = isSelected ? Pink : Secondary;
+        switch (Hotbar::Slots[static_cast<std::size_t>(index)]) {
+        case Hotbar::Slot::Start: Dock::DrawIcon(draw, Dock::Icon::Start, center, 7.0F, color); break;
+        case Hotbar::Slot::Back: Dock::DrawIcon(draw, Dock::Icon::Back, center, 7.0F, color); break;
+        case Hotbar::Slot::PlayPause:
+            Dock::DrawIcon(draw, status.paused ? Dock::Icon::Play : Dock::Icon::Pause, center, 8.0F, color);
+            break;
+        case Hotbar::Slot::Forward: Dock::DrawIcon(draw, Dock::Icon::Forward, center, 7.0F, color); break;
+        case Hotbar::Slot::Keyframe:
+            draw->AddQuad(ImVec2(center.x, center.y - 10.0F), ImVec2(center.x + 10.0F, center.y), ImVec2(center.x, center.y + 10.0F),
+                ImVec2(center.x - 10.0F, center.y), color, 1.6F);
+            Editor::DrawGlyph(draw, Editor::Glyph::Plus, center, 6.0F, color);
+            break;
+        case Hotbar::Slot::Speed: {
+            const std::string speed = std::format("{}x", status.speed);
+            const ImVec2 size = font->CalcTextSizeA(font->FontSize, FLT_MAX, 0.0F, speed.c_str());
+            draw->AddText(font, font->FontSize, ImVec2(center.x - size.x * 0.5F, center.y - size.y * 0.5F), color, speed.c_str());
+            break;
+        }
+        case Hotbar::Slot::Teleport: Editor::DrawGlyph(draw, Editor::Glyph::Person, center, 9.0F, color); break;
+        case Hotbar::Slot::Editor: Editor::DrawGlyph(draw, Editor::Glyph::Keyframes, center, 8.0F, color); break;
+        case Hotbar::Slot::Exit:
+            Editor::DrawGlyph(draw, Editor::Glyph::Close, center, 9.0F,
+                Hotbar::ExitArmed(now) ? Amber : color);
+            break;
+        }
+        // Slot numbers in the corner, like Minecraft's.
+        const std::string number = std::to_string(index + 1);
+        draw->AddText(font, font->FontSize * 0.75F, ImVec2(slotMin.x + 4.0F, slotMin.y + 2.0F), WithAlpha(Muted, 0.8F), number.c_str());
+    }
+
+    const char* hint = "Scroll: choose   Click: use   Right-click a player: their view   K: editor";
+    const ImVec2 hintSize = font->CalcTextSizeA(font->FontSize, FLT_MAX, 0.0F, hint);
+    draw->AddText(font, font->FontSize, ImVec2((display.x - hintSize.x) * 0.5F, max.y + 5.0F), WithAlpha(Muted, 0.85F), hint);
+}
+
+// Top-center status while a replay is being watched.
+void DrawReplayPill() {
+    const auto status = ReplayInjector::CurrentStatus();
+    const auto display = ImGui::GetIO().DisplaySize;
+    const std::string text = status.playing
+        ? std::format("REPLAY  {} / {}{}", ClockText(status.positionMicros), ClockText(status.lengthMicros),
+            status.paused ? "  PAUSED" : status.speed != 1.0F ? std::format("  {}x", status.speed) : std::string())
+        : "REPLAY  " + status.phaseText;
+    ImFont* font = CompactFont();
+    const ImVec2 textSize = font->CalcTextSizeA(font->FontSize, FLT_MAX, 0.0F, text.c_str());
+    const ImVec2 size(textSize.x + 28.0F, textSize.y + 12.0F);
+    const ImVec2 position((display.x - size.x) * 0.5F, 10.0F);
+    auto* draw = ImGui::GetForegroundDrawList();
+    draw->AddRectFilled(position, ImVec2(position.x + size.x, position.y + size.y), WithAlpha(Canvas, 0.85F), size.y * 0.5F);
+    draw->AddCircleFilled(ImVec2(position.x + 11.0F, position.y + size.y * 0.5F), 3.5F, status.paused ? Amber : Pink);
+    draw->AddText(font, font->FontSize, ImVec2(position.x + 20.0F, position.y + 6.0F), Text, text.c_str());
+}
+
+void DrawReplayPanel(ModuleManager& modules, SteadyTime now) {
+    const auto controllers = modules.EnabledModulesOf<IReplayControlModule>();
+    const bool watching = ReplayInjector::Running();
+    if (controllers.empty() && !watching) return;
+    if (watching) {
+        // While a replay plays, Minecraft's pause screen gets the editor dock.
+        const auto status = ReplayInjector::CurrentStatus();
+        if (status.playing) {
+            DrawReplayDock(status);
+            return;
+        }
+    }
+
+    ImGui::SetNextWindowPos(ImVec2(16.0F, 16.0F), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(292.0F, 0.0F), ImGuiCond_Always);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 9.0F);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(14.0F, 12.0F));
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.0F);
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, IM_COL32(17, 20, 23, 242));
+    ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(242, 143, 181, 150));
+    ImGui::Begin("##replay-pause-controller", nullptr, ImGuiWindowFlags_NoTitleBar |
+        ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
+        ImGuiWindowFlags_AlwaysAutoResize);
+    if (titleFont) ImGui::PushFont(titleFont);
+    ImGui::TextUnformatted(watching ? "Replay" : "Replay Mod");
+    if (titleFont) ImGui::PopFont();
+    if (watching) DrawPlaybackControls();
+    else DrawRecorderControls(*controllers.front(), now, 124.0F);
+    ImGui::End();
+    ImGui::PopStyleColor(2);
+    ImGui::PopStyleVar(3);
 }
 
 std::string KeyName(std::uint32_t key) {
@@ -268,11 +1943,6 @@ void DrawCubeLayer(ImDrawList* draw, ImVec2 center, float size, float yaw, float
             face.projected[2].screen, face.projected[3].screen};
         draw->AddPolyline(outline, 4, IM_COL32(12, 15, 18, transparent ? 72 : 118), ImDrawFlags_Closed, 1.0F);
     }
-}
-
-bool SkinReady() {
-    std::scoped_lock lock(playerHeadMutex);
-    return playerHeadReady;
 }
 
 // Stand-in head used until PlayerSkinTelemetry delivers the real skin (and if
@@ -497,7 +2167,61 @@ void DrawKeyRows(const std::string& moduleId, const std::vector<std::vector<HudK
     ImGui::Dummy(ImVec2(totalWidth, y - origin.y));
 }
 
-bool DrawHud(ModuleManager& modules, bool editMode) {
+// An ArgbImage as solid cells (no texture upload needed for icon-sized
+// images). Cell edges are snapped to whole pixels so neighbours never leave
+// seams, and runs of one color in a row become one rectangle.
+void DrawArgbImage(ImDrawList* draw, const ArgbImage& image, ImVec2 origin, float size) {
+    if (!image.Valid()) return;
+    const float cell = size / static_cast<float>(std::max(image.width, image.height));
+    const float left = origin.x + (size - cell * static_cast<float>(image.width)) * 0.5F;
+    const float top = origin.y + (size - cell * static_cast<float>(image.height)) * 0.5F;
+    const auto edgeX = [&](std::uint32_t column) { return std::floor(left + cell * static_cast<float>(column) + 0.5F); };
+    const auto edgeY = [&](std::uint32_t row) { return std::floor(top + cell * static_cast<float>(row) + 0.5F); };
+    for (std::uint32_t row = 0; row < image.height; ++row) {
+        const auto* pixels = image.pixels.data() + static_cast<std::size_t>(row) * image.width;
+        for (std::uint32_t column = 0; column < image.width;) {
+            const std::uint32_t argb = pixels[column];
+            std::uint32_t end = column + 1;
+            while (end < image.width && pixels[end] == argb) ++end;
+            if ((argb >> 24U) != 0) {
+                draw->AddRectFilled(ImVec2(edgeX(column), edgeY(row)), ImVec2(edgeX(end), edgeY(row + 1)), FromArgb(argb));
+            }
+            column = end;
+        }
+    }
+}
+
+// Java-chat style lines: wrapped at a fixed width, each with its own backdrop
+// strip, faded by the line's alpha.
+void DrawWrappedHudLines(const HudContent& content, const HudLayout& layout) {
+    const float scale = layout.scale;
+    const float width = content.wrapWidth * scale;
+    const float padX = 4.0F * scale;
+    const float padY = 1.0F * scale;
+    auto* draw = ImGui::GetWindowDrawList();
+    for (const auto& line : content.lines) {
+        const float alpha = std::clamp(line.alpha, 0.0F, 1.0F);
+        const ImVec2 start = ImGui::GetCursorScreenPos();
+        const ImVec2 textSize = ImGui::CalcTextSize(line.text.c_str(), nullptr, false, width);
+        const float height = textSize.y + padY * 2.0F;
+        if (content.lineBackdrops && layout.background) {
+            draw->AddRectFilled(start, ImVec2(start.x + width + padX * 2.0F, start.y + height),
+                WithAlpha(FromArgb(layout.backgroundColor), layout.backgroundOpacity * alpha * 0.6F));
+        }
+        ImGui::SetCursorScreenPos(ImVec2(start.x + padX, start.y + padY));
+        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + width);
+        ImGui::PushStyleColor(ImGuiCol_Text, ToVec4(WithAlpha(ToneColor(line.tone, layout), alpha)));
+        ImGui::TextUnformatted(line.text.c_str());
+        ImGui::PopStyleColor();
+        ImGui::PopTextWrapPos();
+        ImGui::SetCursorScreenPos(ImVec2(start.x, start.y + height));
+    }
+    ImGui::Dummy(ImVec2(width + padX * 2.0F, 0.0F));
+}
+
+// gameplayVisible: the in-world HUD is showing. Otherwise (a game screen such
+// as chat owns the cursor) only content marked overGameScreens is drawn.
+bool DrawHud(ModuleManager& modules, bool editMode, bool gameplayVisible) {
     bool dirty{};
     const auto display = ImGui::GetIO().DisplaySize;
     auto hudModules = modules.EnabledHudModules();
@@ -509,9 +2233,12 @@ bool DrawHud(ModuleManager& modules, bool editMode) {
         // A module with nothing to say right now (e.g. "hide when OK") takes
         // no space - except in edit mode, where it must stay draggable.
         if (empty && !editMode) continue;
+        if (!gameplayVisible && !editMode && !content.overGameScreens) continue;
         auto layout = module->Layout();
-        if (!editMode) ImGui::SetNextWindowPos(ImVec2(layout.normalizedX * display.x, layout.normalizedY * display.y), ImGuiCond_Always);
-        else ImGui::SetNextWindowPos(ImVec2(layout.normalizedX * display.x, layout.normalizedY * display.y), ImGuiCond_Appearing);
+        // Bottom-anchored widgets store their bottom edge in normalizedY.
+        const ImVec2 pivot(0.0F, content.anchorBottom ? 1.0F : 0.0F);
+        const ImVec2 anchor(layout.normalizedX * display.x, layout.normalizedY * display.y);
+        ImGui::SetNextWindowPos(anchor, editMode ? ImGuiCond_Appearing : ImGuiCond_Always, pivot);
         // Bare content (key grids) draws its own tiles; a panel behind them
         // only adds a box around the keys. Edit mode keeps the border so it
         // can still be found and dragged.
@@ -537,11 +2264,29 @@ bool DrawHud(ModuleManager& modules, bool editMode) {
         ImGui::Begin(id.c_str(), nullptr, flags);
         ImGui::SetWindowFontScale(layout.scale);
         if (empty) ImGui::TextColored(ToVec4(Muted), "%s", Narrow(module->Metadata().name).c_str());
-        for (const auto& line : content.lines) {
-            ImGui::PushStyleColor(ImGuiCol_Text, ToVec4(ToneColor(line.tone, layout)));
-            ImGui::TextUnformatted(line.text.c_str());
-            ImGui::PopStyleColor();
+        const bool icon = content.icon && content.icon->Valid() && !content.lines.empty();
+        if (icon) {
+            // Icon on the left, the lines centered against it.
+            const float iconSize = std::round(ImGui::GetFontSize() * 2.2F);
+            const float top = ImGui::GetCursorPosY();
+            DrawArgbImage(ImGui::GetWindowDrawList(), *content.icon, ImGui::GetCursorScreenPos(), iconSize);
+            ImGui::Dummy(ImVec2(iconSize, iconSize));
+            ImGui::SameLine(0.0F, 8.0F * layout.scale);
+            const float textHeight = static_cast<float>(content.lines.size()) * ImGui::GetTextLineHeightWithSpacing()
+                - ImGui::GetStyle().ItemSpacing.y;
+            ImGui::SetCursorPosY(top + std::max(0.0F, (iconSize - textHeight) * 0.5F));
+            ImGui::BeginGroup();
         }
+        if (content.wrapWidth > 0.0F && !icon) {
+            DrawWrappedHudLines(content, layout);
+        } else {
+            for (const auto& line : content.lines) {
+                ImGui::PushStyleColor(ImGuiCol_Text, ToVec4(WithAlpha(ToneColor(line.tone, layout), line.alpha)));
+                ImGui::TextUnformatted(line.text.c_str());
+                ImGui::PopStyleColor();
+            }
+        }
+        if (icon) ImGui::EndGroup();
         if (!content.keyRows.empty()) DrawKeyRows(module->Metadata().id, content.keyRows, layout);
         if (content.graph && !content.graph->values.empty()) {
             const auto& graph = *content.graph;
@@ -551,6 +2296,14 @@ bool DrawHud(ModuleManager& modules, bool editMode) {
                 graph.caption.empty() ? nullptr : graph.caption.c_str(), graph.minimum, graph.maximum,
                 ImVec2(220.0F * layout.scale, 62.0F * layout.scale));
             ImGui::PopStyleColor(2);
+        }
+        // Widgets stay fully on screen, including mid-drag in edit mode.
+        {
+            const ImVec2 current = ImGui::GetWindowPos();
+            const ImVec2 extent = ImGui::GetWindowSize();
+            const ImVec2 clamped(std::clamp(current.x, 0.0F, std::max(0.0F, display.x - extent.x)),
+                std::clamp(current.y, 0.0F, std::max(0.0F, display.y - extent.y)));
+            if (clamped.x != current.x || clamped.y != current.y) ImGui::SetWindowPos(clamped);
         }
         const auto position = ImGui::GetWindowPos();
         const auto size = ImGui::GetWindowSize();
@@ -562,8 +2315,10 @@ bool DrawHud(ModuleManager& modules, bool editMode) {
             HudLayout next = layout;
             next.normalizedX = std::clamp(position.x / std::max(display.x, 1.0F), 0.0F,
                 std::max(0.0F, 1.0F - size.x / std::max(display.x, 1.0F)));
-            next.normalizedY = std::clamp(position.y / std::max(display.y, 1.0F), 0.0F,
-                std::max(0.0F, 1.0F - size.y / std::max(display.y, 1.0F)));
+            const float heightFraction = size.y / std::max(display.y, 1.0F);
+            next.normalizedY = content.anchorBottom
+                ? std::clamp((position.y + size.y) / std::max(display.y, 1.0F), std::min(1.0F, heightFraction), 1.0F)
+                : std::clamp(position.y / std::max(display.y, 1.0F), 0.0F, std::max(0.0F, 1.0F - heightFraction));
             if (next.normalizedX != layout.normalizedX || next.normalizedY != layout.normalizedY) {
                 module->SetLayout(next);
                 dirty = true;
@@ -582,12 +2337,192 @@ void DrawOverlayPrimitives(ModuleManager& modules, ImVec2 display) {
             if (rect.filled) draw->AddRectFilled(ImVec2(rect.x1, rect.y1), ImVec2(rect.x2, rect.y2), FromArgb(rect.argb));
             else draw->AddRect(ImVec2(rect.x1, rect.y1), ImVec2(rect.x2, rect.y2), FromArgb(rect.argb), 0.0F, 0, rect.thickness);
         }
+        // Fills first, so outlines drawn on the same shape stay on top.
+        for (const auto& quad : primitives.quads) {
+            draw->AddQuadFilled(ImVec2(quad.x[0], quad.y[0]), ImVec2(quad.x[1], quad.y[1]), ImVec2(quad.x[2], quad.y[2]),
+                ImVec2(quad.x[3], quad.y[3]), FromArgb(quad.argb));
+        }
         for (const auto& line : primitives.lines) {
             draw->AddLine(ImVec2(line.x1, line.y1), ImVec2(line.x2, line.y2), FromArgb(line.argb), line.thickness);
         }
         for (const auto& circle : primitives.circles) {
             if (circle.filled) draw->AddCircleFilled(ImVec2(circle.x, circle.y), circle.radius, FromArgb(circle.argb));
             else draw->AddCircle(ImVec2(circle.x, circle.y), circle.radius, FromArgb(circle.argb), 0, circle.thickness);
+        }
+    }
+}
+
+ImU32 DebugToneColor(HudTone tone) {
+    switch (tone) {
+    case HudTone::Accent: return IM_COL32(255, 255, 85, 255);
+    case HudTone::Muted: return IM_COL32(180, 180, 180, 255);
+    case HudTone::Warning: return IM_COL32(255, 170, 0, 255);
+    case HudTone::Good: return IM_COL32(85, 255, 85, 255);
+    case HudTone::Normal: break;
+    }
+    return IM_COL32(255, 255, 255, 255);
+}
+
+std::string FitDebugText(ImFont* font, float fontSize, std::string text, float maximumWidth) {
+    if (font->CalcTextSizeA(fontSize, FLT_MAX, 0.0F, text.c_str()).x <= maximumWidth) return text;
+    constexpr std::string_view suffix = "...";
+    while (!text.empty()) {
+        unsigned char removed{};
+        do {
+            removed = static_cast<unsigned char>(text.back());
+            text.pop_back();
+        } while (!text.empty() && (removed & 0xC0U) == 0x80U);
+        const auto candidate = text + std::string(suffix);
+        if (font->CalcTextSizeA(fontSize, FLT_MAX, 0.0F, candidate.c_str()).x <= maximumWidth) return candidate;
+    }
+    return {};
+}
+
+void DrawDebugOverlays(ModuleManager& modules, ImVec2 display) {
+    auto* draw = ImGui::GetBackgroundDrawList();
+    ImFont* font = CompactFont();
+    constexpr ImU32 backdrop = IM_COL32(0, 0, 0, 150);
+    for (const auto* module : modules.EnabledModulesOf<IDebugOverlayModule>()) {
+        DebugOverlayContent content;
+        try { content = module->DebugOverlay(); } catch (...) { continue; }
+        if (!content.visible) continue;
+
+        const float scale = std::clamp(content.scale, 0.6F, 2.0F);
+        const float fontSize = font->FontSize * scale;
+        const float padX = std::max(2.0F, 2.0F * scale);
+        const float padY = std::max(1.0F, scale);
+        const float lineHeight = std::ceil(fontSize + padY * 2.0F);
+        const float groupGap = std::max(3.0F, 4.0F * scale);
+        const float margin = std::max(3.0F, 4.0F * scale);
+        const float maxTextWidth = std::max(1.0F, display.x * 0.47F - padX * 2.0F);
+
+        const auto column = [&](const std::vector<DebugOverlayGroup>& groups, bool rightAligned) {
+            float y = margin;
+            for (std::size_t groupIndex = 0; groupIndex < groups.size(); ++groupIndex) {
+                if (groupIndex != 0) y += groupGap;
+                for (const auto& row : groups[groupIndex].lines) {
+                    if (y + lineHeight > display.y - margin) return;
+                    const std::string shown = FitDebugText(font, fontSize, row.text, maxTextWidth);
+                    if (shown.empty()) continue;
+                    const float textWidth = font->CalcTextSizeA(fontSize, FLT_MAX, 0.0F, shown.c_str()).x;
+                    const float x = rightAligned ? display.x - margin - padX - textWidth : margin + padX;
+                    draw->AddRectFilled(ImVec2(x - padX, y), ImVec2(x + textWidth + padX, y + lineHeight), backdrop);
+                    draw->AddText(font, fontSize, ImVec2(x, y + padY), DebugToneColor(row.tone), shown.c_str());
+                    y += lineHeight;
+                }
+            }
+        };
+        column(content.left, false);
+        column(content.right, true);
+    }
+}
+
+// Module notices (INoticeModule): the newest one, briefly, near the top.
+struct ModuleNotice {
+    std::string text;
+    Clock::time_point at{};
+};
+ModuleNotice moduleNotice;
+
+void DrawModuleNotices(ModuleManager& modules, ImVec2 display) {
+    for (auto* module : modules.EnabledModulesOf<INoticeModule>()) {
+        std::vector<std::string> notices;
+        try { notices = module->TakeNotices(); } catch (...) { continue; }
+        if (!notices.empty()) moduleNotice = {notices.back(), Clock::now()};
+    }
+    if (moduleNotice.text.empty()) return;
+    constexpr float Duration = 3.0F;
+    const float elapsed = std::chrono::duration<float>(Clock::now() - moduleNotice.at).count();
+    if (elapsed > Duration) {
+        moduleNotice.text.clear();
+        return;
+    }
+    const float alpha = elapsed > Duration - 0.4F ? (Duration - elapsed) / 0.4F : 1.0F;
+    auto* draw = ImGui::GetForegroundDrawList();
+    const ImVec2 textSize = ImGui::CalcTextSize(moduleNotice.text.c_str());
+    const ImVec2 size(textSize.x + 28.0F, textSize.y + 14.0F);
+    const ImVec2 position(std::round((display.x - size.x) * 0.5F), std::round(display.y * 0.18F));
+    draw->AddRectFilled(position, ImVec2(position.x + size.x, position.y + size.y), WithAlpha(Canvas, 0.92F * alpha), 8.0F);
+    draw->AddRect(position, ImVec2(position.x + size.x, position.y + size.y), WithAlpha(Pink, alpha), 8.0F);
+    draw->AddText(ImVec2(position.x + 14.0F, position.y + 7.0F), WithAlpha(Text, alpha), moduleNotice.text.c_str());
+}
+
+// Java-style tab list: a centred panel near the top of the screen with a
+// grid of player heads and names.
+void DrawPlayerLists(ModuleManager& modules, ImVec2 display) {
+    for (const auto* module : modules.EnabledModulesOf<IPlayerListModule>()) {
+        PlayerListView view;
+        try { view = module->PlayerList(); } catch (...) { continue; }
+        if (!view.visible) continue;
+        auto* draw = ImGui::GetForegroundDrawList();
+        auto* font = ImGui::GetFont();
+        const float scale = std::clamp(view.scale, 0.6F, 2.0F);
+        const float fontSize = ImGui::GetFontSize() * scale;
+        const float rowHeight = std::round(fontSize + 6.0F * scale);
+        const float head = view.heads ? std::round(fontSize) : 0.0F;
+        const float padding = 10.0F * scale;
+        const std::size_t count = view.rows.size();
+        const float safeWidth = std::max(40.0F, display.x - 24.0F);
+        std::size_t columns = view.columns > 0 ? static_cast<std::size_t>(view.columns)
+            : std::clamp<std::size_t>((count + 19) / 20, 1, 4);
+        columns = std::max<std::size_t>(1, std::min(columns, std::max<std::size_t>(count, 1)));
+        const float fixedCellWidth = (head > 0.0F ? head + 6.0F * scale : 0.0F) + 12.0F * scale;
+        const std::size_t maxColumns = std::max<std::size_t>(1,
+            static_cast<std::size_t>(std::floor(std::max(1.0F, safeWidth - padding * 2.0F) / (80.0F * scale))));
+        columns = std::min(columns, maxColumns);
+        const float headerHeight = fontSize * 2.0F + 12.0F * scale;
+        const std::size_t maxRows = std::max<std::size_t>(1, static_cast<std::size_t>(std::floor(
+            std::max(rowHeight, display.y - 24.0F * scale - headerHeight - padding) / rowHeight)));
+        const std::size_t shownCount = std::min(count, columns * maxRows);
+        const std::size_t rows = std::max<std::size_t>(1, (shownCount + columns - 1) / columns);
+        float nameWidth = 60.0F * scale;
+        for (const auto& row : view.rows) {
+            nameWidth = std::max(nameWidth, font->CalcTextSizeA(fontSize, FLT_MAX, 0.0F, row.name.c_str()).x);
+        }
+        const float maxNameWidth = std::max(20.0F, (safeWidth - padding * 2.0F) / static_cast<float>(columns) - fixedCellWidth);
+        nameWidth = std::min(nameWidth, maxNameWidth);
+        const float cellWidth = fixedCellWidth + nameWidth;
+        const std::string title = FitDebugText(font, fontSize, view.title.empty() ? std::string("Players") : view.title,
+            safeWidth - padding * 2.0F);
+        const std::string subtitle = std::format("{} online", count);
+        const float titleWidth = font->CalcTextSizeA(fontSize, FLT_MAX, 0.0F, title.c_str()).x;
+        const float width = std::min(safeWidth,
+            std::max(cellWidth * static_cast<float>(columns), titleWidth + 40.0F * scale) + padding * 2.0F);
+        const float height = headerHeight + rowHeight * static_cast<float>(rows) + padding;
+        const ImVec2 origin(std::round((display.x - width) * 0.5F), std::round(24.0F * scale));
+        draw->AddRectFilled(origin, ImVec2(origin.x + width, origin.y + height), WithAlpha(Canvas, 0.92F), 8.0F * scale);
+        draw->AddRect(origin, ImVec2(origin.x + width, origin.y + height), Stroke, 8.0F * scale);
+        draw->AddText(font, fontSize, ImVec2(origin.x + (width - titleWidth) * 0.5F, origin.y + padding * 0.6F), Text, title.c_str());
+        const float subtitleWidth = font->CalcTextSizeA(fontSize * 0.85F, FLT_MAX, 0.0F, subtitle.c_str()).x;
+        draw->AddText(font, fontSize * 0.85F, ImVec2(origin.x + (width - subtitleWidth) * 0.5F, origin.y + padding * 0.6F + fontSize + 2.0F),
+            Pink, subtitle.c_str());
+        const float gridLeft = origin.x + (width - cellWidth * static_cast<float>(columns)) * 0.5F;
+        for (std::size_t index = 0; index < shownCount; ++index) {
+            const auto& row = view.rows[index];
+            // Column-major, like Java's list.
+            const std::size_t column = index / rows;
+            const std::size_t line = index % rows;
+            const ImVec2 cell(gridLeft + cellWidth * static_cast<float>(column),
+                origin.y + headerHeight + rowHeight * static_cast<float>(line));
+            draw->AddRectFilled(ImVec2(cell.x + 2.0F, cell.y + 1.0F), ImVec2(cell.x + cellWidth - 2.0F, cell.y + rowHeight - 1.0F),
+                line % 2 == 0 ? WithAlpha(Surface, 0.85F) : WithAlpha(SurfaceRaised, 0.85F), 3.0F * scale);
+            float textX = cell.x + 6.0F * scale;
+            if (head > 0.0F) {
+                const float pixel = head / 8.0F;
+                const ImVec2 headOrigin(textX, cell.y + (rowHeight - head) * 0.5F);
+                if (row.hasFace) {
+                    for (std::size_t p = 0; p < row.face.size(); ++p) {
+                        const float px = headOrigin.x + static_cast<float>(p % 8) * pixel;
+                        const float py = headOrigin.y + static_cast<float>(p / 8) * pixel;
+                        draw->AddRectFilled(ImVec2(px, py), ImVec2(px + pixel, py + pixel), FromArgb(row.face[p]));
+                    }
+                } else {
+                    draw->AddRectFilled(headOrigin, ImVec2(headOrigin.x + head, headOrigin.y + head), Stroke, 2.0F);
+                }
+                textX += head + 6.0F * scale;
+            }
+            const auto shownName = FitDebugText(font, fontSize, row.name, nameWidth);
+            draw->AddText(font, fontSize, ImVec2(textX, cell.y + (rowHeight - fontSize) * 0.5F), Text, shownName.c_str());
         }
     }
 }
@@ -623,7 +2558,7 @@ bool HubTile(const char* id, ImVec2 position, ImVec2 size, HubIcon icon, const c
     return pressed;
 }
 
-void DrawHomeHub(ModuleManager& modules, float deltaSeconds) {
+void DrawHomeHub(ModuleManager& modules, float deltaSeconds, bool& editMode) {
     const auto display = ImGui::GetIO().DisplaySize;
     const float resolutionScale = std::clamp(std::min(display.x / 1280.0F, display.y / 720.0F), 0.85F, 1.15F);
     const float scale = resolutionScale * ParseGuiScale(modules.ModuleSetting("click-gui.scale", "0.65"));
@@ -636,11 +2571,14 @@ void DrawHomeHub(ModuleManager& modules, float deltaSeconds) {
     DrawSkinHead(ImGui::GetWindowDrawList(), ImVec2(display.x * 0.5F, dockY - 104.0F * scale),
         132.0F * scale, deltaSeconds);
     if (HubTile("##customize-hub", ImVec2(startX, dockY), sideSize, HubIcon::Pencil,
-        "", scale, "HUD layout - arrange your HUD")) section = Section::Hud;
+        "", scale, "Edit GUI - arrange your HUD")) editMode = true;
     if (HubTile("##modules-hub", ImVec2(startX + sideSize.x + gap, dockY), centerSize,
         HubIcon::Modules, "MODS", scale, "Modules - browse fair-play tools")) section = Section::Modules;
     if (HubTile("##settings-hub", ImVec2(startX + sideSize.x + gap + centerSize.x + gap, dockY),
         sideSize, HubIcon::Settings, "", scale, "Settings - controls and status")) section = Section::Settings;
+    const ImVec2 profileSize(220.0F * scale, 58.0F * scale);
+    if (HubTile("##profiles-hub", ImVec2((display.x - profileSize.x) * 0.5F, dockY + sideSize.y + gap),
+        profileSize, HubIcon::Modules, "PROFILES", scale, "Profiles - switch complete setups")) section = Section::Profiles;
 }
 
 // Middle dot, spelled as bytes so it does not depend on the source charset.
@@ -815,6 +2753,68 @@ void CaptureHint(const Form& form, float rowStartX) {
     CaptionText(Muted, "Esc cancels, Backspace clears");
 }
 
+// A 16x16 paint grid: left-drag paints, right-drag erases. Returns true and
+// updates `grid` only when a pixel actually changed.
+bool PixelGridEditor(const char* id, PixelGrid& grid, const PixelGrid& fallback, float width) {
+    const float cell = std::clamp(std::floor(width / static_cast<float>(PixelGridSize)), 8.0F, 16.0F);
+    const float edge = cell * static_cast<float>(PixelGridSize);
+    const ImVec2 origin = ImGui::GetCursorScreenPos();
+    ImGui::InvisibleButton(id, ImVec2(edge, edge), ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonRight);
+    const bool hovered = ImGui::IsItemHovered();
+    const bool painting = ImGui::IsItemActive() && ImGui::IsMouseDown(ImGuiMouseButton_Left);
+    const bool erasing = ImGui::IsItemActive() && ImGui::IsMouseDown(ImGuiMouseButton_Right);
+
+    bool changed = false;
+    const ImVec2 mouse = ImGui::GetIO().MousePos;
+    const auto column = static_cast<int>(std::floor((mouse.x - origin.x) / cell));
+    const auto row = static_cast<int>(std::floor((mouse.y - origin.y) / cell));
+    const bool inside = column >= 0 && row >= 0 && column < static_cast<int>(PixelGridSize) && row < static_cast<int>(PixelGridSize);
+    if (inside && (painting || erasing)) {
+        const auto x = static_cast<std::size_t>(column);
+        const auto y = static_cast<std::size_t>(row);
+        if (PixelAt(grid, x, y) != painting) {
+            SetPixel(grid, x, y, painting);
+            changed = true;
+        }
+    }
+
+    auto* draw = ImGui::GetWindowDrawList();
+    draw->AddRectFilled(origin, ImVec2(origin.x + edge, origin.y + edge), Surface, 4.0F);
+    for (std::size_t y = 0; y < PixelGridSize; ++y) {
+        for (std::size_t x = 0; x < PixelGridSize; ++x) {
+            if (!PixelAt(grid, x, y)) continue;
+            const ImVec2 minimum(origin.x + static_cast<float>(x) * cell, origin.y + static_cast<float>(y) * cell);
+            draw->AddRectFilled(minimum, ImVec2(minimum.x + cell, minimum.y + cell), Text);
+        }
+    }
+    for (std::size_t line = 1; line < PixelGridSize; ++line) {
+        const float offset = static_cast<float>(line) * cell;
+        const ImU32 color = line == PixelGridSize / 2 ? WithAlpha(Pink, 0.6F) : WithAlpha(Stroke, 0.55F);
+        draw->AddLine(ImVec2(origin.x + offset, origin.y), ImVec2(origin.x + offset, origin.y + edge), color);
+        draw->AddLine(ImVec2(origin.x, origin.y + offset), ImVec2(origin.x + edge, origin.y + offset), color);
+    }
+    if (hovered && inside) {
+        const ImVec2 minimum(origin.x + static_cast<float>(column) * cell, origin.y + static_cast<float>(row) * cell);
+        draw->AddRect(minimum, ImVec2(minimum.x + cell, minimum.y + cell), Pink, 0.0F, 0, 1.5F);
+    }
+    draw->AddRect(origin, ImVec2(origin.x + edge, origin.y + edge), Stroke, 4.0F);
+
+    const auto edit = [&](const char* label, const PixelGrid& next) {
+        if (ImGui::SmallButton(label) && next != grid) {
+            grid = next;
+            changed = true;
+        }
+    };
+    edit("Clear", PixelGrid{});
+    ImGui::SameLine();
+    edit("Mirror left to right", MirrorPixelsHorizontally(grid));
+    ImGui::SameLine();
+    edit("Mirror top to bottom", MirrorPixelsVertically(grid));
+    ImGui::SameLine();
+    edit("Default", fallback);
+    return changed;
+}
+
 bool DrawSettingControl(ModuleManager& modules, const std::string& moduleId, const SettingDescriptor& descriptor,
     const SettingsReader& reader, const Form& form) {
     const std::string fullKey = moduleId + "." + descriptor.key;
@@ -904,6 +2904,19 @@ bool DrawSettingControl(ModuleManager& modules, const std::string& moduleId, con
         FormLabel(form, descriptor.label, help);
         ImGui::SetNextItemWidth(form.controlWidth);
         if (ImGui::InputText(id.c_str(), buffer.data(), buffer.size())) { value = buffer.data(); changed = true; }
+        break;
+    }
+    case SettingType::Pixels: {
+        auto grid = reader.Pixels(descriptor.key);
+        FormLabel(form, descriptor.label, help);
+        ImGui::NewLine();
+        FormIndent(form, rowStartX);
+        ImGui::BeginGroup();
+        if (PixelGridEditor(id.c_str(), grid, ParsePixelGrid(descriptor.defaultValue).value_or(PixelGrid{}), form.controlWidth)) {
+            value = FormatPixelGrid(grid);
+            changed = true;
+        }
+        ImGui::EndGroup();
         break;
     }
     }
@@ -1031,6 +3044,8 @@ void DrawModulePanel(ModuleManager& modules, const ModuleMetadata& metadata, flo
         if (!metadata.available) CaptionText(Muted, "Saved now, applied once the module is available.");
         const auto reader = modules.SettingsFor(metadata.id);
         for (const auto& descriptor : module->Settings()) {
+            if (!IsSettingVisible(descriptor, reader) || !module->IsSettingRelevant(descriptor.key)) continue;
+            // A change can show or hide later rows; they appear next frame.
             if (DrawSettingControl(modules, metadata.id, descriptor, reader, form)) dirty = true;
         }
     }
@@ -1182,6 +3197,1065 @@ void DrawModulesPage(ModuleManager& modules, ClickGui& browser, bool& dirty) {
     ImGui::EndChild();
 }
 
+std::filesystem::path ReplayDirectory() {
+    wchar_t localAppData[32768]{};
+    const auto length = GetEnvironmentVariableW(L"LOCALAPPDATA", localAppData,
+        static_cast<DWORD>(std::size(localAppData)));
+    if (length > 0 && length < std::size(localAppData)) {
+        return std::filesystem::path(localAppData) / L"Oinkster" / L"Client" / L"replays";
+    }
+    return std::filesystem::temp_directory_path() / L"Oinkster" / L"replays";
+}
+
+// Replays theater: intro/loading -> library of saved recordings -> viewer.
+// Everything runs on the render thread; files are summarized one per frame
+// behind the intro animation, so there is no worker to drain on unload.
+enum class TheaterPhase { Intro, Library, ViewerLoading, Viewer };
+
+struct TheaterEntry {
+    std::filesystem::file_time_type modified{};
+    Replay::ReplaySummary summary;
+};
+
+struct Theater {
+    TheaterPhase phase{TheaterPhase::Intro};
+    std::uint64_t lastFrame{};
+    float phaseSeconds{};
+    float introSeconds{};
+    bool introPlayed{};
+    std::vector<std::filesystem::path> pending;
+    std::size_t total{};
+    std::unordered_map<std::wstring, TheaterEntry> cache;
+    std::vector<std::wstring> order;
+    // The replay a Delete or Rename dialog is about (its cache key), and the
+    // name being typed. Esc closes an open dialog before anything else.
+    enum class Dialog { None, Delete, Rename } dialog{Dialog::None};
+    std::wstring dialogKey;
+    std::array<char, 96> renameBuffer{};
+    std::string renameError;
+    std::filesystem::path openPath;
+    std::optional<Replay::ReplayTimeline> timeline;
+    std::vector<Replay::PathPoint> drawPath;
+    double playheadMicros{};
+    bool playing{};
+    float speed{1.0F};
+    // Opened from the main-menu button: no ClickGUI chrome, no recorder.
+    bool standalone{};
+    bool closeRequested{};
+    std::string watchError;
+    std::filesystem::path watchPath;
+    // Watch was pressed and the replay is loading or waiting for a world.
+    bool watchArmed{};
+};
+Theater theater;
+
+constexpr std::size_t MaxListedReplays = 200;
+
+bool IsReplayFile(const std::filesystem::path& path) {
+    const auto extension = path.extension().wstring();
+    return extension == L".oinkreplay" || extension == L".partial";
+}
+
+void SortTheaterOrder() {
+    theater.order.clear();
+    for (const auto& [key, entry] : theater.cache) theater.order.push_back(key);
+    std::ranges::sort(theater.order, [](const std::wstring& left, const std::wstring& right) {
+        const auto& a = theater.cache.at(left);
+        const auto& b = theater.cache.at(right);
+        if (a.summary.startedUnixMillis != b.summary.startedUnixMillis) {
+            return a.summary.startedUnixMillis > b.summary.startedUnixMillis;
+        }
+        return a.modified > b.modified;
+    });
+}
+
+// Rescans the folder, keeping cached summaries whose file is unchanged.
+void EnterTheater() {
+    theater.pending.clear();
+    theater.dialog = Theater::Dialog::None;
+    theater.dialogKey.clear();
+    std::unordered_map<std::wstring, TheaterEntry> kept;
+    std::error_code error;
+    const auto directory = ReplayDirectory();
+    std::size_t listed = 0;
+    if (std::filesystem::exists(directory, error)) {
+        for (std::filesystem::directory_iterator iterator(directory, error), end;
+             !error && iterator != end && listed < MaxListedReplays; iterator.increment(error)) {
+            if (!iterator->is_regular_file(error) || !IsReplayFile(iterator->path())) continue;
+            ++listed;
+            const auto key = iterator->path().wstring();
+            const auto modified = iterator->last_write_time(error);
+            const auto bytes = iterator->file_size(error);
+            const auto cached = theater.cache.find(key);
+            if (cached != theater.cache.end() && cached->second.modified == modified
+                && cached->second.summary.bytes == bytes) {
+                kept.emplace(key, std::move(cached->second));
+            } else {
+                theater.pending.push_back(iterator->path());
+            }
+        }
+    }
+    theater.cache = std::move(kept);
+    theater.total = theater.cache.size() + theater.pending.size();
+    theater.phase = TheaterPhase::Intro;
+    theater.phaseSeconds = 0.0F;
+    // The full intro plays once per session; later visits get a short fade.
+    theater.introSeconds = theater.introPlayed ? 0.3F : 0.9F;
+    theater.introPlayed = true;
+    SortTheaterOrder();
+}
+
+void LoadPendingSummary() {
+    if (theater.pending.empty()) return;
+    const auto path = theater.pending.back();
+    theater.pending.pop_back();
+    std::error_code error;
+    TheaterEntry entry{std::filesystem::last_write_time(path, error), Replay::Summarize(path)};
+    theater.cache[path.wstring()] = std::move(entry);
+    if (theater.pending.empty()) SortTheaterOrder();
+}
+
+std::string FormatDuration(std::uint64_t micros) {
+    const auto seconds = micros / 1'000'000;
+    if (seconds >= 3600) return std::format("{}:{:02}:{:02}", seconds / 3600, seconds / 60 % 60, seconds % 60);
+    return std::format("{:02}:{:02}", seconds / 60, seconds % 60);
+}
+
+std::string FormatStarted(std::uint64_t unixMillis) {
+    if (unixMillis == 0) return "Unknown date";
+    const auto seconds = static_cast<std::time_t>(unixMillis / 1000);
+    std::tm local{};
+    if (localtime_s(&local, &seconds) != 0) return "Unknown date";
+    constexpr std::array<const char*, 12> Months{"Jan", "Feb", "Mar", "Apr", "May", "Jun",
+        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+    return std::format("{} {}, {:02}:{:02}", Months.at(static_cast<std::size_t>(local.tm_mon) % 12),
+        local.tm_mday, local.tm_hour, local.tm_min);
+}
+
+const char* DimensionName(std::optional<int> dimension) {
+    if (!dimension) return "Unknown";
+    switch (*dimension) {
+    case 0: return "Overworld";
+    case 1: return "Nether";
+    case 2: return "The End";
+    default: return "Other";
+    }
+}
+
+// Maps world X/Z into a screen rectangle with one uniform scale (X right,
+// Z down, i.e. north up) so the path keeps its real shape.
+struct MapProjection {
+    ImVec2 origin;
+    ImVec2 size;
+    double minX{};
+    double minZ{};
+    double scale{1.0};
+    ImVec2 offset;
+
+    MapProjection(ImVec2 position, ImVec2 extent, double lowX, double highX, double lowZ, double highZ, float padding)
+        : origin(position), size(extent), minX(lowX), minZ(lowZ) {
+        const double spanX = std::max(highX - lowX, 8.0);
+        const double spanZ = std::max(highZ - lowZ, 8.0);
+        const double usableX = std::max(1.0, static_cast<double>(extent.x - padding * 2.0F));
+        const double usableY = std::max(1.0, static_cast<double>(extent.y - padding * 2.0F));
+        scale = std::min(usableX / spanX, usableY / spanZ);
+        offset = ImVec2(static_cast<float>((extent.x - (highX - lowX) * scale) * 0.5),
+            static_cast<float>((extent.y - (highZ - lowZ) * scale) * 0.5));
+    }
+
+    [[nodiscard]] ImVec2 operator()(double x, double z) const {
+        return ImVec2(origin.x + offset.x + static_cast<float>((x - minX) * scale),
+            origin.y + offset.y + static_cast<float>((z - minZ) * scale));
+    }
+};
+
+void DrawPathThumbnail(ImDrawList* draw, const Replay::ReplaySummary& summary, ImVec2 position, ImVec2 size) {
+    draw->AddRectFilled(position, ImVec2(position.x + size.x, position.y + size.y), Rail, 8.0F);
+    if (summary.thumbnail.size() < 2) {
+        const char* label = summary.thumbnail.empty() ? "no path" : "stood still";
+        ImFont* font = CompactFont();
+        const ImVec2 textSize = font->CalcTextSizeA(font->FontSize, FLT_MAX, 0.0F, label);
+        draw->AddText(font, font->FontSize, ImVec2(position.x + (size.x - textSize.x) * 0.5F,
+            position.y + (size.y - textSize.y) * 0.5F), Muted, label);
+        return;
+    }
+    const MapProjection project(position, size, summary.minX, summary.maxX, summary.minZ, summary.maxZ, 10.0F);
+    std::vector<ImVec2> points;
+    points.reserve(summary.thumbnail.size());
+    for (const auto& point : summary.thumbnail) points.push_back(project(point.x, point.z));
+    draw->AddPolyline(points.data(), static_cast<int>(points.size()), WithAlpha(Pink, 0.85F), ImDrawFlags_None, 1.6F);
+    draw->AddCircleFilled(points.front(), 3.0F, Green);
+    draw->AddCircleFilled(points.back(), 3.0F, Pink);
+}
+
+// Recordings are saved as replay-<unix ms>; anything else was renamed.
+bool HasDefaultName(const std::filesystem::path& path) {
+    const auto stem = path.stem().wstring();
+    constexpr std::wstring_view Prefix = L"replay-";
+    return stem.size() > Prefix.size() && stem.starts_with(Prefix)
+        && std::all_of(stem.begin() + static_cast<std::ptrdiff_t>(Prefix.size()), stem.end(), [](wchar_t c) { return c >= L'0' && c <= L'9'; });
+}
+
+// A replay's card title: its name, or when it was recorded.
+std::string ReplayTitle(const Replay::ReplaySummary& summary) {
+    if (HasDefaultName(summary.path)) return FormatStarted(summary.startedUnixMillis);
+    return Narrow(summary.path.stem().wstring());
+}
+
+std::wstring Widen(std::string_view text) {
+    if (text.empty()) return {};
+    const int length = MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), nullptr, 0);
+    std::wstring wide(static_cast<std::size_t>(std::max(length, 0)), L'\0');
+    if (length > 0) MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), wide.data(), length);
+    return wide;
+}
+
+// A typed name as a file name: no characters Windows forbids, no leading or
+// trailing spaces or dots. Empty when nothing usable is left.
+std::wstring ReplayFileStem(std::string_view typed) {
+    std::wstring name;
+    for (const wchar_t c : Widen(typed)) {
+        if (c < 0x20 || std::wstring_view(L"<>:\"/\\|?*").find(c) != std::wstring_view::npos) continue;
+        name.push_back(c);
+    }
+    const auto first = name.find_first_not_of(L" .");
+    if (first == std::wstring::npos) return {};
+    name = name.substr(first, name.find_last_not_of(L" .") - first + 1);
+    if (name.size() > 64) name.resize(64);
+    return name;
+}
+
+bool DangerButton(const char* label, ImVec2 size) {
+    ImGui::PushStyleColor(ImGuiCol_Button, ToVec4(IM_COL32(206, 82, 96, 255)));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ToVec4(IM_COL32(226, 104, 116, 255)));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ToVec4(IM_COL32(184, 66, 80, 255)));
+    ImGui::PushStyleColor(ImGuiCol_Text, ToVec4(IM_COL32(255, 244, 246, 255)));
+    const bool pressed = ImGui::Button(label, size);
+    ImGui::PopStyleColor(4);
+    return pressed;
+}
+
+// A small confirmation card in the overlay's own style: centered, no title
+// bar, a rounded panel over a dimmed library.
+bool BeginTheaterDialog(const char* id, float width) {
+    const ImVec2 display = ImGui::GetIO().DisplaySize;
+    ImGui::SetNextWindowPos(ImVec2(display.x * 0.5F, display.y * 0.5F), ImGuiCond_Always, ImVec2(0.5F, 0.5F));
+    ImGui::SetNextWindowSize(ImVec2(width, 0.0F), ImGuiCond_Always);
+    ImGui::PushStyleColor(ImGuiCol_PopupBg, ToVec4(Surface));
+    ImGui::PushStyleColor(ImGuiCol_Border, ToVec4(Stroke));
+    ImGui::PushStyleColor(ImGuiCol_ModalWindowDimBg, ToVec4(IM_COL32(10, 6, 8, 150)));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 10.0F);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.0F);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(20.0F, 18.0F));
+    const bool open = ImGui::BeginPopupModal(id, nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoMove
+        | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoSavedSettings);
+    ImGui::PopStyleVar(3);
+    ImGui::PopStyleColor(3);
+    return open;
+}
+
+void DialogHeading(const char* title) {
+    ImGui::PushFont(BodyFont());
+    ImGui::TextColored(ToVec4(Text), "%s", title);
+    ImGui::PopFont();
+    ImGui::Dummy(ImVec2(0.0F, 2.0F));
+}
+
+// Right-aligns a row of two buttons of `width` each.
+void DialogButtonRow(float width) {
+    ImGui::Dummy(ImVec2(0.0F, 8.0F));
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - width * 2.0F - ImGui::GetStyle().ItemSpacing.x);
+}
+
+// The Delete and Rename dialogs for theater.dialogKey. True when the files
+// changed and the library must be rescanned.
+bool DrawReplayDialogs() {
+    constexpr const char* DeleteId = "##delete-replay";
+    constexpr const char* RenameId = "##rename-replay";
+    const auto found = theater.cache.find(theater.dialogKey);
+    if (theater.dialog != Theater::Dialog::None && found == theater.cache.end()) theater.dialog = Theater::Dialog::None;
+    if (theater.dialog == Theater::Dialog::Delete && !ImGui::IsPopupOpen(DeleteId)) ImGui::OpenPopup(DeleteId);
+    if (theater.dialog == Theater::Dialog::Rename && !ImGui::IsPopupOpen(RenameId)) ImGui::OpenPopup(RenameId);
+    bool changed = false;
+    constexpr float ButtonWidth = 96.0F;
+
+    if (BeginTheaterDialog(DeleteId, 340.0F)) {
+        if (theater.dialog != Theater::Dialog::Delete) {
+            ImGui::CloseCurrentPopup();
+        } else {
+            const auto& summary = found->second.summary;
+            DialogHeading("Delete replay?");
+            ImGui::PushTextWrapPos();
+            ImGui::PushFont(CompactFont());
+            ImGui::TextColored(ToVec4(Secondary), "%s", ReplayTitle(summary).c_str());
+            ImGui::TextColored(ToVec4(Muted), "This recording will be permanently removed. This can't be undone.");
+            ImGui::PopFont();
+            ImGui::PopTextWrapPos();
+            DialogButtonRow(ButtonWidth);
+            if (ImGui::Button("Cancel", ImVec2(ButtonWidth, 30.0F))) theater.dialog = Theater::Dialog::None;
+            ImGui::SameLine();
+            if (DangerButton("Delete", ImVec2(ButtonWidth, 30.0F))) {
+                std::error_code ignored;
+                std::filesystem::remove(summary.path, ignored);
+                std::filesystem::remove(ReplayInjector::CameraPathFile(summary.path), ignored);
+                theater.dialog = Theater::Dialog::None;
+                changed = true;
+            }
+            if (theater.dialog == Theater::Dialog::None) ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+
+    if (BeginTheaterDialog(RenameId, 360.0F)) {
+        if (theater.dialog != Theater::Dialog::Rename) {
+            ImGui::CloseCurrentPopup();
+        } else {
+            const auto& summary = found->second.summary;
+            DialogHeading("Rename replay");
+            CaptionText(Muted, FormatStarted(summary.startedUnixMillis).c_str());
+            ImGui::Dummy(ImVec2(0.0F, 4.0F));
+            if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            const bool entered = ImGui::InputTextWithHint("##replay-name", "Name this replay", theater.renameBuffer.data(),
+                theater.renameBuffer.size(), ImGuiInputTextFlags_EnterReturnsTrue);
+            if (!theater.renameError.empty()) {
+                ImGui::PushTextWrapPos();
+                CaptionText(Amber, theater.renameError.c_str());
+                ImGui::PopTextWrapPos();
+            }
+            DialogButtonRow(ButtonWidth);
+            if (ImGui::Button("Cancel", ImVec2(ButtonWidth, 30.0F))) theater.dialog = Theater::Dialog::None;
+            ImGui::SameLine();
+            if (PrimaryButton("Save", ImVec2(ButtonWidth, 30.0F)) || entered) {
+                const auto stem = ReplayFileStem(theater.renameBuffer.data());
+                const auto target = summary.path.parent_path() / (stem + summary.path.extension().wstring());
+                std::error_code error;
+                if (stem.empty()) {
+                    theater.renameError = "Type a name first.";
+                } else if (target == summary.path) {
+                    theater.dialog = Theater::Dialog::None;
+                } else if (std::filesystem::exists(target, error)) {
+                    theater.renameError = "Another replay already has that name.";
+                } else {
+                    std::filesystem::rename(summary.path, target, error);
+                    // Its camera keyframes go with it.
+                    if (std::error_code ignored; !error && std::filesystem::exists(ReplayInjector::CameraPathFile(summary.path), ignored)) {
+                        std::filesystem::rename(ReplayInjector::CameraPathFile(summary.path), ReplayInjector::CameraPathFile(target), ignored);
+                    }
+                    if (error) {
+                        theater.renameError = "The replay could not be renamed.";
+                    } else {
+                        theater.dialog = Theater::Dialog::None;
+                        changed = true;
+                    }
+                }
+            }
+            if (theater.dialog == Theater::Dialog::None) ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+    return changed;
+}
+
+void DrawTheaterIntro(float deltaSeconds) {
+    theater.phaseSeconds += deltaSeconds;
+    // One file per frame keeps a long recording from stalling several frames.
+    LoadPendingSummary();
+    const bool loaded = theater.pending.empty();
+    const bool skip = loaded && (ImGui::IsMouseClicked(ImGuiMouseButton_Left) || ImGui::IsKeyPressed(ImGuiKey_Space, false));
+    if (loaded && (theater.phaseSeconds >= theater.introSeconds || skip)) {
+        theater.phase = TheaterPhase::Library;
+        theater.phaseSeconds = 0.0F;
+        return;
+    }
+
+    const ImVec2 origin = ImGui::GetCursorScreenPos();
+    const ImVec2 area = ImGui::GetContentRegionAvail();
+    auto* draw = ImGui::GetWindowDrawList();
+    const float t = theater.phaseSeconds;
+    const float appear = std::clamp(t / 0.35F, 0.0F, 1.0F);
+    const ImVec2 center(origin.x + area.x * 0.5F, origin.y + area.y * 0.42F);
+
+    // Two film reels spinning either side of the snout.
+    for (int side = -1; side <= 1; side += 2) {
+        const ImVec2 reel(center.x + static_cast<float>(side) * 74.0F, center.y);
+        draw->AddCircle(reel, 34.0F, WithAlpha(Pink, appear), 48, 3.0F);
+        draw->AddCircleFilled(reel, 7.0F, WithAlpha(Pink, appear));
+        for (int hole = 0; hole < 5; ++hole) {
+            const float angle = t * 3.2F * static_cast<float>(side) + static_cast<float>(hole) * 1.2566F;
+            draw->AddCircleFilled(ImVec2(reel.x + std::cos(angle) * 20.0F, reel.y + std::sin(angle) * 20.0F),
+                6.0F, WithAlpha(PinkDeep, appear));
+            draw->AddCircle(ImVec2(reel.x + std::cos(angle) * 20.0F, reel.y + std::sin(angle) * 20.0F),
+                6.0F, WithAlpha(Pink, appear * 0.8F), 16, 1.5F);
+        }
+    }
+    // Film strip running between the reels.
+    const float stripY = center.y + 46.0F;
+    draw->AddRectFilled(ImVec2(center.x - 120.0F, stripY), ImVec2(center.x + 120.0F, stripY + 18.0F),
+        WithAlpha(Surface, appear), 3.0F);
+    const float scroll = std::fmod(t * 60.0F, 20.0F);
+    draw->PushClipRect(ImVec2(center.x - 120.0F, stripY), ImVec2(center.x + 120.0F, stripY + 18.0F), true);
+    for (float x = center.x - 140.0F + scroll; x < center.x + 140.0F; x += 20.0F) {
+        draw->AddRectFilled(ImVec2(x, stripY + 3.0F), ImVec2(x + 8.0F, stripY + 7.0F), WithAlpha(Muted, appear), 1.0F);
+        draw->AddRectFilled(ImVec2(x, stripY + 11.0F), ImVec2(x + 8.0F, stripY + 15.0F), WithAlpha(Muted, appear), 1.0F);
+    }
+    draw->PopClipRect();
+    const float bob = std::sin(t * 4.0F) * 2.0F;
+    DrawSnout(draw, ImVec2(center.x, center.y + bob), 1.15F, appear);
+
+    ImFont* title = TitleFont();
+    const char* heading = "OINKSTER REPLAYS";
+    const ImVec2 headingSize = title->CalcTextSizeA(title->FontSize, FLT_MAX, 0.0F, heading);
+    draw->AddText(title, title->FontSize, ImVec2(center.x - headingSize.x * 0.5F, stripY + 34.0F),
+        WithAlpha(Text, appear), heading);
+
+    // Progress follows real loading; the timer only guarantees a minimum.
+    const float loadProgress = theater.total == 0 ? 1.0F
+        : static_cast<float>(theater.total - theater.pending.size()) / static_cast<float>(theater.total);
+    const float progress = std::min(loadProgress, std::clamp(t / std::max(theater.introSeconds, 0.01F), 0.0F, 1.0F));
+    const float barY = stripY + 44.0F + headingSize.y;
+    const ImVec2 barMin(center.x - 140.0F, barY);
+    draw->AddRectFilled(barMin, ImVec2(center.x + 140.0F, barY + 5.0F), WithAlpha(Stroke, appear), 2.5F);
+    draw->AddRectFilled(barMin, ImVec2(barMin.x + 280.0F * progress, barY + 5.0F), WithAlpha(Pink, appear), 2.5F);
+    const std::string status = theater.total == 0 ? std::string("Loading replays...")
+        : std::format("Loading replays... {} / {}", theater.total - theater.pending.size(), theater.total);
+    ImFont* compact = CompactFont();
+    const ImVec2 statusSize = compact->CalcTextSizeA(compact->FontSize, FLT_MAX, 0.0F, status.c_str());
+    draw->AddText(compact, compact->FontSize, ImVec2(center.x - statusSize.x * 0.5F, barY + 12.0F),
+        WithAlpha(Muted, appear), status.c_str());
+}
+
+void DrawRecorderCard(ModuleManager& modules, SteadyTime now) {
+    const auto controllers = modules.EnabledModulesOf<IReplayControlModule>();
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ToVec4(Surface));
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 8.0F);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(14.0F, 10.0F));
+    ImGui::BeginChild("##recorder-card", ImVec2(0.0F, 0.0F),
+        ImGuiChildFlags_AlwaysUseWindowPadding | ImGuiChildFlags_AutoResizeY);
+    CaptionText(Pink, "RECORDER");
+    if (controllers.empty()) {
+        CaptionText(Muted, "Enable Replay Mod in MODS to record your sessions.");
+    } else {
+        auto* replay = controllers.front();
+        const float width = std::min(124.0F, (ImGui::GetContentRegionAvail().x - 8.0F) * 0.5F);
+        DrawRecorderControls(*replay, now, width);
+    }
+    ImGui::EndChild();
+    ImGui::PopStyleVar(2);
+    ImGui::PopStyleColor();
+}
+
+void OpenReplay(const std::filesystem::path& path) {
+    theater.openPath = path;
+    theater.timeline.reset();
+    theater.drawPath.clear();
+    theater.playheadMicros = 0.0;
+    theater.playing = false;
+    theater.speed = 1.0F;
+    theater.phase = TheaterPhase::ViewerLoading;
+    theater.phaseSeconds = 0.0F;
+}
+
+// Loads the replay and waits for the viewer to open one of their own local
+// worlds; the recording then replaces that world's packets in-game
+// (ReplayInjector), with the viewer in spectator mode.
+void WatchReplay(const std::filesystem::path& path) {
+    Keyframes::Reset();
+    std::string error;
+    theater.watchPath = path;
+    if (!ReplayInjector::Watch(path, error)) {
+        theater.watchError = error;
+        theater.watchArmed = false;
+        return;
+    }
+    theater.watchError.clear();
+    theater.watchArmed = true;
+}
+
+void UpdateWatchLaunch() {
+    if (!theater.watchArmed) return;
+    const auto status = ReplayInjector::CurrentStatus();
+    if (status.phase == ReplayInjector::Phase::Failed) {
+        theater.watchArmed = false;
+        theater.watchError = status.error.empty() ? "The replay could not be loaded." : status.error;
+        return;
+    }
+    if (!status.running) {
+        theater.watchArmed = false;
+        return;
+    }
+    // Loaded: start the private replay world (or, if this build could not be
+    // matched, get the theater out of the way so a world can be opened).
+    if (status.phase == ReplayInjector::Phase::WaitingForWorld && theater.standalone) {
+        theater.watchArmed = false;
+        if (ReplayWorld::Available()) ReplayWorld::RequestStart();
+        theater.closeRequested = true;
+    }
+}
+
+void DrawTheaterLibrary(ModuleManager& modules, SteadyTime now) {
+    UpdateWatchLaunch();
+    PageHeader("Replays", theater.order.empty() ? "Your saved recordings"
+        : std::format("{} saved recording{}", theater.order.size(), theater.order.size() == 1 ? "" : "s").c_str());
+    const float headerRight = ImGui::GetWindowContentRegionMax().x;
+    ImGui::SameLine();
+    ImGui::SetCursorPosX(headerRight - (theater.standalone ? 334.0F : 254.0F));
+    if (ImGui::Button("Videos", ImVec2(76.0F, 0.0F))) {
+        std::error_code ignored;
+        const auto directory = Render::VideoDirectory();
+        std::filesystem::create_directories(directory, ignored);
+        ShellExecuteW(nullptr, L"open", directory.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Open the folder rendered videos are saved in");
+    ImGui::SameLine();
+    if (ImGui::Button("Open folder", ImVec2(96.0F, 0.0F))) {
+        std::error_code ignored;
+        const auto directory = ReplayDirectory();
+        std::filesystem::create_directories(directory, ignored);
+        ShellExecuteW(nullptr, L"open", directory.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Refresh", ImVec2(68.0F, 0.0F))) EnterTheater();
+    if (theater.standalone) {
+        ImGui::SameLine();
+        if (PrimaryButton("Done", ImVec2(72.0F, 0.0F))) theater.closeRequested = true;
+    }
+    ImGui::Dummy(ImVec2(0.0F, 4.0F));
+    if (ReplayInjector::Running()) {
+        const auto status = ReplayInjector::CurrentStatus();
+        ImGui::TextColored(ToVec4(Pink), "%s", status.phaseText.c_str());
+        if (status.phase == ReplayInjector::Phase::WaitingForWorld) {
+            const auto worldError = ReplayWorld::LastError();
+            if (!worldError.empty()) {
+                ImGui::PushTextWrapPos();
+                ImGui::TextColored(ToVec4(Amber), "%s", worldError.c_str());
+                ImGui::PopTextWrapPos();
+            }
+            if (ReplayWorld::Available() && ImGui::Button("Start replay world", ImVec2(150.0F, 0.0F))) {
+                ReplayWorld::RequestStart();
+                theater.closeRequested = true;
+            }
+            CaptionText(Muted, ReplayWorld::Available()
+                ? "Or open any singleplayer world; the replay takes it over."
+                : "Open any singleplayer world; the replay takes it over. Use a throwaway world.");
+        }
+        if (ImGui::Button("Cancel replay", ImVec2(124.0F, 0.0F))) {
+            ReplayInjector::Stop();
+            theater.watchArmed = false;
+        }
+    }
+    if (!theater.watchError.empty()) {
+        ImGui::PushTextWrapPos();
+        ImGui::TextColored(ToVec4(Amber), "%s", theater.watchError.c_str());
+        ImGui::PopTextWrapPos();
+        if (!theater.watchPath.empty() && ImGui::Button("Retry Watch", ImVec2(112.0F, 0.0F))) {
+            WatchReplay(theater.watchPath);
+        }
+    }
+    if (!theater.standalone) CaptionText(Muted, "Watch replays from the Replays button on Minecraft's title screen.");
+    if (!theater.standalone) {
+        DrawRecorderCard(modules, now);
+        ImGui::Dummy(ImVec2(0.0F, 8.0F));
+    }
+
+    if (theater.order.empty()) {
+        ImGui::TextColored(ToVec4(Secondary), "No replays yet.");
+        CaptionText(Muted, "Enable Replay Mod, join a world, then press Start in the Esc menu or the K menu.");
+        return;
+    }
+
+    // A recorder that is still writing owns its .partial file.
+    bool recording = false;
+    for (auto* replay : modules.EnabledModulesOf<IReplayControlModule>()) {
+        const auto state = replay->ReplaySnapshot(now).state;
+        recording |= state == ReplayControlState::Recording || state == ReplayControlState::Paused;
+    }
+
+    ImGui::BeginChild("##replay-grid", ImVec2(0.0F, 0.0F), ImGuiChildFlags_None, ImGuiWindowFlags_NoBackground);
+    const float available = ImGui::GetContentRegionAvail().x;
+    constexpr float Gap = 12.0F;
+    const int columns = available >= 560.0F ? 2 : 1;
+    const float cardWidth = (available - Gap * static_cast<float>(columns - 1)) / static_cast<float>(columns);
+    constexpr float CardHeight = 112.0F;
+    constexpr float ActionHeight = 26.0F;
+    auto* draw = ImGui::GetWindowDrawList();
+    std::optional<std::filesystem::path> open;
+    std::optional<std::filesystem::path> watch;
+    int column = 0;
+    for (const auto& key : theater.order) {
+        const auto& summary = theater.cache.at(key).summary;
+        const bool partial = summary.path.extension() == L".partial";
+        ImGui::PushID(static_cast<int>(std::hash<std::wstring>{}(key)));
+        if (column > 0) ImGui::SameLine(0.0F, Gap);
+        ImGui::BeginGroup();
+        const ImVec2 position = ImGui::GetCursorScreenPos();
+        const bool clicked = ImGui::InvisibleButton("##card", ImVec2(cardWidth, CardHeight));
+        const bool hovered = ImGui::IsItemHovered();
+        const ImVec2 maximum(position.x + cardWidth, position.y + CardHeight + ActionHeight);
+        draw->AddRectFilled(position, maximum, hovered ? SurfaceRaised : Surface, 8.0F);
+        draw->AddRect(position, maximum, hovered ? Pink : Stroke, 8.0F, 0, hovered ? 1.6F : 1.0F);
+        const ImVec2 thumbSize(CardHeight - 20.0F, CardHeight - 20.0F);
+        DrawPathThumbnail(draw, summary, ImVec2(position.x + 10.0F, position.y + 10.0F), thumbSize);
+
+        const float textX = position.x + 20.0F + thumbSize.x;
+        const float textWidth = cardWidth - (textX - position.x) - 10.0F;
+        draw->AddText(BodyFont(), BodyFont()->FontSize, ImVec2(textX, position.y + 12.0F), Text,
+            Ellipsize(BodyFont(), ReplayTitle(summary), textWidth).c_str());
+        // A named replay keeps its date on the line below.
+        const std::string facts = std::format("{}{}{}{} mark{}",
+            HasDefaultName(summary.path) ? std::string() : FormatStarted(summary.startedUnixMillis) + Dot,
+            FormatDuration(summary.durationMicros), Dot, summary.markCount, summary.markCount == 1 ? "" : "s");
+        draw->AddText(CompactFont(), CompactFont()->FontSize, ImVec2(textX, position.y + 40.0F), Secondary,
+            Ellipsize(CompactFont(), facts, textWidth).c_str());
+        const std::string size = std::format("{:.1f} MB{}{} packets", static_cast<double>(summary.bytes) / (1024.0 * 1024.0), Dot,
+            summary.packetCount);
+        draw->AddText(CompactFont(), CompactFont()->FontSize, ImVec2(textX, position.y + 58.0F), Muted,
+            Ellipsize(CompactFont(), size, textWidth).c_str());
+        const char* badge = !summary.error.empty() ? "DAMAGED" : !summary.hasStartGame ? "NO WORLD DATA"
+            : partial ? "RECOVERABLE" : "COMPLETE";
+        const ImU32 badgeColor = summary.error.empty() && summary.hasStartGame && !partial ? Green : Amber;
+        draw->AddText(CompactFont(), CompactFont()->FontSize, ImVec2(textX, position.y + 82.0F), badgeColor, badge);
+        if (hovered) ImGui::SetTooltip("%s", Narrow(summary.path.filename().wstring()).c_str());
+
+        const bool playable = summary.hasStartGame && summary.error.empty();
+        ImGui::SetCursorScreenPos(ImVec2(textX, position.y + CardHeight + 2.0F));
+        ImGui::BeginDisabled(!playable || !theater.standalone);
+        if (LinkButton("##watch", "Watch")) watch = summary.path;
+        ImGui::EndDisabled();
+        ImGui::SameLine(0.0F, 18.0F);
+        if (LinkButton("##preview", "Preview")) open = summary.path;
+        ImGui::SameLine(0.0F, 18.0F);
+        // A file the recorder is still writing cannot be renamed or deleted.
+        ImGui::BeginDisabled(partial && recording);
+        if (LinkButton("##rename", "Rename")) {
+            theater.dialog = Theater::Dialog::Rename;
+            theater.dialogKey = key;
+            theater.renameError.clear();
+            theater.renameBuffer.fill('\0');
+            if (!HasDefaultName(summary.path)) {
+                const auto current = Narrow(summary.path.stem().wstring());
+                std::copy_n(current.begin(), std::min(current.size(), theater.renameBuffer.size() - 1), theater.renameBuffer.begin());
+            }
+        }
+        ImGui::SameLine(0.0F, 18.0F);
+        if (LinkButton("##delete", "Delete")) {
+            theater.dialog = Theater::Dialog::Delete;
+            theater.dialogKey = key;
+        }
+        ImGui::EndDisabled();
+        ImGui::SetCursorScreenPos(position);
+        ImGui::Dummy(ImVec2(cardWidth, CardHeight + ActionHeight));
+        ImGui::EndGroup();
+        if (clicked) {
+            if (playable && theater.standalone) watch = summary.path;
+            else open = summary.path;
+        }
+        ImGui::PopID();
+        column = (column + 1) % columns;
+        if (column == 0) ImGui::Dummy(ImVec2(0.0F, Gap - ImGui::GetStyle().ItemSpacing.y));
+    }
+    ImGui::EndChild();
+    if (DrawReplayDialogs()) {
+        EnterTheater();
+        theater.phase = TheaterPhase::Library;
+        return;
+    }
+    if (watch) WatchReplay(*watch);
+    else if (open) OpenReplay(*open);
+}
+
+void SeekTo(double micros) {
+    const double duration = theater.timeline ? static_cast<double>(theater.timeline->durationMicros) : 0.0;
+    const double start = theater.timeline ? std::min(static_cast<double>(theater.timeline->clipStartMicros), duration) : 0.0;
+    theater.playheadMicros = std::clamp(micros, start, duration);
+}
+
+void DrawTheaterViewer(float deltaSeconds) {
+    if (theater.phase == TheaterPhase::ViewerLoading) {
+        // Draw one spinner frame first, then load on the next one.
+        if (theater.phaseSeconds > 0.0F) {
+            theater.timeline = Replay::BuildTimeline(Replay::Read(theater.openPath));
+            theater.drawPath = Replay::DecimatePath(*theater.timeline, 4000);
+            theater.playing = !theater.timeline->samples.empty();
+            theater.playheadMicros = static_cast<double>(theater.timeline->clipStartMicros);
+            theater.phase = TheaterPhase::Viewer;
+        } else {
+            theater.phaseSeconds += std::max(deltaSeconds, 0.001F);
+            const ImVec2 origin = ImGui::GetCursorScreenPos();
+            const ImVec2 area = ImGui::GetContentRegionAvail();
+            const ImVec2 center(origin.x + area.x * 0.5F, origin.y + area.y * 0.45F);
+            ImGui::GetWindowDrawList()->AddCircle(center, 18.0F, Pink, 32, 3.0F);
+            DrawSnout(ImGui::GetWindowDrawList(), center, 0.6F);
+            return;
+        }
+    }
+    auto& timeline = *theater.timeline;
+    const double duration = static_cast<double>(timeline.durationMicros);
+    // A clip replays from its start; the session before it only rebuilds the world.
+    const double clipStart = std::min(static_cast<double>(timeline.clipStartMicros), duration);
+    const double clipLength = duration - clipStart;
+    if (theater.playing) {
+        theater.playheadMicros += static_cast<double>(deltaSeconds) * 1'000'000.0 * static_cast<double>(theater.speed);
+        if (theater.playheadMicros >= duration) {
+            theater.playheadMicros = duration;
+            theater.playing = false;
+        }
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_Space, false) && !timeline.samples.empty()) {
+        if (!theater.playing && theater.playheadMicros >= duration) theater.playheadMicros = clipStart;
+        theater.playing = !theater.playing;
+    }
+    const auto playhead = static_cast<std::uint64_t>(theater.playheadMicros);
+
+    if (LinkButton("##back", "< Replays")) {
+        theater.phase = TheaterPhase::Library;
+        return;
+    }
+    PageHeader(FormatStarted(timeline.startedUnixMillis).c_str(),
+        Narrow(theater.openPath.filename().wstring()).c_str());
+    ImGui::Dummy(ImVec2(0.0F, 4.0F));
+    if (!timeline.error.empty()) {
+        ImGui::TextColored(ToVec4(Amber), "Part of this replay is damaged: %s", timeline.error.c_str());
+    }
+    if (timeline.samples.empty()) {
+        ImGui::TextColored(ToVec4(Secondary), "This replay has no recorded movement.");
+        CaptionText(Muted, "Camera samples are recorded while you are in a world.");
+        return;
+    }
+
+    constexpr float SidePanel = 170.0F;
+    constexpr float TransportHeight = 74.0F;
+    const ImVec2 area = ImGui::GetContentRegionAvail();
+    const ImVec2 mapPosition = ImGui::GetCursorScreenPos();
+    const ImVec2 mapSize(std::max(120.0F, area.x - SidePanel - 12.0F), std::max(120.0F, area.y - TransportHeight));
+    ImGui::InvisibleButton("##map", mapSize);
+    auto* draw = ImGui::GetWindowDrawList();
+    const ImVec2 mapMax(mapPosition.x + mapSize.x, mapPosition.y + mapSize.y);
+    draw->AddRectFilled(mapPosition, mapMax, Rail, 8.0F);
+    draw->PushClipRect(mapPosition, mapMax, true);
+    const MapProjection project(mapPosition, mapSize, timeline.minX, timeline.maxX, timeline.minZ, timeline.maxZ, 24.0F);
+
+    // Block grid at a step that keeps lines roughly 40 px or more apart.
+    double step = 1.0;
+    while (step * project.scale < 40.0 && step < 1'000'000.0) step *= step < 10.0 ? 2.0 : 5.0;
+    const double gridStartX = std::floor((timeline.minX - project.offset.x / project.scale) / step) * step;
+    const double gridStartZ = std::floor((timeline.minZ - project.offset.y / project.scale) / step) * step;
+    for (double x = gridStartX; project(x, 0.0).x < mapMax.x; x += step) {
+        const float screenX = project(x, 0.0).x;
+        if (screenX >= mapPosition.x) draw->AddLine(ImVec2(screenX, mapPosition.y), ImVec2(screenX, mapMax.y), WithAlpha(Stroke, 0.45F));
+    }
+    for (double z = gridStartZ; project(0.0, z).y < mapMax.y; z += step) {
+        const float screenY = project(0.0, z).y;
+        if (screenY >= mapPosition.y) draw->AddLine(ImVec2(mapPosition.x, screenY), ImVec2(mapMax.x, screenY), WithAlpha(Stroke, 0.45F));
+    }
+
+    // Whole path dimmed, travelled part bright. Segments never join across
+    // a dimension change.
+    const auto drawSegments = [&](std::uint64_t until, ImU32 color, float thickness) {
+        std::vector<ImVec2> run;
+        std::optional<int> runDimension;
+        const auto flush = [&] {
+            if (run.size() >= 2) draw->AddPolyline(run.data(), static_cast<int>(run.size()), color, ImDrawFlags_None, thickness);
+            run.clear();
+        };
+        const auto stride = std::max<std::size_t>(1, timeline.samples.size() / 4000);
+        for (std::size_t index = 0; index < timeline.samples.size(); index += stride) {
+            const auto& sample = timeline.samples[index];
+            if (sample.t > until) break;
+            if (!run.empty() && sample.dimension != runDimension) flush();
+            runDimension = sample.dimension;
+            run.push_back(project(sample.x, sample.z));
+        }
+        if (const auto now = Replay::SampleAt(timeline, until); now && now->dimension == runDimension) {
+            run.push_back(project(now->x, now->z));
+        }
+        flush();
+    };
+    drawSegments(timeline.samples.back().t, WithAlpha(Muted, 0.35F), 2.0F);
+    drawSegments(playhead, Pink, 2.6F);
+    const auto& first = timeline.samples.front();
+    draw->AddCircleFilled(project(first.x, first.z), 4.5F, Green);
+    for (const auto& mark : timeline.marks) {
+        if (!mark.label.starts_with("mark")) continue;
+        const auto at = Replay::SampleAt(timeline, mark.t);
+        if (!at) continue;
+        const ImVec2 pin = project(at->x, at->z);
+        draw->AddTriangleFilled(ImVec2(pin.x - 5.0F, pin.y - 12.0F), ImVec2(pin.x + 5.0F, pin.y - 12.0F), pin, Amber);
+        draw->AddCircleFilled(ImVec2(pin.x, pin.y - 13.0F), 5.0F, Amber);
+    }
+    const auto current = Replay::SampleAt(timeline, playhead);
+    if (current) {
+        const ImVec2 player = project(current->x, current->z);
+        draw->AddCircleFilled(player, 9.0F, WithAlpha(Pink, 0.25F));
+        if (current->yaw) {
+            // Bedrock yaw: 0 faces +Z (south, down on the map), 90 faces -X.
+            const float radians = *current->yaw * 3.14159265F / 180.0F;
+            const ImVec2 forward(-std::sin(radians), std::cos(radians));
+            const ImVec2 side(-forward.y, forward.x);
+            draw->AddTriangleFilled(ImVec2(player.x + forward.x * 11.0F, player.y + forward.y * 11.0F),
+                ImVec2(player.x - forward.x * 6.0F + side.x * 7.0F, player.y - forward.y * 6.0F + side.y * 7.0F),
+                ImVec2(player.x - forward.x * 6.0F - side.x * 7.0F, player.y - forward.y * 6.0F - side.y * 7.0F), Pink);
+        } else {
+            draw->AddCircleFilled(player, 6.0F, Pink);
+        }
+    }
+    draw->AddText(CompactFont(), CompactFont()->FontSize, ImVec2(mapPosition.x + 10.0F, mapPosition.y + 8.0F), Muted,
+        std::format("N ^   grid {} blocks", static_cast<long long>(step)).c_str());
+    draw->PopClipRect();
+
+    // Readout beside the map.
+    ImGui::SameLine(0.0F, 12.0F);
+    ImGui::BeginGroup();
+    const auto readout = [](const char* label, const std::string& value) {
+        CaptionText(Muted, label);
+        ImGui::TextUnformatted(value.c_str());
+        ImGui::Dummy(ImVec2(0.0F, 2.0F));
+    };
+    readout("TIME", FormatDuration(static_cast<std::uint64_t>(theater.playheadMicros - clipStart)) + " / "
+        + FormatDuration(static_cast<std::uint64_t>(clipLength)));
+    if (current) {
+        readout("POSITION", std::format("{:.1f}  {:.1f}  {:.1f}", current->x, current->y, current->z));
+        readout("FACING", current->yaw ? std::format("yaw {:.0f}  pitch {:.0f}", *current->yaw, current->pitch.value_or(0.0F))
+            : std::string("not recorded"));
+        readout("DIMENSION", DimensionName(current->dimension));
+    }
+    const auto highlights = std::ranges::count_if(timeline.marks,
+        [](const Replay::TimelineMark& mark) { return mark.label.starts_with("mark"); });
+    readout("HIGHLIGHTS", std::to_string(highlights));
+    std::string firstIds;
+    for (const auto id : timeline.firstPacketIds) firstIds += (firstIds.empty() ? "" : " ") + std::to_string(id);
+    readout("WORLD DATA", timeline.packetCount == 0 ? std::string("none captured")
+        : std::format("{} packets{}", timeline.packetCount, timeline.hasStartGame ? "" : ", no StartGame"));
+    if (!firstIds.empty()) {
+        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + 166.0F);
+        ImGui::PushFont(CompactFont());
+        ImGui::PushStyleColor(ImGuiCol_Text, ToVec4(Muted));
+        ImGui::TextWrapped("first ids %s", firstIds.c_str());
+        ImGui::PopStyleColor();
+        ImGui::PopFont();
+        ImGui::PopTextWrapPos();
+    }
+    CaptionText(Muted, "Space plays / pauses.");
+    CaptionText(Muted, "Path preview. In-world playback is next.");
+    ImGui::EndGroup();
+
+    // Transport: jump between highlights, play, speed, and the scrubber.
+    ImGui::Dummy(ImVec2(0.0F, 4.0F));
+    const auto jump = [&](bool forward) {
+        std::optional<std::uint64_t> target;
+        for (const auto& mark : timeline.marks) {
+            if (!mark.label.starts_with("mark")) continue;
+            if (forward && mark.t > playhead + 1000) { target = mark.t; break; }
+            if (!forward && mark.t + 1000 < playhead) target = mark.t;
+        }
+        if (target) SeekTo(static_cast<double>(*target));
+        else SeekTo(forward ? duration : clipStart);
+    };
+    if (ImGui::Button("|<", ImVec2(36.0F, 28.0F))) jump(false);
+    ImGui::SameLine();
+    const bool atEnd = theater.playheadMicros >= duration;
+    if (PrimaryButton(theater.playing ? "Pause" : atEnd ? "Replay" : "Play", ImVec2(76.0F, 28.0F))) {
+        if (atEnd) theater.playheadMicros = clipStart;
+        theater.playing = !theater.playing || atEnd;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button(">|", ImVec2(36.0F, 28.0F))) jump(true);
+    constexpr std::array<float, 4> Speeds{0.5F, 1.0F, 2.0F, 4.0F};
+    for (const float option : Speeds) {
+        ImGui::SameLine();
+        const bool selected = theater.speed == option;
+        if (selected) ImGui::PushStyleColor(ImGuiCol_Button, ToVec4(PinkDeep));
+        if (ImGui::Button(std::format("{}x##speed", option).c_str(), ImVec2(42.0F, 28.0F))) theater.speed = option;
+        if (selected) ImGui::PopStyleColor();
+    }
+
+    const ImVec2 trackPosition = ImGui::GetCursorScreenPos();
+    const float trackWidth = ImGui::GetContentRegionAvail().x;
+    ImGui::InvisibleButton("##scrubber", ImVec2(trackWidth, 22.0F));
+    if (ImGui::IsItemActive() && trackWidth > 0.0F) {
+        const float fraction = std::clamp((ImGui::GetIO().MousePos.x - trackPosition.x) / trackWidth, 0.0F, 1.0F);
+        SeekTo(clipStart + static_cast<double>(fraction) * clipLength);
+    }
+    const float trackY = trackPosition.y + 11.0F;
+    const float fraction = clipLength > 0.0 ? static_cast<float>((theater.playheadMicros - clipStart) / clipLength) : 0.0F;
+    draw->AddRectFilled(ImVec2(trackPosition.x, trackY - 2.5F), ImVec2(trackPosition.x + trackWidth, trackY + 2.5F), Stroke, 2.5F);
+    draw->AddRectFilled(ImVec2(trackPosition.x, trackY - 2.5F),
+        ImVec2(trackPosition.x + trackWidth * fraction, trackY + 2.5F), Pink, 2.5F);
+    for (const auto& mark : timeline.marks) {
+        if (!mark.label.starts_with("mark") || clipLength <= 0.0 || static_cast<double>(mark.t) < clipStart) continue;
+        const float x = trackPosition.x + trackWidth * static_cast<float>((static_cast<double>(mark.t) - clipStart) / clipLength);
+        draw->AddRectFilled(ImVec2(x - 1.5F, trackY - 8.0F), ImVec2(x + 1.5F, trackY + 8.0F), Amber, 1.0F);
+    }
+    draw->AddCircleFilled(ImVec2(trackPosition.x + trackWidth * fraction, trackY),
+        ImGui::IsItemHovered() || ImGui::IsItemActive() ? 8.0F : 6.5F, Text);
+}
+
+void DrawReplaysPage(ModuleManager& modules, const FrameInfo& frame, bool standalone) {
+    // Re-entering the page (or reopening the menu) skipped at least one frame.
+    if (theater.lastFrame == 0 || frame.frameIndex != theater.lastFrame + 1 || theater.standalone != standalone) {
+        theater.standalone = standalone;
+        theater.closeRequested = false;
+        EnterTheater();
+    }
+    theater.lastFrame = frame.frameIndex;
+    switch (theater.phase) {
+    case TheaterPhase::Intro: DrawTheaterIntro(frame.deltaSeconds); break;
+    case TheaterPhase::Library: DrawTheaterLibrary(modules, frame.presentedAt); break;
+    case TheaterPhase::ViewerLoading:
+    case TheaterPhase::Viewer: DrawTheaterViewer(frame.deltaSeconds); break;
+    }
+}
+
+// Esc inside the viewer returns to the library instead of leaving the page.
+bool TheaterConsumesEscape() {
+    if (!theater.standalone) return false;
+    if (theater.dialog != Theater::Dialog::None) {
+        theater.dialog = Theater::Dialog::None;
+        return true;
+    }
+    if (theater.phase != TheaterPhase::Viewer && theater.phase != TheaterPhase::ViewerLoading) return false;
+    theater.phase = TheaterPhase::Library;
+    theater.playing = false;
+    return true;
+}
+
+std::filesystem::path ProfileDirectory() {
+    wchar_t localAppData[32768]{};
+    const auto length = GetEnvironmentVariableW(L"LOCALAPPDATA", localAppData,
+        static_cast<DWORD>(std::size(localAppData)));
+    if (length > 0 && length < std::size(localAppData)) {
+        return std::filesystem::path(localAppData) / L"Oinkster" / L"Client" / L"profiles";
+    }
+    return std::filesystem::temp_directory_path() / L"Oinkster" / L"profiles";
+}
+
+void RefreshProfiles() {
+    const SettingsProfileStore store(ProfileDirectory());
+    profileNames = store.List();
+    activeProfile = store.Active();
+    if (!activeProfile.empty()
+        && std::ranges::find(profileNames, activeProfile) == profileNames.end()) activeProfile.clear();
+    profilesLoaded = true;
+}
+
+ClientSettings CaptureCurrentProfile(const ModuleManager& modules) {
+    return CaptureSettings(modules, Dx12Overlay::MenuKey(), Dx12Overlay::UnloadKey(), 0);
+}
+
+void DrawProfilesPage(ModuleManager& modules, bool& dirty) {
+    if (!profilesLoaded) RefreshProfiles();
+    PageHeader("Profiles", "Save and switch complete module, keybind, and HUD setups.");
+    ImGui::Dummy(ImVec2(0.0F, 10.0F));
+
+    CaptionText(Muted, activeProfile.empty() ? "No active profile" : ("Active: " + activeProfile).c_str());
+    if (!activeProfile.empty()) {
+        ImGui::SameLine();
+        if (ImGui::Button("Save current")) {
+            try {
+                SettingsProfileStore(ProfileDirectory()).Save(activeProfile, CaptureCurrentProfile(modules));
+                profileMessage = "Profile updated.";
+                profileMessageIsError = false;
+            } catch (const std::exception& error) {
+                profileMessage = error.what();
+                profileMessageIsError = true;
+            }
+        }
+    }
+
+    GroupLabel("New profile");
+    ImGui::SetNextItemWidth(std::min(280.0F, ImGui::GetContentRegionAvail().x - 110.0F));
+    const bool submitted = ImGui::InputTextWithHint("##new-profile", "Profile name", newProfileName.data(), newProfileName.size(),
+        ImGuiInputTextFlags_EnterReturnsTrue);
+    ImGui::SameLine();
+    if (submitted || ImGui::Button("Create", ImVec2(92.0F, 0.0F))) {
+        const std::string name(newProfileName.data());
+        if (!SettingsProfileStore::IsValidName(name)) {
+            profileMessage = "Use 1-32 letters, numbers, spaces, dashes, or underscores.";
+            profileMessageIsError = true;
+        } else if (std::ranges::find(profileNames, name) != profileNames.end()) {
+            profileMessage = "A profile with that name already exists.";
+            profileMessageIsError = true;
+        } else {
+            try {
+                const SettingsProfileStore store(ProfileDirectory());
+                store.Save(name, CaptureCurrentProfile(modules));
+                store.SetActive(name);
+                newProfileName.fill('\0');
+                profileMessage = "Profile created.";
+                profileMessageIsError = false;
+                RefreshProfiles();
+            } catch (const std::exception& error) {
+                profileMessage = error.what();
+                profileMessageIsError = true;
+            }
+        }
+    }
+    if (!profileMessage.empty()) CaptionText(profileMessageIsError ? Amber : Green, profileMessage.c_str());
+
+    GroupLabel("Saved profiles");
+    if (profileNames.empty()) {
+        CaptionText(Muted, "Create a profile to save your current setup.");
+        return;
+    }
+
+    for (const auto& name : profileNames) {
+        ImGui::PushID(name.c_str());
+        const bool active = name == activeProfile;
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextColored(ToVec4(active ? Pink : Text), "%s", name.c_str());
+        const float actionsWidth = pendingDeleteProfile == name ? 184.0F : 132.0F;
+        ImGui::SameLine(std::max(ImGui::GetCursorPosX() + 12.0F, ImGui::GetWindowContentRegionMax().x - actionsWidth));
+        if (!active) {
+            if (ImGui::Button("Load", ImVec2(60.0F, 0.0F))) {
+                try {
+                    const SettingsProfileStore store(ProfileDirectory());
+                    if (!activeProfile.empty()) store.Save(activeProfile, CaptureCurrentProfile(modules));
+                    const auto settings = store.Load(name);
+                    if (!settings) throw std::runtime_error("Profile could not be loaded");
+                    ApplySettings(modules, *settings);
+                    Dx12Overlay::ConfigureControlKeys(settings->clickGuiKey, settings->unloadKey);
+                    store.SetActive(name);
+                    activeProfile = name;
+                    pendingDeleteProfile.clear();
+                    profileMessage = "Loaded " + name + ".";
+                    profileMessageIsError = false;
+                    dirty = true;
+                } catch (const std::exception& error) {
+                    profileMessage = error.what();
+                    profileMessageIsError = true;
+                }
+            }
+        } else {
+            ImGui::BeginDisabled();
+            ImGui::Button("Active", ImVec2(60.0F, 0.0F));
+            ImGui::EndDisabled();
+        }
+        ImGui::SameLine();
+        if (pendingDeleteProfile == name) {
+            if (ImGui::Button("Delete", ImVec2(60.0F, 0.0F))) {
+                const SettingsProfileStore store(ProfileDirectory());
+                if (store.Remove(name)) {
+                    if (active) store.SetActive({});
+                    profileMessage = "Profile deleted.";
+                    profileMessageIsError = false;
+                } else {
+                    profileMessage = "Profile could not be deleted.";
+                    profileMessageIsError = true;
+                }
+                pendingDeleteProfile.clear();
+                RefreshProfiles();
+                ImGui::PopID();
+                break;
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel", ImVec2(60.0F, 0.0F))) pendingDeleteProfile.clear();
+        } else if (ImGui::Button("Remove", ImVec2(64.0F, 0.0F))) {
+            pendingDeleteProfile = name;
+        }
+        ImGui::PopID();
+    }
+}
+
 bool NavItem(const char* id, const char* label, std::optional<std::size_t> count, bool active) {
     const ImVec2 position = ImGui::GetCursorScreenPos();
     const ImVec2 size(ImGui::GetContentRegionAvail().x, 32.0F);
@@ -1217,6 +4291,7 @@ void DrawSidebar(ModuleManager& modules, ClickGui& browser, float deltaSeconds) 
     draw->AddText(CompactFont(), CompactFont()->FontSize, ImVec2(origin.x + 46.0F, origin.y + 21.0F), Muted, "Esc to go back");
     ImGui::Dummy(ImVec2(0.0F, 46.0F));
     if (NavItem("##nav-home", "Home", std::nullopt, false)) section = Section::Home;
+    if (NavItem("##nav-profiles", "Profiles", std::nullopt, section == Section::Profiles)) section = Section::Profiles;
     ImGui::Dummy(ImVec2(0.0F, 6.0F));
 
     const auto catalog = modules.Catalog();
@@ -1305,6 +4380,149 @@ void DrawHudPage(ModuleManager& modules, bool& editMode, bool& dirty) {
     if (!any) CaptionText(Muted, "No HUD widgets are installed.");
 }
 
+void LoadPackEditor() {
+    auto snapshot = UserResourcePacks::LoadSnapshot();
+    stagedPackUuids.clear();
+    for (const auto& entry : snapshot.active) stagedPackUuids.push_back(entry.uuid);
+    packSnapshot = std::move(snapshot);
+    packEditsDirty = false;
+    packFileConflict = false;
+    packFileCheckedAt = Clock::now();
+}
+
+bool PackFileChanged() {
+    if (!packSnapshot || packSnapshot->path.empty()) return false;
+    std::error_code error;
+    if (!std::filesystem::exists(packSnapshot->path, error)) return packSnapshot->size != 0;
+    const auto written = std::filesystem::last_write_time(packSnapshot->path, error);
+    if (error || written != packSnapshot->written) return true;
+    const auto size = std::filesystem::file_size(packSnapshot->path, error);
+    return error || size != packSnapshot->size;
+}
+
+void DrawPackIcon(const UserResourcePacks::Pack& pack, const ImVec2 origin, const float edge) {
+    auto* draw = ImGui::GetWindowDrawList();
+    draw->AddRectFilled(origin, ImVec2(origin.x + edge, origin.y + edge), SurfaceRaised, 5.0F);
+    if (!pack.icon || pack.icon->pixels.empty() || pack.icon->width == 0 || pack.icon->height == 0) {
+        const std::string initial = Narrow(pack.name).substr(0, 1);
+        const ImVec2 size = BodyFont()->CalcTextSizeA(BodyFont()->FontSize, FLT_MAX, 0.0F, initial.c_str());
+        draw->AddText(BodyFont(), BodyFont()->FontSize,
+            ImVec2(origin.x + (edge - size.x) * 0.5F, origin.y + (edge - size.y) * 0.5F), Pink, initial.c_str());
+        return;
+    }
+    constexpr std::uint32_t Cells = 8;
+    const float cell = edge / static_cast<float>(Cells);
+    for (std::uint32_t y = 0; y < Cells; ++y) {
+        for (std::uint32_t x = 0; x < Cells; ++x) {
+            const auto sourceX = std::min(pack.icon->width - 1, x * pack.icon->width / Cells);
+            const auto sourceY = std::min(pack.icon->height - 1, y * pack.icon->height / Cells);
+            const ImU32 color = FromArgb(pack.icon->pixels[static_cast<std::size_t>(sourceY) * pack.icon->width + sourceX]);
+            draw->AddRectFilled(ImVec2(origin.x + x * cell, origin.y + y * cell),
+                ImVec2(origin.x + (x + 1) * cell + 0.5F, origin.y + (y + 1) * cell + 0.5F), color);
+        }
+    }
+}
+
+void DrawTexturePackSettings(ModuleManager& modules) {
+    if (!packSnapshot) LoadPackEditor();
+    const auto now = Clock::now();
+    if (now - packFileCheckedAt >= std::chrono::seconds(2)) {
+        packFileCheckedAt = now;
+        if (PackFileChanged()) {
+            if (packEditsDirty) packFileConflict = true;
+            else LoadPackEditor();
+        }
+    }
+
+    GroupLabel("Texture packs");
+    CaptionText(Muted, "Global Resources only. The top enabled pack has highest priority.");
+    ImGui::SetNextItemWidth(std::min(ImGui::GetContentRegionAvail().x, 420.0F));
+    ImGui::InputTextWithHint("##pack-search", "Search installed packs", packSearch.data(), packSearch.size());
+    if (!packSnapshot || !packSnapshot->Ready()) {
+        CaptionText(Amber, packSnapshot ? Narrow(packSnapshot->error).c_str() : "Loading texture packs...");
+        return;
+    }
+    if (packFileConflict) CaptionText(Amber, "Global Resources changed outside Oinkster. Revert before applying.");
+
+    std::string query(packSearch.data());
+    std::ranges::transform(query, query.begin(), [](const char value) {
+        return static_cast<char>(std::tolower(static_cast<unsigned char>(value)));
+    });
+    std::vector<const UserResourcePacks::Pack*> rows;
+    rows.reserve(packSnapshot->packs.size());
+    const auto appendMatching = [&](const std::string& uuid) {
+        const auto found = std::ranges::find_if(packSnapshot->packs, [&](const auto& pack) { return pack.uuid == uuid; });
+        if (found == packSnapshot->packs.end()) return;
+        std::string searchable = Narrow(found->name) + " " + Narrow(found->author) + " " + found->uuid;
+        std::ranges::transform(searchable, searchable.begin(), [](const char value) {
+            return static_cast<char>(std::tolower(static_cast<unsigned char>(value)));
+        });
+        if (query.empty() || searchable.find(query) != std::string::npos) rows.push_back(&*found);
+    };
+    for (const auto& uuid : stagedPackUuids) appendMatching(uuid);
+    for (const auto& pack : packSnapshot->packs) {
+        if (std::ranges::find(stagedPackUuids, pack.uuid) == stagedPackUuids.end()) appendMatching(pack.uuid);
+    }
+
+    ImGui::BeginChild("##texture-pack-list", ImVec2(std::min(ImGui::GetContentRegionAvail().x, 620.0F), 270.0F), true);
+    if (rows.empty()) CaptionText(Muted, query.empty() ? "No installed texture packs were found." : "No texture packs match your search.");
+    for (const auto* pack : rows) {
+        ImGui::PushID(pack->uuid.c_str());
+        constexpr float RowHeight = 56.0F;
+        const ImVec2 origin = ImGui::GetCursorScreenPos();
+        const float width = ImGui::GetContentRegionAvail().x;
+        const auto position = std::ranges::find(stagedPackUuids, pack->uuid);
+        const bool enabled = position != stagedPackUuids.end();
+        DrawPackIcon(*pack, ImVec2(origin.x + 8.0F, origin.y + 8.0F), 40.0F);
+        ImGui::GetWindowDrawList()->AddText(BodyFont(), BodyFont()->FontSize, ImVec2(origin.x + 58.0F, origin.y + 9.0F), Text,
+            Ellipsize(BodyFont(), Narrow(pack->name), std::max(40.0F, width - 210.0F)).c_str());
+        std::string metadata = pack->author.empty() ? Narrow(pack->version)
+            : "by " + Narrow(pack->author) + (pack->version.empty() ? "" : Dot + Narrow(pack->version));
+        ImGui::GetWindowDrawList()->AddText(CompactFont(), CompactFont()->FontSize, ImVec2(origin.x + 58.0F, origin.y + 31.0F), Muted,
+            Ellipsize(CompactFont(), metadata, std::max(40.0F, width - 210.0F)).c_str());
+        if (enabled) {
+            const auto index = static_cast<std::size_t>(std::distance(stagedPackUuids.begin(), position));
+            ImGui::SetCursorScreenPos(ImVec2(origin.x + width - 132.0F, origin.y + 14.0F));
+            ImGui::BeginDisabled(index == 0);
+            if (ImGui::SmallButton("^") && index > 0) { std::swap(stagedPackUuids[index], stagedPackUuids[index - 1]); packEditsDirty = true; }
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            ImGui::BeginDisabled(index + 1 >= stagedPackUuids.size());
+            if (ImGui::SmallButton("v") && index + 1 < stagedPackUuids.size()) { std::swap(stagedPackUuids[index], stagedPackUuids[index + 1]); packEditsDirty = true; }
+            ImGui::EndDisabled();
+        }
+        ImGui::SetCursorScreenPos(ImVec2(origin.x + width - 44.0F, origin.y + 18.0F));
+        if (Switch("##pack-enabled", enabled)) {
+            if (enabled) stagedPackUuids.erase(std::ranges::find(stagedPackUuids, pack->uuid));
+            else stagedPackUuids.push_back(pack->uuid);
+            packEditsDirty = true;
+            packMessage.clear();
+        }
+        ImGui::SetCursorScreenPos(ImVec2(origin.x, origin.y + RowHeight));
+        ImGui::Separator();
+        ImGui::PopID();
+    }
+    ImGui::EndChild();
+
+    const auto capability = modules.CapabilityStatusOf(Capability::ResourcePackReload);
+    const bool canApply = packEditsDirty && !packFileConflict && capability.IsAvailable()
+        && ResourcePackReloadAdapter::Available();
+    ImGui::BeginDisabled(!canApply);
+    if (PrimaryButton("Apply changes", ImVec2(126.0F, 0.0F))) {
+        const auto result = UserResourcePacks::ApplyStack(*packSnapshot, stagedPackUuids, ResourcePackReloadAdapter::Reload);
+        packMessage = Narrow(result.message);
+        packMessageIsError = !result.Succeeded();
+        if (result.Succeeded()) LoadPackEditor();
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!packEditsDirty && !packFileConflict);
+    if (ImGui::Button("Revert")) { LoadPackEditor(); packMessage = "Changes reverted."; packMessageIsError = false; }
+    ImGui::EndDisabled();
+    if (!capability.IsAvailable()) CaptionText(Amber, Narrow(capability.reason).c_str());
+    if (!packMessage.empty()) CaptionText(packMessageIsError ? Amber : Green, packMessage.c_str());
+}
+
 void DrawSettingsPage(ModuleManager& modules, bool& dirty) {
     PageHeader("Settings", nullptr);
     const Form form = MakeForm(std::min(ImGui::GetContentRegionAvail().x, 600.0F));
@@ -1359,60 +4577,36 @@ void DrawSettingsPage(ModuleManager& modules, bool& dirty) {
         CaptionText(Amber, controlMessage.c_str());
     }
 
-    // Live state rather than hardcoded labels, so problems are visible
-    // in-game instead of only in oinkster-native.log.
-    GroupLabel("Status");
-    const auto statusRow = [&](const char* label, bool ok, const char* detail, const char* tooltip = nullptr) {
-        const ImVec2 start = ImGui::GetCursorScreenPos();
-        const float lineHeight = ImGui::GetTextLineHeight();
-        ImGui::GetWindowDrawList()->AddCircleFilled(ImVec2(start.x + 4.0F, start.y + lineHeight * 0.5F), 3.5F, ok ? Green : Muted);
-        ImGui::SetCursorScreenPos(ImVec2(start.x + 16.0F, start.y));
-        ImGui::TextColored(ToVec4(Secondary), "%s", label);
-        if (tooltip && *tooltip && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tooltip);
-        ImGui::SameLine(0.0F, 0.0F);
-        ImGui::SetCursorScreenPos(ImVec2(start.x + form.labelWidth, start.y + 2.0F));
-        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + form.controlWidth);
-        CaptionText(Muted, detail);
-        ImGui::PopTextWrapPos();
-        ImGui::SetCursorScreenPos(ImVec2(start.x, ImGui::GetCursorScreenPos().y + 2.0F));
-    };
+    GroupLabel("Rendering");
+    const float renderRowX = ImGui::GetCursorScreenPos().x;
+    const bool vsyncOff = modules.ModuleSetting("click-gui.disable-vsync", "0") == "1";
+    if (FormSwitch(form, "Disable VSync", "##disable-vsync", vsyncOff,
+            "Presents frames without waiting for the display refresh.")) {
+        Dx12Overlay::SetVsyncDisabled(!vsyncOff);
+        dirty = true;
+    }
+    FormIndent(form, renderRowX);
+    const auto vsyncState = Dx12Overlay::CurrentVsyncState();
+    const char* vsyncStatus = "Normal Bedrock presentation";
+    ImU32 vsyncStatusColor = Muted;
+    if (vsyncState == VsyncState::Disabled) vsyncStatus = "Uncapped frame rate; may show screen tearing";
+    else if (vsyncState == VsyncState::RestartRequired) { vsyncStatus = "Restart Minecraft to apply"; vsyncStatusColor = Amber; }
+    else if (vsyncState == VsyncState::Unsupported) { vsyncStatus = "Tearing is not supported on this system"; vsyncStatusColor = Amber; }
+    CaptionText(vsyncStatusColor, vsyncStatus);
+    const bool latencySupported = Dx12Overlay::LowLatencySupported();
+    const bool lowLatency = latencySupported && modules.ModuleSetting("click-gui.low-latency", "0") == "1";
+    FormLabel(form, "Low latency mode", "Queues at most one frame ahead, cutting input lag.");
+    const ImVec2 latencyCursor = ImGui::GetCursorScreenPos();
+    ImGui::SetCursorScreenPos(ImVec2(latencyCursor.x, latencyCursor.y + (ImGui::GetFrameHeight() - 20.0F) * 0.5F));
+    if (Switch("##low-latency", lowLatency, latencySupported)) {
+        modules.SetModuleSetting("click-gui.low-latency", lowLatency ? "0" : "1");
+        dirty = true;
+    }
+    FormIndent(form, renderRowX);
+    CaptionText(Muted, latencySupported ? "One queued frame; can lower FPS slightly"
+                                        : "Not supported by this swapchain");
 
-    statusRow("Overlay", true, "Direct3D 12 present hook attached");
-    switch (MouseInputBlocker::State()) {
-    case MouseInputBlocker::InstallState::Ready:
-        statusRow("Input routing", true, "Window scoping and GameInput mouse guard");
-        break;
-    case MouseInputBlocker::InstallState::Initializing:
-        statusRow("Input routing", false, "Window scoping only - discovering GameInput");
-        break;
-    default:
-        statusRow("Input routing", false, "Window scoping only - GameInput guard unavailable");
-        break;
-    }
-    const auto telemetry = modules.CapabilityStatusOf(Capability::LocalPlayerPosition);
-    statusRow("World telemetry", telemetry.IsAvailable(), telemetry.IsAvailable()
-        ? "Camera position signature matched"
-        : telemetry.state == CapabilityState::Pending ? "Validating signature" : "Unavailable for this build");
-    statusRow("Player skin", SkinReady(), SkinReady()
-        ? "Equipped skin loaded from the game"
-        : "Not loaded yet - showing a placeholder head");
-
-    ImGui::Dummy(ImVec2(0.0F, 4.0F));
-    if (LinkButton("##toggle-capabilities", showCapabilities ? "Hide capabilities" : "Show all capabilities")) {
-        showCapabilities = !showCapabilities;
-    }
-    if (showCapabilities) {
-        ImGui::Dummy(ImVec2(0.0F, 2.0F));
-        const auto capabilities = modules.Capabilities();
-        for (std::size_t index = 0; index < capabilities.size(); ++index) {
-            const auto& status = capabilities[index];
-            const std::string name = Narrow(CapabilityName(static_cast<Capability>(index)));
-            const char* state = status.IsAvailable() ? "Available"
-                : status.state == CapabilityState::Pending ? "Checking" : "Unavailable";
-            const std::string reason = Narrow(status.reason);
-            statusRow(name.c_str(), status.IsAvailable(), state, reason.c_str());
-        }
-    }
+    DrawTexturePackSettings(modules);
 }
 
 void DrawEditOverlay(ModuleManager& modules, bool& editMode, bool& dirty) {
@@ -1455,6 +4649,12 @@ void BeginSession() noexcept {
     sessionStarted = Clock::now();
     sessionActive.store(true);
     search[0] = '\0';
+    packSearch[0] = '\0';
+    packSnapshot.reset();
+    stagedPackUuids.clear();
+    packEditsDirty = false;
+    packFileConflict = false;
+    packMessage.clear();
     expandedModule.clear();
     hudWindowStability.clear();
     if (moduleBrowser) {
@@ -1463,7 +4663,7 @@ void BeginSession() noexcept {
     }
 }
 
-bool HasTransientUi() noexcept { return sessionActive.load(); }
+bool HasTransientUi() noexcept { return sessionActive.load() || ReplayInjector::Running(); }
 
 bool UpdatePlayerSkin(std::uint32_t width, std::uint32_t height,
     std::span<const std::uint8_t> rgbaPixels, std::uint64_t revision) noexcept {
@@ -1482,21 +4682,135 @@ bool UpdatePlayerSkin(std::uint32_t width, std::uint32_t height,
     return true;
 }
 
-DrawResult Draw(ModuleManager& modules, bool menuVisible, bool gameplayHudVisible, bool& hudEditMode, const FrameInfo& frame) {
+// A Bedrock-style menu button (black outline, light face, dark lip that the
+// face sinks into while pressed) in the main menu's top-left corner.
+bool DrawReplaysMenuButton() {
+    const auto display = ImGui::GetIO().DisplaySize;
+    const float scale = std::clamp(std::min(display.x / 1280.0F, display.y / 720.0F), 0.8F, 1.6F);
+    const ImVec2 size(std::round(150.0F * scale), std::round(40.0F * scale));
+    const ImVec2 position(std::round(16.0F * scale), std::round(16.0F * scale));
+    ImGui::SetNextWindowPos(position, ImGuiCond_Always);
+    ImGui::SetNextWindowSize(size, ImGuiCond_Always);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0F, 0.0F));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0F);
+    ImGui::Begin("##main-menu-replays", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+        ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoFocusOnAppearing |
+        ImGuiWindowFlags_NoNav);
+    const bool pressed = ImGui::InvisibleButton("##replays-button", size);
+    const bool hovered = ImGui::IsItemHovered();
+    const bool held = ImGui::IsItemActive();
+    auto* draw = ImGui::GetWindowDrawList();
+    const float border = std::max(2.0F, std::round(2.0F * scale));
+    const float fullLip = std::round(5.0F * scale);
+    const float lip = held ? std::round(2.0F * scale) : fullLip;
+    const ImVec2 maximum(position.x + size.x, position.y + size.y);
+    draw->AddRectFilled(position, maximum, IM_COL32(0, 0, 0, 255));
+    const ImVec2 innerMin(position.x + border, position.y + border + (fullLip - lip));
+    const ImVec2 innerMax(maximum.x - border, maximum.y - border);
+    draw->AddRectFilled(innerMin, innerMax, IM_COL32(88, 88, 90, 255));
+    const ImU32 face = held ? IM_COL32(176, 177, 180, 255)
+        : hovered ? IM_COL32(234, 235, 238, 255) : IM_COL32(208, 209, 212, 255);
+    const ImVec2 faceMax(innerMax.x, innerMax.y - lip);
+    draw->AddRectFilled(innerMin, faceMax, face);
+    // Light bevel along the top of the face, like the game's own buttons.
+    draw->AddRectFilled(innerMin, ImVec2(faceMax.x, innerMin.y + border),
+        IM_COL32(255, 255, 255, hovered ? 200 : 120));
+    if (hovered && !held) {
+        draw->AddRect(position, maximum, IM_COL32(255, 255, 255, 255), 0.0F, 0, border);
+    }
+    ImFont* font = TitleFont();
+    const char* label = "Replays";
+    const ImVec2 textSize = font->CalcTextSizeA(font->FontSize, FLT_MAX, 0.0F, label);
+    const ImVec2 text(std::round(innerMin.x + (faceMax.x - innerMin.x - textSize.x) * 0.5F),
+        std::round(innerMin.y + (faceMax.y - innerMin.y - textSize.y) * 0.5F));
+    draw->AddText(font, font->FontSize, ImVec2(text.x + 1.0F, text.y + 1.0F), IM_COL32(255, 255, 255, 110), label);
+    draw->AddText(font, font->FontSize, text, IM_COL32(49, 50, 51, 255), label);
+    if (hovered) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+    ImGui::End();
+    ImGui::PopStyleVar(2);
+    return pressed;
+}
+
+// The theater on its own, opened from the main-menu button.
+void DrawStandaloneTheater(ModuleManager& modules, const FrameInfo& frame, DrawResult& result) {
+    const auto display = ImGui::GetIO().DisplaySize;
+    if (ImGui::IsKeyPressed(ImGuiKey_Escape, false) && !TheaterConsumesEscape()) result.closeRequested = true;
+    ImGui::GetBackgroundDrawList()->AddRectFilled(ImVec2(0.0F, 0.0F), display, IM_COL32(0, 0, 0, 150));
+    const ImVec2 size(std::min(std::clamp(display.x * 0.62F, 760.0F, 1100.0F), std::max(320.0F, display.x - 24.0F)),
+        std::min(std::clamp(display.y * 0.76F, 520.0F, 800.0F), std::max(320.0F, display.y - 24.0F)));
+    ImGui::SetNextWindowPos(ImVec2(display.x * 0.5F, display.y * 0.5F), ImGuiCond_Always, ImVec2(0.5F, 0.5F));
+    ImGui::SetNextWindowSize(size, ImGuiCond_Always);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 10.0F);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.0F);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(24.0F, 20.0F));
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(10.0F, 6.0F));
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.0F);
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0F, 6.0F));
+    ImGui::PushStyleVar(ImGuiStyleVar_PopupRounding, 8.0F);
+    ImGui::PushStyleVar(ImGuiStyleVar_ScrollbarSize, 10.0F);
+    constexpr int StyleVars = 8;
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ToVec4(Canvas));
+    ImGui::PushStyleColor(ImGuiCol_Border, ToVec4(WithAlpha(Pink, 0.35F)));
+    ImGui::PushStyleColor(ImGuiCol_Text, ToVec4(Text));
+    constexpr int StyleColors = 3;
+    ImGui::Begin("##replay-theater", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+        ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoScrollbar |
+        ImGuiWindowFlags_NoScrollWithMouse);
+    DrawReplaysPage(modules, frame, true);
+    ImGui::End();
+    ImGui::PopStyleColor(StyleColors);
+    ImGui::PopStyleVar(StyleVars);
+    if (theater.closeRequested) {
+        theater.closeRequested = false;
+        result.closeRequested = true;
+    }
+}
+
+DrawResult Draw(ModuleManager& modules, const DrawMode& mode, bool& hudEditMode, const FrameInfo& frame) {
+    const bool menuVisible = mode.menuVisible;
+    const bool gameplayHudVisible = mode.gameplayHudVisible;
     DrawResult result{};
     const auto display = ImGui::GetIO().DisplaySize;
     if (moduleBrowserOwner != &modules) {
         moduleBrowser = std::make_unique<ClickGui>(modules);
         moduleBrowserOwner = &modules;
+        profilesLoaded = false;
     }
     const float deltaSeconds = frame.deltaSeconds;
     modules.Publish(RenderEvent{display.x, display.y, 96.0F, frame.deltaSeconds, menuVisible, hudEditMode,
-        frame.gameFocused, frame.frameIndex, frame.presentedAt, frame.keysDown});
+        frame.gameFocused, frame.frameIndex, frame.presentedAt, frame.keysDown, gameplayHudVisible});
     DrawToast();
-    if (!menuVisible && gameplayHudVisible) DrawOverlayPrimitives(modules, display);
-    if ((!menuVisible && gameplayHudVisible) || hudEditMode) result.settingsDirty |= DrawHud(modules, hudEditMode);
+    if (mode.replayPanelVisible && !menuVisible) DrawReplayPanel(modules, frame.presentedAt);
+    // While the camera flies a path, Oinkster's HUD stays out of the shot.
+    bool cleanShot = false;
+    if (ReplayInjector::Running() || Render::Busy()) {
+        const auto status = ReplayInjector::CurrentStatus();
+        Render::Update(status);
+        cleanShot = status.cameraPathPlaying;
+        if (status.running && !menuVisible && !mode.replayPanelVisible) {
+            if (status.playing) DrawReplayHotbar(status, frame, result);
+            else DrawReplayPill();
+        }
+    }
+    Render::DrawBadge();
+    if (mode.replaysButtonVisible && !menuVisible && DrawReplaysMenuButton()) result.openReplayTheater = true;
+    if (!menuVisible && gameplayHudVisible && !cleanShot) DrawOverlayPrimitives(modules, display);
+    if (!menuVisible && gameplayHudVisible && !cleanShot) DrawDebugOverlays(modules, display);
+    if (!menuVisible && gameplayHudVisible && !cleanShot) DrawPlayerLists(modules, display);
+    if (!menuVisible && !cleanShot) DrawModuleNotices(modules, display);
+    if ((!menuVisible && !cleanShot) || hudEditMode) {
+        result.settingsDirty |= DrawHud(modules, hudEditMode, gameplayHudVisible || hudEditMode);
+    }
     if (!menuVisible) {
         menuWasVisible = false;
+        return result;
+    }
+    if (mode.replayEditor) {
+        DrawReplayEditor(frame, result);
+        return result;
+    }
+    if (mode.replayTheater) {
+        DrawStandaloneTheater(modules, frame, result);
         return result;
     }
     if (!menuWasVisible) {
@@ -1516,6 +4830,7 @@ DrawResult Draw(ModuleManager& modules, bool menuVisible, bool gameplayHudVisibl
     const bool capturingKey = !capturingModule.empty() || !capturingSetting.empty() || controlCapture != ControlCapture::None;
     if (!capturingKey && ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
         if (search[0] != '\0') search[0] = '\0';
+        else if (TheaterConsumesEscape()) {}
         else if (section != Section::Home) section = Section::Home;
         else result.closeRequested = true;
     }
@@ -1527,7 +4842,7 @@ DrawResult Draw(ModuleManager& modules, bool menuVisible, bool gameplayHudVisibl
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0F, 0.0F));
         ImGui::Begin("##oinkster-home", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
             ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBackground);
-        DrawHomeHub(modules, deltaSeconds);
+        DrawHomeHub(modules, deltaSeconds, hudEditMode);
         ImGui::End();
         ImGui::PopStyleVar();
         return result;
@@ -1579,8 +4894,10 @@ DrawResult Draw(ModuleManager& modules, bool menuVisible, bool gameplayHudVisibl
     ImGui::PopStyleVar();
     switch (section) {
     case Section::Modules: DrawModulesPage(modules, *moduleBrowser, result.settingsDirty); break;
+    case Section::Profiles: DrawProfilesPage(modules, result.settingsDirty); break;
     case Section::Hud: DrawHudPage(modules, hudEditMode, result.settingsDirty); break;
     case Section::Settings: DrawSettingsPage(modules, result.settingsDirty); break;
+    case Section::Home: break;
     }
     ImGui::EndChild();
 

@@ -5,6 +5,7 @@
 #include <libhat/Process.hpp>
 #include <charconv>
 #include <cstdio>
+#include <chrono>
 #include <filesystem>
 #include <format>
 #include <fstream>
@@ -25,15 +26,20 @@ std::filesystem::path LogDirectory() {
 }
 }
 
+// Milliseconds since this DLL was loaded, so a log can be read as a timeline.
+const std::chrono::steady_clock::time_point loadedAt = std::chrono::steady_clock::now();
+
 void LogLine(std::string_view level, std::string_view event, std::string_view message) noexcept {
     try {
+        const auto millis = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - loadedAt).count();
         std::scoped_lock lock(logMutex);
         const auto directory = LogDirectory();
         std::filesystem::create_directories(directory);
         std::ofstream output(directory / "oinkster-native.log", std::ios::app);
         // Escaped: messages carry reasons and paths that may contain quotes
         // or backslashes, which used to produce invalid JSON lines.
-        output << "{\"level\":\"" << Json::Escape(level) << "\",\"event\":\"" << Json::Escape(event)
+        output << "{\"ms\":" << millis << ",\"level\":\"" << Json::Escape(level) << "\",\"event\":\"" << Json::Escape(event)
                << "\",\"message\":\"" << Json::Escape(message) << "\"}\n";
     } catch (...) {}
 }

@@ -152,6 +152,11 @@ private:
     static void Dispatch(IModule& module, const CombatEvent& value) { module.OnCombat(value); }
     static void Dispatch(IModule& module, const SoundEvent& value) { module.OnSound(value); }
     static void Dispatch(IModule& module, const ChatEvent& value) { module.OnChat(value); }
+    static void Dispatch(IModule& module, const CameraPerspectiveEvent& value) { module.OnCameraPerspective(value); }
+    static void Dispatch(IModule& module, const GameCrosshairEvent& value) { module.OnGameCrosshair(value); }
+    static void Dispatch(IModule& module, const BlockSelectionEvent& value) { module.OnBlockSelection(value); }
+    static void Dispatch(IModule& module, const ReplayPacketEvent& value) { module.OnReplayPacket(value); }
+    static void Dispatch(IModule& module, const CameraPoseEvent& value) { module.OnCameraPose(value); }
 
     [[nodiscard]] ModuleAvailability ComputeAvailabilityLocked(const IModule& module) const;
     [[nodiscard]] SettingsReader SettingsForLocked(const IModule& module) const;

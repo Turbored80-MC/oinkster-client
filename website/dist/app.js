@@ -1,57 +1,41 @@
-document.documentElement.classList.add("js");
+// Fills in release details from release.json. The HTML already holds safe
+// defaults, so if the fetch fails the page still reads correctly.
 
-const year = document.querySelector("#current-year");
-if (year) year.textContent = String(new Date().getFullYear());
-
-const validDownloadUrl = (value) => {
+const isHttps = (value) => {
     try {
-        const url = new URL(value);
-        return url.protocol === "https:";
+        return new URL(value).protocol === "https:";
     } catch {
         return false;
     }
 };
 
-const applyReleaseConfig = (config) => {
+export const loadRelease = async () => {
+    try {
+        const response = await fetch("release.json", { cache: "no-store" });
+        return response.ok ? await response.json() : {};
+    } catch {
+        return {};
+    }
+};
+
+export const applyRelease = (config) => {
+    if (typeof config.version === "string") {
+        document.querySelectorAll("[data-release-version]").forEach((el) => { el.textContent = config.version; });
+    }
+    if (typeof config.supportedBedrock === "string") {
+        document.querySelectorAll("[data-release-bedrock]").forEach((el) => { el.textContent = `Bedrock ${config.supportedBedrock}`; });
+    }
+
     const action = document.querySelector("#download-action");
-    const platform = document.querySelector("#release-platform");
-    const bedrock = document.querySelector("#release-bedrock");
-    const status = document.querySelector("#release-status-label");
-    if (!action) return;
-
-    if (typeof config.platform === "string" && platform) platform.textContent = config.platform;
-    if (typeof config.supportedBedrock === "string" && bedrock) bedrock.textContent = `Bedrock ${config.supportedBedrock}`;
-
-    const canDownload = config.availability === "available" && validDownloadUrl(config.downloadUrl);
-    if (!canDownload) return;
+    if (!action || config.availability !== "available" || !isHttps(config.downloadUrl)) return;
 
     const link = document.createElement("a");
     link.className = "button button-primary";
     link.href = config.downloadUrl;
-    link.textContent = config.label || "Download Oinkster";
-    link.setAttribute("aria-label", `${link.textContent} for ${config.platform || "Windows x64"}`);
+    link.textContent = `Download ${config.version ?? ""}`.trim();
     action.querySelector(".button-disabled")?.replaceWith(link);
-    action.dataset.state = "available";
-    if (status) status.textContent = config.statusLabel || "Verified release";
+    const note = document.querySelector("#release-status-label");
+    if (note) note.textContent = `${config.statusLabel ?? "Signed release"} for ${config.platform ?? "Windows x64"}.`;
 };
 
-fetch("release.json", { cache: "no-store" })
-    .then((response) => response.ok ? response.json() : Promise.reject(new Error("Release configuration unavailable")))
-    .then(applyReleaseConfig)
-    .catch(() => { /* The safe static fallback remains visible. */ });
-
-const revealTargets = document.querySelectorAll(".section-heading, .feature-card, .safety-copy, .safety-steps, .download > :not(.download-orbit), .faq-heading, .faq-list");
-revealTargets.forEach((element) => element.classList.add("reveal"));
-
-if ("IntersectionObserver" in window) {
-    const observer = new IntersectionObserver((entries) => {
-        entries.forEach((entry) => {
-            if (!entry.isIntersecting) return;
-            entry.target.classList.add("is-visible");
-            observer.unobserve(entry.target);
-        });
-    }, { threshold: 0.12 });
-    revealTargets.forEach((element) => observer.observe(element));
-} else {
-    revealTargets.forEach((element) => element.classList.add("is-visible"));
-}
+applyRelease(await loadRelease());

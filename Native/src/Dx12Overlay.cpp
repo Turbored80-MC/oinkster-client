@@ -1,5 +1,7 @@
 #include "Oinkster/Dx12Overlay.hpp"
 #include "Oinkster/FrameBlend.hpp"
+#include "Oinkster/PostProcess.hpp"
+#include "Oinkster/VideoRecorder.hpp"
 #include "Oinkster/ModuleManager.hpp"
 #include "Oinkster/OverlayUi.hpp"
 #include "Oinkster/InputState.hpp"
@@ -8,11 +10,16 @@
 #include "Oinkster/Diagnostics.hpp"
 #include "Oinkster/HookManager.hpp"
 #include "Oinkster/UnloadGuard.hpp"
+#include "Oinkster/ReplayInjector.hpp"
+#include "Oinkster/ReplayWorld.hpp"
+#include "Oinkster/ScreenTelemetry.hpp"
+#include "Oinkster/ScreenshotCapture.hpp"
+#include "Oinkster/WorldTelemetry.hpp"
 #include "Oinkster/Modules/AccessibilityLogic.hpp"
 #include <Windows.h>
 #include <windowsx.h>
 #include <d3d12.h>
-#include <dxgi1_4.h>
+#include <dxgi1_6.h>
 #include <MinHook.h>
 #include <imgui.h>
 #include <imgui_impl_dx12.h>
@@ -45,6 +52,10 @@ using PresentFunction = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT)
 using ResizeFunction = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT, UINT, DXGI_FORMAT, UINT);
 using Resize1Function = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain3*, UINT, UINT, UINT, DXGI_FORMAT, UINT,
     const UINT*, IUnknown* const*);
+using CreateSwapChainForHwndFunction = HRESULT(STDMETHODCALLTYPE*)(IDXGIFactory2*, IUnknown*, HWND,
+    const DXGI_SWAP_CHAIN_DESC1*, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC*, IDXGIOutput*, IDXGISwapChain1**);
+using CreateSwapChainForCoreWindowFunction = HRESULT(STDMETHODCALLTYPE*)(IDXGIFactory2*, IUnknown*, IUnknown*,
+    const DXGI_SWAP_CHAIN_DESC1*, IDXGIOutput*, IDXGISwapChain1**);
 using ExecuteFunction = void(STDMETHODCALLTYPE*)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*);
 using ClipCursorFunction = BOOL(WINAPI*)(const RECT*);
 using GetRawInputDataFunction = UINT(WINAPI*)(HRAWINPUT, UINT, LPVOID, PUINT, UINT);
@@ -60,6 +71,8 @@ struct FrameContext {
 PresentFunction originalPresent{};
 ResizeFunction originalResize{};
 Resize1Function originalResize1{};
+CreateSwapChainForHwndFunction originalCreateSwapChainForHwnd{};
+CreateSwapChainForCoreWindowFunction originalCreateSwapChainForCoreWindow{};
 ExecuteFunction originalExecute{};
 ClipCursorFunction originalClipCursor{};
 GetRawInputDataFunction originalGetRawInputData{};
@@ -79,7 +92,7 @@ WNDPROC originalWindowProcedure{};
 DXGI_FORMAT renderFormat{DXGI_FORMAT_UNKNOWN};
 std::mutex stateMutex;
 std::atomic_bool installed{};
-bool imguiReady{};
+std::atomic_bool imguiReady{};
 std::atomic_bool menuVisible{};
 bool hudEditMode{};
 // Render-thread state for frame timing and pacing.
@@ -88,6 +101,15 @@ std::chrono::steady_clock::time_point lastPresentAt{};
 // Signalled by Remove() so a dynamic-FPS wait in Present ends immediately.
 HANDLE pacingWakeEvent{};
 FrameBlendResources frameBlend;
+PostProcessPass postProcess;
+// The grade the post-process draw callback binds (render thread only).
+PostProcessSettings framePostProcess;
+// Gameplay owns the mouse and keyboard (no game screen, no menu, focused):
+// written by HookPresent, read by WindowProcedure for key transforms.
+std::atomic_bool gameplayCaptured{};
+bool lastGameplayCaptured{};
+VideoRecorder::GpuCapture videoCapture;
+ScreenshotCapture::GpuCapture screenshotCapture;
 constexpr UINT FontDescriptorCount = 1;
 constexpr UINT SrvDescriptorCount = FontDescriptorCount + FrameBlendResources::HistoryCount;
 ModuleManager* moduleManager{};
@@ -103,6 +125,14 @@ KeyStateTracker keyStateTracker;
 // keyStateTracker is touched from the window thread (WindowProcedure) and the
 // render thread (ReleaseTrackedKeys/RestoreTrackedKeys via HookPresent).
 std::mutex keyStateMutex;
+// Dear ImGui is not thread-safe. Its input queue (an ImVector) is filled by
+// ImGui_ImplWin32_WndProcHandler on the game's window thread and drained by
+// ImGui::NewFrame on the render thread; unsynchronized, the two race and trip
+// ImVector's bounds assert. Every ImGui call made off the render thread, and
+// the render thread's input/NewFrame step, holds this. Recursive because the
+// Win32 handler's SetCapture/ReleaseCapture re-enter WindowProcedure
+// synchronously on the same thread.
+std::recursive_mutex imguiInputMutex;
 std::atomic_uint32_t rawInputMessagesWhileMenu{};
 std::atomic_uint32_t mouseMessagesWhileMenu{};
 std::atomic_uint32_t keyboardMessagesWhileMenu{};
@@ -112,16 +142,64 @@ std::atomic_uint32_t extraWindowKeyMessages{};
 std::atomic_uint32_t rawMousePacketsBlocked{};
 std::atomic_int extraVerticalWheel{};
 std::atomic_int extraHorizontalWheel{};
-// The key currently held on the player's behalf by an ISprintAssistModule
-// (0 = none). Remembered so a settings change can never strand a different
-// key in the "down" state.
-std::uint32_t heldSprintKey{};
+// Keys currently held on the player's behalf by scoped assist modules.
+// Remembered so settings changes, focus loss, and unload always emit key-up.
+std::vector<std::uint32_t> heldAssistKeys;
 bool menuKeyDown{};
 bool unloadKeyDown{};
+bool escapeKeyDown{};
 bool cursorVisibilityInitialized{};
 bool observedCursorVisible{};
 bool stableCursorVisible{};
 std::chrono::steady_clock::time_point cursorVisibilityChangedAt{};
+std::atomic_bool pauseProbeRequested{};
+std::atomic_bool overlayControlsVisible{};
+// The open menu is the standalone Replays theater (opened from the main-menu
+// button). The game's cursor is already free there, so opening and closing it
+// must not release or re-grab the cursor the way the ClickGUI does.
+std::atomic_bool menuIsReplayTheater{};
+// The menu is open as the replay editor (opened when a replay world is
+// joined, or with K while one plays) rather than the ClickGUI. Cursor and
+// input handling are the ClickGUI's; only what OverlayUi draws differs.
+std::atomic_bool menuIsReplayEditor{};
+// The editor already opened itself for the replay that is running.
+bool replayEditorAutoOpened{};
+// Set only after the replay's local world has rendered at least one frame.
+// This distinguishes a real Save & Quit from transient title events emitted
+// while that local world is still starting.
+bool replayWorldRendered{};
+// While a replay plays (no menu, no pause screen) the wheel and left click
+// drive the replay hotbar instead of the game. Queued by the mouse feed hook
+// (or, without it, the window procedure / button polling) and drained by
+// the next Present.
+std::atomic_bool replayHotbarActive{};
+std::atomic_int replayHotbarScroll{};
+std::atomic_int replayHotbarClicks{};
+std::atomic_int replayHotbarRightClicks{};
+bool replayHotbarLeftDown{};
+bool replayHotbarRightDown{};
+// The temporary replay world is deleted once the game is back on its menus
+// after a replay (and once after injection, for one left by a crash).
+bool replayWorldCleanupDue{true};
+// Present-thread only: last logged in-world state, for transition logging.
+bool loggedInWorld{true};
+// Present-thread only: GameInput mouse is blocked because the pointer is over
+// one of the small overlay controls (not because the menu is open).
+bool controlsBlockingMouse{};
+bool minecraftPauseVisible{};
+std::chrono::steady_clock::time_point pauseCandidateUntil{};
+std::chrono::steady_clock::time_point pauseCursorHiddenSince{};
+bool previousFrameCursorVisible{};
+// Cursor state the game had when the ClickGUI opened, put back exactly on
+// close. Render thread only (ShowCursor's display count is per thread).
+int showCursorCountBeforeMenu{};
+bool cursorHiddenBeforeMenu{};
+bool cursorStateSaved{};
+// Focus loss closes the menu on the window thread; the render thread puts
+// the saved cursor state back on its next Present.
+std::atomic_bool cursorRestorePending{};
+
+bool IsCursorVisible() noexcept;
 
 UINT WINAPI HookGetRawInputData(HRAWINPUT input, UINT command, LPVOID data, PUINT size, UINT headerSize) noexcept;
 
@@ -249,8 +327,11 @@ void SetCoreWindowCursorVisible(bool visible) noexcept {
     try {
         auto window = winrt::Windows::UI::Core::CoreWindow::GetForCurrentThread();
         if (!window) {
-            Diagnostics::LogLine("warning", "corewindow_cursor",
-                "CoreWindow::GetForCurrentThread() returned null - this thread does not own the CoreWindow");
+            static std::atomic_bool logged{};
+            if (!logged.exchange(true)) {
+                Diagnostics::LogLine("warning", "corewindow_cursor",
+                    "CoreWindow::GetForCurrentThread() returned null - this thread does not own the CoreWindow");
+            }
             return;
         }
         if (visible) {
@@ -272,14 +353,31 @@ void SetCoreWindowCursorVisible(bool visible) noexcept {
 // when our menu opens and takes the mouse back from gameplay), same call
 // order as theirs: unclip, release capture, then show the cursor.
 void ReleaseCursorForMenu() noexcept {
+    cursorHiddenBeforeMenu = !IsCursorVisible();
     SetCoreWindowCursorVisible(true);
     // Call the trampoline directly, not the (now hooked) ClipCursor symbol:
     // menuVisible is already true here, so going through the hook would make
     // this call a no-op too.
     if (originalClipCursor) originalClipCursor(nullptr); else ClipCursor(nullptr);
     ReleaseCapture();
-    while (ShowCursor(TRUE) < 0) {}
+    int count = ShowCursor(TRUE);
+    showCursorCountBeforeMenu = count - 1;
+    cursorStateSaved = true;
+    while (count < 0) count = ShowCursor(TRUE);
     SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+}
+
+// Returns the ShowCursor display count to what the game had before the menu
+// opened. Bedrock hides the gameplay cursor by clearing its shape, not via
+// ShowCursor, so forcing the count negative here (as this used to) left the
+// pointer invisible on every game screen - inventory, chat, pause - until
+// restart.
+void RestoreShowCursorCount() noexcept {
+    if (!cursorStateSaved) return;
+    cursorStateSaved = false;
+    int count = ShowCursor(FALSE);
+    while (count > showCursorCountBeforeMenu) count = ShowCursor(FALSE);
+    while (count < showCursorCountBeforeMenu) count = ShowCursor(TRUE);
 }
 
 LPARAM KeyboardMessageData(std::uint32_t key, bool released) noexcept {
@@ -341,39 +439,205 @@ void RestoreTrackedKeys() noexcept {
     }
 }
 
+// Null Movement and friends: the first enabled IKeyTransformModule that
+// takes the message replaces it with its own key messages, sent straight
+// to the game's procedure on this (the window) thread.
+bool TransformKeyMessage(HWND window, UINT message, WPARAM wParam, LPARAM lParam) noexcept {
+    try {
+        const auto modules = moduleManager->EnabledModulesOf<IKeyTransformModule>();
+        if (modules.empty()) return false;
+        std::array<bool, 256> physical{};
+        for (std::uint32_t key = 1; key < physical.size(); ++key) {
+            physical[key] = (GetAsyncKeyState(static_cast<int>(key)) & 0x8000) != 0;
+        }
+        const auto key = static_cast<std::uint32_t>(wParam);
+        const bool pressed = message == WM_KEYDOWN;
+        const bool repeated = pressed && (lParam & (1LL << 30)) != 0;
+        std::vector<KeyMessage> out;
+        for (auto* module : modules) {
+            if (!module->TransformKey(key, pressed, repeated, physical, out)) continue;
+            for (const auto& replacement : out) {
+                LPARAM data = KeyboardMessageData(replacement.key, !replacement.pressed);
+                if (replacement.pressed && replacement.key == key && repeated) data |= (1LL << 30);
+                (void)CallWindowProcW(originalWindowProcedure, window, replacement.pressed ? WM_KEYDOWN : WM_KEYUP,
+                    replacement.key, data);
+            }
+            return true;
+        }
+    } catch (...) {}
+    return false;
+}
+
+// Per frame: mouse shaping, key-transform resets and held-key restores,
+// keyed off whether gameplay currently owns the input.
+void ApplyGameplayInput(bool gameFocused, bool cursorVisible) noexcept {
+    if (!moduleManager) return;
+    const bool captured = gameFocused && !cursorVisible && !menuVisible.load();
+    MouseShaping shaping;
+    try {
+        for (const auto* module : moduleManager->EnabledModulesOf<IMouseShapingModule>()) module->ShapeMouse(shaping, captured);
+    } catch (...) {
+        shaping = {};
+    }
+    MouseInputBlocker::SetMouseShaping(shaping);
+    if (captured == lastGameplayCaptured) return;
+    lastGameplayCaptured = captured;
+    gameplayCaptured.store(captured, std::memory_order_release);
+    try {
+        if (!captured) {
+            for (auto* module : moduleManager->EnabledModulesOf<IKeyTransformModule>()) module->ResetKeyTransform();
+            return;
+        }
+        // A game screen (inventory, chat, pause) just closed: Bedrock forgot
+        // the keys still held through it.
+        std::vector<std::uint32_t> keys;
+        for (const auto* module : moduleManager->EnabledModulesOf<IHeldKeyRestoreModule>()) {
+            for (const auto key : module->KeysToRestore()) keys.push_back(key);
+        }
+        std::ranges::sort(keys);
+        keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+        for (const auto key : keys) {
+            if (key != 0 && key < 256 && (GetAsyncKeyState(static_cast<int>(key)) & 0x8000) != 0) PostSyntheticKey(key, true);
+        }
+    } catch (...) {}
+}
+
+void PostProcessCallback(const ImDrawList*, const ImDrawCmd*) {
+    const auto& io = ImGui::GetIO();
+    postProcess.Bind(commandList.Get(), io.DisplaySize.x, io.DisplaySize.y, framePostProcess);
+}
+
 bool KeyDown(std::uint32_t key) noexcept {
     return key != 0 && key < 256 && (GetAsyncKeyState(static_cast<int>(key)) & 0x8000) != 0;
 }
 
-void ReleaseSprintKey() noexcept {
-    if (heldSprintKey != 0) PostSyntheticKey(heldSprintKey, false);
-    heldSprintKey = 0;
+void ReleaseAssistKeys() noexcept {
+    for (const auto key : heldAssistKeys) PostSyntheticKey(key, false);
+    heldAssistKeys.clear();
 }
 
-// Sprint assistance is delegated to whichever enabled module implements
-// ISprintAssistModule (currently "toggle-sprint-dynamic-fps"). Input is
-// sampled only while a Minecraft window is focused (GetAsyncKeyState is
-// process-wide, so the focus gate is what scopes it to the game), and the
-// sprint key is delivered through the same posted window message as every
-// other synthetic key - an ordinary key press, nothing a player could not do.
-void ApplySprintAssist(bool gameFocused, bool cursorVisible) noexcept {
-    if (!gameWindow || !originalWindowProcedure || !moduleManager) { heldSprintKey = 0; return; }
-    std::uint32_t wantKey{};
+// Assist keys use the same scoped window-message path as ordinary input.
+// Sprint remains conditional on physical movement; generalized holds (such
+// as toggle sneak) must reset themselves whenever gameplay loses the cursor.
+void ApplyKeyHoldAssists(bool gameFocused, bool cursorVisible) noexcept {
+    if (!gameWindow || !originalWindowProcedure || !moduleManager) { ReleaseAssistKeys(); return; }
+    std::vector<std::uint32_t> wanted;
     try {
         for (auto* module : moduleManager->EnabledModulesOf<ISprintAssistModule>()) {
             const SprintInputs inputs{gameFocused && KeyDown(module->ForwardKey()), gameFocused && KeyDown(module->SneakKey()),
                 !cursorVisible, menuVisible.load(), gameFocused};
-            if (module->WantsSprintHeld(inputs)) { wantKey = module->SprintKey(); break; }
+            if (module->WantsSprintHeld(inputs) && module->SprintKey() != 0) wanted.push_back(module->SprintKey());
+        }
+        const HeldKeyInputs inputs{!cursorVisible, menuVisible.load(), gameFocused};
+        for (auto* module : moduleManager->EnabledModulesOf<IKeyHoldAssistModule>()) {
+            if (const auto key = module->DesiredHeldKey(inputs); key != 0) wanted.push_back(key);
         }
     } catch (...) {
-        wantKey = 0;
+        wanted.clear();
     }
-    if (wantKey == heldSprintKey) return;
-    ReleaseSprintKey();
-    if (wantKey != 0) {
-        PostSyntheticKey(wantKey, true);
-        heldSprintKey = wantKey;
+    std::ranges::sort(wanted);
+    wanted.erase(std::unique(wanted.begin(), wanted.end()), wanted.end());
+    for (const auto key : heldAssistKeys) {
+        if (!std::ranges::binary_search(wanted, key)) PostSyntheticKey(key, false);
     }
+    for (const auto key : wanted) {
+        if (!std::ranges::binary_search(heldAssistKeys, key)) PostSyntheticKey(key, true);
+    }
+    heldAssistKeys = std::move(wanted);
+}
+
+// Settings page "Rendering" toggles, stored as click-gui.* settings. Only the
+// Present arguments and the swapchain's frame latency change; the swapchain
+// is never recreated and its creation flags are never touched (a flag
+// mismatch on ResizeBuffers makes Minecraft abort).
+constexpr std::string_view DisableVsyncSetting = "click-gui.disable-vsync";
+constexpr std::string_view LowLatencySetting = "click-gui.low-latency";
+std::atomic_bool tearingSupported{};
+std::atomic_bool systemTearingSupported{};
+std::atomic_bool tearingCreationHooksReady{};
+std::atomic<VsyncState> vsyncState{VsyncState::Enabled};
+std::atomic_bool lowLatencySupported{};
+// Identity only, never dereferenced: which swapchain the flags above describe.
+// Cleared on resize so a fullscreen change is re-inspected.
+std::atomic<IDXGISwapChain*> inspectedSwapChain{};
+bool swapChainFullscreen{};
+std::atomic_bool vsyncDisabled{};
+bool lowLatencyWanted{};
+std::chrono::steady_clock::time_point renderSettingsReadAt{};
+// Held only while low latency is applied, so it can be undone.
+ComPtr<IDXGISwapChain2> latencySwapChain;
+UINT originalFrameLatency{};
+
+void RestoreFrameLatency() noexcept {
+    if (!latencySwapChain) return;
+    (void)latencySwapChain->SetMaximumFrameLatency(originalFrameLatency);
+    latencySwapChain.Reset();
+}
+
+void InspectSwapChain(IDXGISwapChain* swapChain) noexcept {
+    if (inspectedSwapChain.load(std::memory_order_acquire) == swapChain) return;
+    inspectedSwapChain.store(swapChain, std::memory_order_release);
+    DXGI_SWAP_CHAIN_DESC desc{};
+    const bool described = SUCCEEDED(swapChain->GetDesc(&desc));
+    BOOL fullscreen = FALSE;
+    swapChainFullscreen = SUCCEEDED(swapChain->GetFullscreenState(&fullscreen, nullptr)) && fullscreen != FALSE;
+    const bool tearing = described && (desc.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0;
+    const bool waitable = described && (desc.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT) != 0;
+    tearingSupported.store(tearing, std::memory_order_release);
+    lowLatencySupported.store(waitable, std::memory_order_release);
+    Diagnostics::LogLine("info", "swapchain_present_caps", std::format(
+        "flags=0x{:X} allowTearing={} latencyWaitable={} fullscreen={}",
+        described ? desc.Flags : 0U, tearing ? 1 : 0, waitable ? 1 : 0, swapChainFullscreen ? 1 : 0));
+}
+
+void ReportVsyncState(const VsyncState state) noexcept {
+    const auto prior = vsyncState.exchange(state, std::memory_order_acq_rel);
+    if (prior == state) return;
+    const char* text = "enabled";
+    if (state == VsyncState::Disabled) text = "disabled";
+    else if (state == VsyncState::RestartRequired) text = "restart-required";
+    else if (state == VsyncState::Unsupported) text = "unsupported";
+    Diagnostics::LogLine("info", "vsync_transition", text);
+}
+
+// The arguments the real Present() receives, after the Rendering toggles.
+void ApplyRenderOptions(IDXGISwapChain* swapChain, UINT& interval, UINT& flags) noexcept {
+    if (!moduleManager) return;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - renderSettingsReadAt >= std::chrono::milliseconds(250)) {
+        renderSettingsReadAt = now;
+        try {
+            vsyncDisabled.store(moduleManager->ModuleSetting(DisableVsyncSetting, "0") == "1", std::memory_order_release);
+            lowLatencyWanted = moduleManager->ModuleSetting(LowLatencySetting, "0") == "1";
+        } catch (...) {
+            return;
+        }
+    }
+    InspectSwapChain(swapChain);
+    if (lowLatencyWanted && lowLatencySupported.load(std::memory_order_acquire)) {
+        if (!latencySwapChain || latencySwapChain.Get() != swapChain) {
+            RestoreFrameLatency();
+            ComPtr<IDXGISwapChain2> swapChain2;
+            UINT previous = 0;
+            if (SUCCEEDED(swapChain->QueryInterface(IID_PPV_ARGS(&swapChain2)))
+                && SUCCEEDED(swapChain2->GetMaximumFrameLatency(&previous))
+                && SUCCEEDED(swapChain2->SetMaximumFrameLatency(1))) {
+                originalFrameLatency = previous;
+                latencySwapChain = std::move(swapChain2);
+                Diagnostics::LogLine("info", "low_latency", std::format("maximum frame latency {} -> 1", previous));
+            }
+        }
+    } else {
+        RestoreFrameLatency();
+    }
+    const bool chainAllows = tearingSupported.load(std::memory_order_acquire);
+    const bool systemAllows = systemTearingSupported.load(std::memory_order_acquire)
+        && (chainAllows || tearingCreationHooksReady.load(std::memory_order_acquire));
+    const auto decision = DecideVsyncPresent({vsyncDisabled.load(std::memory_order_acquire), systemAllows, chainAllows, swapChainFullscreen,
+        (flags & DXGI_PRESENT_TEST) != 0, interval, flags}, DXGI_PRESENT_ALLOW_TEARING);
+    interval = decision.interval;
+    flags = decision.flags;
+    ReportVsyncState(decision.state);
 }
 
 // Dynamic FPS: while the game is in the background, an enabled
@@ -400,12 +664,29 @@ void ApplyFramePacing(bool gameFocused) noexcept {
     if (pacingWakeEvent) (void)WaitForSingleObject(pacingWakeEvent, milliseconds);
 }
 
+// ImGui's Win32 backend calls SetCursor on its own, both when its cursor shape
+// changes and on WM_SETCURSOR. Outside the menu that fought the game: a stale
+// "ImGui draws the cursor" state hid the pointer over pause, inventory and
+// chat. Only while ImGui draws its own cursor may it touch the OS cursor.
+// Caller holds imguiInputMutex.
+void SetImGuiOwnsCursor(bool owns) noexcept {
+    if (!imguiReady) return;
+    auto& io = ImGui::GetIO();
+    io.MouseDrawCursor = owns;
+    if (owns) io.ConfigFlags &= ~ImGuiConfigFlags_NoMouseCursorChange;
+    else io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
+}
+
 void ClearImGuiInput() noexcept {
+    std::scoped_lock lock(imguiInputMutex);
     if (!imguiReady) return;
     auto& io = ImGui::GetIO();
     io.ClearInputKeys();
     io.ClearInputMouse();
     io.InputQueueCharacters.resize(0);
+    // Every menu close comes through here. The next ImGui frame may be far
+    // off (nothing else on screen) and WM_SETCURSOR reaches the backend first.
+    SetImGuiOwnsCursor(false);
 }
 
 // Literal port of Flarial dll-oss's CursorHandler::grabCursor (called when
@@ -417,6 +698,11 @@ void ClearImGuiInput() noexcept {
 // SetCursorPos writes to, ahead of our GameInput-level freeze).
 void RestoreCursorToGame() noexcept {
     if (!gameWindow) return;
+    const bool regrab = cursorHiddenBeforeMenu;
+    RestoreShowCursorCount();
+    // Opened from a screen that shows the cursor (the pause screen): hand it
+    // back visible and free, exactly as that screen had it.
+    if (!regrab) return;
     RECT rect{};
     GetClientRect(gameWindow, &rect);
     rect.top = (rect.bottom + rect.top) / 2;
@@ -426,7 +712,6 @@ void RestoreCursorToGame() noexcept {
     rect.right = rect.left;
     ClipCursor(&rect);
     SetCapture(gameWindow);
-    while (ShowCursor(FALSE) >= 0) {}
     SetCoreWindowCursorVisible(false);
 }
 
@@ -442,11 +727,14 @@ void RestoreCursorToGame() noexcept {
 void CloseMenuForFocusLoss() noexcept {
     MouseInputBlocker::SetActive(false);
     const bool wasVisible = menuVisible.exchange(false, std::memory_order_acq_rel);
+    const bool wasTheater = menuIsReplayTheater.exchange(false, std::memory_order_acq_rel);
+    menuIsReplayEditor.store(false, std::memory_order_release);
     if (wasVisible) {
         PlayerSkinTelemetry::NotifyMenuClosed();
         ClearImGuiInput();
-        while (ShowCursor(FALSE) >= 0) {}
-        SetCoreWindowCursorVisible(false);
+        // This runs on the window thread; ShowCursor counts are per thread,
+        // so the render thread unwinds its own count on the next Present.
+        if (!wasTheater) cursorRestorePending.store(true, std::memory_order_release);
     }
     // Drop isolation bookkeeping without synthesizing key events into a window
     // that no longer has focus. Guarded because the render thread also touches
@@ -455,12 +743,30 @@ void CloseMenuForFocusLoss() noexcept {
     keyStateTracker.Reset();
 }
 
-void SetMenuVisible(bool visible) noexcept {
+enum class MenuKind { ClickGui, ReplayTheater, ReplayEditor };
+
+void SetMenuVisible(bool visible, MenuKind kind = MenuKind::ClickGui) noexcept {
     if (menuVisible == visible) return;
+    if (visible) {
+        menuIsReplayTheater.store(kind == MenuKind::ReplayTheater, std::memory_order_release);
+        menuIsReplayEditor.store(kind == MenuKind::ReplayEditor, std::memory_order_release);
+    }
     menuVisible = visible;
     MouseInputBlocker::SetActive(menuVisible);
+    if (menuIsReplayTheater.load(std::memory_order_acquire)) {
+        if (menuVisible) {
+            ReleaseTrackedKeys();
+        } else {
+            ClearImGuiInput();
+            RestoreTrackedKeys();
+            menuIsReplayTheater.store(false, std::memory_order_release);
+        }
+        return;
+    }
     if (menuVisible) {
-        PlayerSkinTelemetry::RequestRefresh();
+        // The event-driven skin hook and startup cache keep the menu portrait
+        // current. A refresh here used to start a large game-memory scan on
+        // the same moment as the first ClickGUI frame, causing a visible hitch.
         ReleaseTrackedKeys();
         ReleaseCursorForMenu();
     } else {
@@ -468,11 +774,12 @@ void SetMenuVisible(bool visible) noexcept {
         ClearImGuiInput();
         RestoreCursorToGame();
         RestoreTrackedKeys();
+        menuIsReplayEditor.store(false, std::memory_order_release);
     }
 }
 
 void UpdateImGuiMouseFromSystem() noexcept {
-    if (!menuVisible || !gameWindow || !imguiReady) return;
+    if ((!menuVisible && !overlayControlsVisible.load(std::memory_order_acquire)) || !gameWindow || !imguiReady) return;
 
     POINT cursor{};
     if (GetCursorPos(&cursor) && ScreenToClient(gameWindow, &cursor)) {
@@ -564,6 +871,10 @@ void WaitForOverlayGpuIdle() noexcept {
 void ReleaseRenderState() noexcept {
     WaitForOverlayGpuIdle();
     frameBlend.Release();
+    postProcess.Release();
+    videoCapture.Release();
+    screenshotCapture.Release();
+    std::scoped_lock imguiLock(imguiInputMutex);
     if (imguiReady) {
         ImGui_ImplDX12_Shutdown();
         ImGui_ImplWin32_Shutdown();
@@ -636,15 +947,23 @@ LRESULT CALLBACK WindowProcedure(HWND window, UINT message, WPARAM wParam, LPARA
         || message == WM_SYSKEYDOWN || message == WM_SYSKEYUP;
     if (keyboardMessage) {
         const bool pressed = message == WM_KEYDOWN || message == WM_SYSKEYDOWN;
+        const bool repeated = (lParam & (1LL << 30)) != 0;
+        if (pressed && !repeated && wParam == VK_ESCAPE && !menuVisible) {
+            pauseProbeRequested.store(true, std::memory_order_release);
+        }
         {
             std::scoped_lock keyLock(keyStateMutex);
             keyStateTracker.Observe(static_cast<std::uint32_t>(wParam), pressed);
         }
         if (moduleManager) {
+            // A game screen with a cursor (chat above all) owns typing as much
+            // as the ClickGUI does: letters typed there are not gameplay
+            // presses, so module keys and keybinds must ignore them.
+            const bool gameScreenOpen = !gameplayCaptured.load(std::memory_order_acquire);
             const KeyboardEvent event{static_cast<std::uint32_t>(wParam), pressed,
-                (lParam & (1LL << 30)) != 0, menuVisible};
+                repeated, menuVisible || overlayControlsVisible.load(std::memory_order_acquire) || gameScreenOpen};
             allowGameplay = moduleManager->PublishInput(event);
-            if (pressed && !event.repeated && !menuVisible && wParam != configuredMenuKey.load()
+            if (pressed && !event.repeated && !event.uiCaptured && wParam != configuredMenuKey.load()
                 && wParam != configuredUnloadKey.load()) {
                 // Only mark the settings dirty when a keybind actually toggled
                 // something. Setting it unconditionally meant every gameplay
@@ -682,18 +1001,40 @@ LRESULT CALLBACK WindowProcedure(HWND window, UINT message, WPARAM wParam, LPARA
         }
         const float wheel = message == WM_MOUSEWHEEL || message == WM_MOUSEHWHEEL
             ? static_cast<float>(GET_WHEEL_DELTA_WPARAM(wParam)) / static_cast<float>(WHEEL_DELTA) : 0.0F;
-        const MouseEvent event{static_cast<float>(position.x), static_cast<float>(position.y), wheel, buttons,
-            changedButton, pressed, menuVisible};
-        allowGameplay = moduleManager->PublishInput(event) && allowGameplay;
+        // The validated MouseDevice::feed hook is authoritative for button
+        // transitions. Publishing the legacy message too would make one
+        // physical click advance debounce/CPS state twice. Keep the window
+        // path as a fallback, and continue publishing movement/wheel here.
+        if (changedButton == 0U || !MouseInputBlocker::CanFilterButtons()) {
+            const MouseEvent event{static_cast<float>(position.x), static_cast<float>(position.y), wheel, buttons,
+                changedButton, pressed, menuVisible || overlayControlsVisible.load(std::memory_order_acquire)};
+            allowGameplay = moduleManager->PublishInput(event) && allowGameplay;
+        }
+    }
+    // Replay hotbar without the mouse feed hook: take the wheel here.
+    if ((message == WM_MOUSEWHEEL) && replayHotbarActive.load(std::memory_order_acquire)
+        && !MouseInputBlocker::ReplayHotbarCaptured()) {
+        const int delta = GET_WHEEL_DELTA_WPARAM(wParam);
+        if (delta != 0) replayHotbarScroll.fetch_add(delta > 0 ? 1 : -1, std::memory_order_acq_rel);
+        return 0;
     }
     if (message == WM_KILLFOCUS) {
         CloseMenuForFocusLoss();
         hudEditMode = false;
     }
-    if (menuVisible) {
-        (void)ImGui_ImplWin32_WndProcHandler(window, message, wParam, lParam);
+    const bool controlsVisible = overlayControlsVisible.load(std::memory_order_acquire);
+    if (menuVisible || controlsVisible) {
+        bool wantCaptureMouse = false;
+        {
+            std::scoped_lock imguiLock(imguiInputMutex);
+            if (imguiReady) {
+                (void)ImGui_ImplWin32_WndProcHandler(window, message, wParam, lParam);
+                wantCaptureMouse = ImGui::GetIO().WantCaptureMouse;
+            }
+        }
         const bool keyMessage = message >= WM_KEYFIRST && message <= WM_KEYLAST;
-        if (mouseMessage || keyMessage || message == WM_INPUT || message == WM_CHAR) return 0;
+        if (menuVisible && (mouseMessage || keyMessage || message == WM_INPUT || message == WM_CHAR)) return 0;
+        if (controlsVisible && mouseMessage && wantCaptureMouse) return 0;
     }
     // The menu's own toggle key is read via GetAsyncKeyState polling in the
     // Present hook, on a completely separate timeline from this Win32 message
@@ -704,6 +1045,10 @@ LRESULT CALLBACK WindowProcedure(HWND window, UINT message, WPARAM wParam, LPARA
     // reach gameplay, independent of menu state.
     if (keyboardMessage && (wParam == configuredMenuKey.load() || wParam == configuredUnloadKey.load())) return 0;
     if (!allowGameplay) return 0;
+    if ((message == WM_KEYDOWN || message == WM_KEYUP) && moduleManager && !menuVisible
+        && gameplayCaptured.load(std::memory_order_acquire) && TransformKeyMessage(window, message, wParam, lParam)) {
+        return 0;
+    }
     return CallWindowProcW(originalWindowProcedure, window, message, wParam, lParam);
 }
 
@@ -927,7 +1272,61 @@ bool InitializeRenderer(IDXGISwapChain3* swapChain) {
 
 bool IsCursorVisible() noexcept {
     CURSORINFO info{ sizeof(CURSORINFO) };
-    return GetCursorInfo(&info) && (info.flags & CURSOR_SHOWING) != 0;
+    // SetCursor(nullptr) hides the pointer without clearing CURSOR_SHOWING,
+    // so a missing cursor shape also counts as hidden.
+    return GetCursorInfo(&info) && (info.flags & CURSOR_SHOWING) != 0 && info.hCursor != nullptr;
+}
+
+void LogPauseDetect(std::string_view what) noexcept {
+    CURSORINFO info{ sizeof(CURSORINFO) };
+    const bool read = GetCursorInfo(&info) != FALSE;
+    Diagnostics::LogLine("info", "replay_pause_detect", std::format(
+        "{} pauseVisible={} cursorRead={} flags=0x{:x} hasShape={} prevFrameCursorVisible={}",
+        what, minecraftPauseVisible, read, read ? info.flags : 0, read && info.hCursor != nullptr,
+        previousFrameCursorVisible));
+}
+
+// Minecraft's pause screen has no direct signal we can read, so it is
+// inferred: Esc pressed during gameplay (cursor hidden on the previous
+// frame), then the cursor appears within a short window. The latch then
+// holds until the cursor stays hidden again, focus is lost, or the ClickGUI
+// opens. Esc that closes a screen (cursor already visible) never arms it.
+void UpdateMinecraftPauseVisible(bool cursorVisible, bool gameFocused,
+    std::chrono::steady_clock::time_point now) noexcept {
+    constexpr auto CandidateWindow = std::chrono::milliseconds(1500);
+    constexpr auto HiddenRelease = std::chrono::milliseconds(150);
+    const bool wasVisible = minecraftPauseVisible;
+    if (pauseProbeRequested.exchange(false, std::memory_order_acq_rel)) {
+        const bool armed = gameFocused && !menuVisible && !previousFrameCursorVisible;
+        if (armed) pauseCandidateUntil = now + CandidateWindow;
+        LogPauseDetect(armed ? "escape armed" : "escape ignored");
+    }
+    if (!gameFocused || menuVisible) {
+        minecraftPauseVisible = false;
+        pauseCandidateUntil = {};
+    } else if (!minecraftPauseVisible) {
+        const bool levelRendering = !WorldTelemetry::Attached()
+            || WorldTelemetry::LevelRenderedWithin(now, std::chrono::milliseconds(250));
+        if (cursorVisible && now <= pauseCandidateUntil && levelRendering) {
+            minecraftPauseVisible = true;
+            pauseCandidateUntil = {};
+            pauseCursorHiddenSince = {};
+        }
+    } else if (WorldTelemetry::Attached()
+        && !WorldTelemetry::LevelRenderedWithin(now, std::chrono::milliseconds(250))) {
+        // Quitting from the pause screen leaves the cursor visible on the
+        // main menu; the level no longer rendering is what ends the pause.
+        minecraftPauseVisible = false;
+        pauseCandidateUntil = {};
+    } else if (cursorVisible) {
+        pauseCursorHiddenSince = {};
+    } else if (pauseCursorHiddenSince == std::chrono::steady_clock::time_point{}) {
+        pauseCursorHiddenSince = now;
+    } else if (now - pauseCursorHiddenSince >= HiddenRelease) {
+        minecraftPauseVisible = false;
+    }
+    previousFrameCursorVisible = cursorVisible;
+    if (wasVisible != minecraftPauseVisible) LogPauseDetect(minecraftPauseVisible ? "latched" : "released");
 }
 
 bool GameplayHudVisible(bool cursorVisible, bool gameFocused,
@@ -973,19 +1372,94 @@ HRESULT STDMETHODCALLTYPE HookPresent(IDXGISwapChain* baseSwapChain, UINT interv
         && (GetAsyncKeyState(static_cast<int>(configuredUnloadKey.load())) & 0x8000) != 0;
     if (unloadDown && !unloadKeyDown) ejectRequested.store(true);
     unloadKeyDown = unloadDown;
+    if (cursorRestorePending.exchange(false, std::memory_order_acq_rel) && !menuVisible) RestoreShowCursorCount();
     const bool cursorVisible = IsCursorVisible();
+    const bool escapeDown = gameFocused && (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
+    if (escapeDown && !escapeKeyDown && !menuVisible) {
+        pauseProbeRequested.store(true, std::memory_order_release);
+    }
+    escapeKeyDown = escapeDown;
+    // Outside a world (main menu, world list, settings) K does nothing; the
+    // main-menu Replays button is the way in there. Without world telemetry
+    // there is no way to tell, so K keeps working everywhere.
+    const auto inWorldCheckedAt = std::chrono::steady_clock::now();
+    // The level keeps rendering behind Minecraft's pause screen, so this
+    // stays true while paused and turns false as soon as the world is left.
+    const bool worldKnown = WorldTelemetry::Attached();
+    const bool levelRendered = worldKnown
+        && WorldTelemetry::LevelRenderedWithin(inWorldCheckedAt, std::chrono::milliseconds(400));
+    const bool inWorld = !worldKnown || levelRendered;
+    if (inWorld != loggedInWorld) {
+        loggedInWorld = inWorld;
+        Diagnostics::LogLine("info", "world_presence", inWorld ? "in world" : "out of world (main menu button shown)");
+    }
     const bool menuDown = gameFocused
         && (GetAsyncKeyState(static_cast<int>(configuredMenuKey.load())) & 0x8000) != 0;
-    if (menuDown && !menuKeyDown) SetMenuVisible(!menuVisible);
+    // While a replay plays, K opens its editor; the editor's gear button
+    // switches to the ClickGUI.
+    bool replayRunning = ReplayInjector::Running();
+    // Only gameplay (cursor hidden) or the pause screen may open the menu: a
+    // visible cursor otherwise means a game screen such as chat is up, and K
+    // typed into chat must not toggle the overlay.
+    // While a text field in the menu (module search, setting text, replay or
+    // profile names) has focus, K is a letter being typed, not the toggle.
+    bool typingInMenu = false;
+    if (menuVisible) {
+        std::scoped_lock imguiLock(imguiInputMutex);
+        typingInMenu = imguiReady && ImGui::GetIO().WantTextInput;
+    }
+    const bool menuKeyAllowed = menuVisible ? !typingInMenu : (inWorld && (!cursorVisible || minecraftPauseVisible));
+    if (menuDown && !menuKeyDown && menuKeyAllowed) {
+        SetMenuVisible(!menuVisible, replayRunning ? MenuKind::ReplayEditor : MenuKind::ClickGui);
+    }
     menuKeyDown = menuDown;
-    ApplySprintAssist(gameFocused, cursorVisible);
+    // The replay hotbar takes the wheel and left click while the replay is
+    // being watched with the camera (no menu, no pause screen).
+    const bool hotbar = replayRunning && gameFocused && levelRendered && !menuVisible && !cursorVisible;
+    if (hotbar != replayHotbarActive.load(std::memory_order_acquire)) {
+        replayHotbarActive.store(hotbar, std::memory_order_release);
+        MouseInputBlocker::SetReplayHotbar(hotbar);
+        replayHotbarScroll.store(0, std::memory_order_release);
+        replayHotbarClicks.store(0, std::memory_order_release);
+        replayHotbarRightClicks.store(0, std::memory_order_release);
+    }
+    // Without the mouse feed hook, clicks are polled (the game sees them too,
+    // which spectator mode ignores).
+    const bool leftDown = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+    if (hotbar && leftDown && !replayHotbarLeftDown && !MouseInputBlocker::ReplayHotbarCaptured()) {
+        replayHotbarClicks.fetch_add(1, std::memory_order_acq_rel);
+    }
+    replayHotbarLeftDown = leftDown;
+    const bool rightDown = (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
+    if (hotbar && rightDown && !replayHotbarRightDown && !MouseInputBlocker::ReplayHotbarCaptured()) {
+        replayHotbarRightClicks.fetch_add(1, std::memory_order_acq_rel);
+    }
+    replayHotbarRightDown = rightDown;
+    // Joining the replay world opens the editor once per replay.
+    if (!replayRunning) {
+        replayEditorAutoOpened = false;
+        replayWorldRendered = false;
+    } else if (levelRendered) {
+        replayWorldRendered = true;
+    }
+    if (replayRunning && !replayEditorAutoOpened && levelRendered && gameFocused && !menuVisible
+        && ReplayInjector::CurrentStatus().playing) {
+        replayEditorAutoOpened = true;
+        Diagnostics::LogLine("info", "replay_editor", "replay world joined; opening the editor");
+        SetMenuVisible(true, MenuKind::ReplayEditor);
+    }
+    ApplyRenderOptions(baseSwapChain, interval, flags);
+    ApplyKeyHoldAssists(gameFocused, cursorVisible);
+    ApplyGameplayInput(gameFocused, cursorVisible);
     ApplyFramePacing(gameFocused);
     const auto presentedAt = std::chrono::steady_clock::now();
     const bool gameplayHudVisible = GameplayHudVisible(cursorVisible, gameFocused, presentedAt);
+    UpdateMinecraftPauseVisible(cursorVisible, gameFocused, presentedAt);
     const float frameSeconds = lastPresentAt == std::chrono::steady_clock::time_point{} ? 0.0F
         : std::chrono::duration<float>(presentedAt - lastPresentAt).count();
     lastPresentAt = presentedAt;
     ++frameCounter;
+#ifndef NDEBUG
     if (menuVisible) {
         const auto now = std::chrono::steady_clock::now();
         if (lastDiagnosticLog == std::chrono::steady_clock::time_point{}) lastDiagnosticLog = now;
@@ -1005,12 +1479,51 @@ HRESULT STDMETHODCALLTYPE HookPresent(IDXGISwapChain* baseSwapChain, UINT interv
                 cursor.x, cursor.y));
         }
     }
+#endif
     // moduleManager must be non-null for the draw path below (OverlayUi::Draw
     // dereferences it); the transient-UI case used to fall through without it,
     // which a Present landing after Remove() cleared it could reach while a
     // toast was still on screen.
-    if (!moduleManager) return originalPresent(baseSwapChain, interval, flags);
-    if (!menuVisible && !moduleManager->HasEnabledOverlayModules() && !OverlayUi::HasTransientUi()) {
+    if (!moduleManager) {
+        overlayControlsVisible.store(false, std::memory_order_release);
+        return originalPresent(baseSwapChain, interval, flags);
+    }
+    const bool showReplayPanel = minecraftPauseVisible
+        && (!moduleManager->EnabledModulesOf<IReplayControlModule>().empty() || ReplayInjector::Running());
+    // Only a positively observed title screen may show the button. Treating
+    // unknown telemetry as the title caused a short-lived Replays button to
+    // appear wherever injection happened until the first screen event arrived.
+    const bool onTitleScreen = ScreenTelemetry::Known() && ScreenTelemetry::OnTitleScreen();
+    const bool onDisconnectedScreen = ScreenTelemetry::Known() && ScreenTelemetry::OnDisconnectedScreen();
+    // Save & Quit tears down the local connection without necessarily giving
+    // the packet hook another session start. Once the title is confirmed and
+    // the replay world has stopped rendering, retire playback so its bottom
+    // bar and input capture cannot leak onto the menus.
+    if (replayRunning && worldKnown && !levelRendered
+        && ((replayWorldRendered && onTitleScreen) || onDisconnectedScreen)
+        && ReplayInjector::CurrentStatus().inWorld) {
+        ReplayInjector::Stop();
+        replayRunning = false;
+        replayEditorAutoOpened = false;
+        replayWorldRendered = false;
+        Diagnostics::LogLine("info", "replay_world_exit",
+            onDisconnectedScreen ? "replay world disconnected; playback reset"
+                                 : "title screen observed after the replay world closed; playback reset");
+    }
+    const bool showReplaysButton = !levelRendered && onTitleScreen && gameFocused && !menuVisible;
+    overlayControlsVisible.store(showReplayPanel || showReplaysButton, std::memory_order_release);
+    if (replayRunning || ReplayWorld::Pending()) {
+        replayWorldCleanupDue = true;
+    } else if (replayWorldCleanupDue && worldKnown && !levelRendered && onTitleScreen) {
+        replayWorldCleanupDue = false;
+        ReplayWorld::DeleteReplayWorldsAsync([] { return ReplayInjector::Running() || ReplayWorld::Pending(); });
+    }
+    if (controlsBlockingMouse && !menuVisible && !showReplayPanel && !showReplaysButton) {
+        controlsBlockingMouse = false;
+        MouseInputBlocker::SetActive(false);
+    }
+    if (!menuVisible && !showReplayPanel && !showReplaysButton && !moduleManager->HasEnabledOverlayModules()
+        && !OverlayUi::HasTransientUi() && !ScreenshotCapture::NeedsPresentWork()) {
         frameBlend.Invalidate();
         return originalPresent(baseSwapChain, interval, flags);
     }
@@ -1026,11 +1539,13 @@ HRESULT STDMETHODCALLTYPE HookPresent(IDXGISwapChain* baseSwapChain, UINT interv
             if (imguiReady && queue && !frames.empty()) {
                 const UINT index = swapChain->GetCurrentBackBufferIndex();
                 auto& frame = frames.at(index);
-                bool framePresentable = true;
-                if (frame.fenceValue != 0 && renderFence->GetCompletedValue() < frame.fenceValue) {
-                    framePresentable = SUCCEEDED(renderFence->SetEventOnCompletion(frame.fenceValue, fenceEvent))
-                        && WaitForSingleObject(fenceEvent, 250) == WAIT_OBJECT_0;
-                }
+                // Present is Minecraft's render thread. Waiting here for an
+                // overlay allocator can stall the entire game for up to 250
+                // ms, which was especially visible while the ClickGUI drew
+                // every frame. If the GPU still owns this back-buffer slot,
+                // skip one overlay frame and let Minecraft present normally.
+                const bool framePresentable = frame.fenceValue == 0
+                    || renderFence->GetCompletedValue() >= frame.fenceValue;
                 if (framePresentable
                     && SUCCEEDED(frame.allocator->Reset())
                     && SUCCEEDED(commandList->Reset(frame.allocator.Get(), nullptr))) {
@@ -1042,38 +1557,112 @@ HRESULT STDMETHODCALLTYPE HookPresent(IDXGISwapChain* baseSwapChain, UINT interv
                             blendStrength = std::max(blendStrength, std::clamp(module->BlendStrength(), 0.0F, MaxFrameBlendStrength));
                         }
                     }
+                    // The replay editor shows the game in its viewport from
+                    // the same raw-frame capture frame blending uses.
+                    const bool replayEditor = menuVisible && menuIsReplayEditor.load(std::memory_order_acquire);
+                    // Colour grading: over gameplay and game screens, never
+                    // over the menu.
+                    bool postActive = false;
+                    if (!menuVisible) {
+                        const auto graders = moduleManager->EnabledModulesOf<IPostProcessModule>();
+                        if (!graders.empty()) {
+                            framePostProcess = {};
+                            for (const auto* grader : graders) {
+                                const auto settings = grader->PostProcess();
+                                framePostProcess.saturation *= settings.saturation;
+                                framePostProcess.contrast *= settings.contrast;
+                                framePostProcess.brightness = std::clamp(framePostProcess.brightness + settings.brightness, -0.5F, 0.5F);
+                                framePostProcess.vignette = std::max(framePostProcess.vignette, settings.vignette);
+                                framePostProcess.sharpen = std::max(framePostProcess.sharpen, settings.sharpen);
+                                framePostProcess.blur = std::max(framePostProcess.blur, settings.blur);
+                                if (settings.tintStrength > framePostProcess.tintStrength) {
+                                    framePostProcess.tint = settings.tint;
+                                    framePostProcess.tintStrength = settings.tintStrength;
+                                }
+                            }
+                            postActive = !framePostProcess.Identity();
+                        }
+                    }
+                    postActive = postActive && postProcess.Ensure(device.Get(), renderFormat);
                     bool captureFrame = false;
                     std::optional<D3D12_GPU_DESCRIPTOR_HANDLE> previousFrame;
-                    if (blendStrength > 0.0F) {
+                    std::optional<D3D12_GPU_DESCRIPTOR_HANDLE> currentFrame;
+                    if (blendStrength > 0.0F || replayEditor || postActive) {
                         const UINT increment = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
                         auto cpu = srvHeap->GetCPUDescriptorHandleForHeapStart();
                         auto gpu = srvHeap->GetGPUDescriptorHandleForHeapStart();
                         cpu.ptr += static_cast<SIZE_T>(increment) * FontDescriptorCount;
                         gpu.ptr += static_cast<UINT64>(increment) * FontDescriptorCount;
                         captureFrame = frameBlend.Ensure(device.Get(), frame.backBuffer->GetDesc(), cpu, gpu, increment);
-                        if (captureFrame) previousFrame = frameBlend.PreviousFrame();
+                        if (captureFrame) {
+                            previousFrame = frameBlend.PreviousFrame();
+                            currentFrame = frameBlend.CurrentFrame();
+                        }
                     }
+                    const bool replayTheater = menuVisible && menuIsReplayTheater.load(std::memory_order_acquire);
                     ImGui_ImplDX12_NewFrame();
-                    ImGui_ImplWin32_NewFrame();
-                    UpdateImGuiMouseFromSystem();
-                    ImGui::NewFrame();
-                    ImGui::GetIO().MouseDrawCursor = menuVisible;
-                    if (previousFrame) {
+                    {
+                        std::scoped_lock imguiLock(imguiInputMutex);
+                        // The theater opens over Minecraft's own menus, whose
+                        // system cursor is already showing. Set before the
+                        // backend's NewFrame, which applies it to the OS cursor.
+                        SetImGuiOwnsCursor(menuVisible && !replayTheater);
+                        ImGui_ImplWin32_NewFrame();
+                        UpdateImGuiMouseFromSystem();
+                        ImGui::NewFrame();
+                    }
+                    if (currentFrame && postActive) {
+                        auto* background = ImGui::GetBackgroundDrawList();
+                        background->AddCallback(&PostProcessCallback, nullptr);
+                        background->AddImage(reinterpret_cast<ImTextureID>(currentFrame->ptr),
+                            ImVec2(0.0F, 0.0F), ImGui::GetIO().DisplaySize);
+                        background->AddCallback(ImDrawCallback_ResetRenderState, nullptr);
+                    }
+                    if (previousFrame && blendStrength > 0.0F) {
                         const auto alpha = static_cast<int>(std::lround(blendStrength * 255.0F));
                         ImGui::GetBackgroundDrawList()->AddImage(reinterpret_cast<ImTextureID>(previousFrame->ptr),
                             ImVec2(0.0F, 0.0F), ImGui::GetIO().DisplaySize, ImVec2(0.0F, 0.0F), ImVec2(1.0F, 1.0F),
                             IM_COL32(255, 255, 255, alpha));
                     }
-                    OverlayUi::FrameInfo frameInfo{frameSeconds, frameCounter, presentedAt, gameFocused, {}};
+                    OverlayUi::FrameInfo frameInfo{frameSeconds, frameCounter, presentedAt, gameFocused, {}, {}};
+                    if (replayEditor && previousFrame) frameInfo.gameFrameTexture = previousFrame->ptr;
+                    if (replayHotbarActive.load(std::memory_order_acquire)) {
+                        frameInfo.replayHotbarScroll = replayHotbarScroll.exchange(0, std::memory_order_acq_rel);
+                        frameInfo.replayHotbarClicks = replayHotbarClicks.exchange(0, std::memory_order_acq_rel);
+                        frameInfo.replayHotbarRightClicks = replayHotbarRightClicks.exchange(0, std::memory_order_acq_rel);
+                    }
                     if (gameFocused) {
                         std::bitset<256> keys;
                         for (int key = 1; key < 255; ++key) keys[static_cast<std::size_t>(key)] = (GetAsyncKeyState(key) & 0x8000) != 0;
                         frameInfo.keysDown = keys;
                     }
-                    const auto draw = OverlayUi::Draw(*moduleManager, menuVisible, gameplayHudVisible, hudEditMode, frameInfo);
+                    const OverlayUi::DrawMode mode{menuVisible, replayTheater, gameplayHudVisible,
+                        showReplayPanel, showReplaysButton, replayEditor};
+                    const auto draw = OverlayUi::Draw(*moduleManager, mode, hudEditMode, frameInfo);
                     if (draw.settingsDirty) settingsDirty.store(true);
                     if (draw.closeRequested) SetMenuVisible(false);
+                    if (draw.openReplayTheater && !menuVisible) SetMenuVisible(true, MenuKind::ReplayTheater);
+                    if (draw.openClickGui && menuVisible) menuIsReplayEditor.store(false, std::memory_order_release);
+                    if (draw.openReplayEditor && !menuVisible) SetMenuVisible(true, MenuKind::ReplayEditor);
+                    // Minecraft may read menu clicks through GameInput, which
+                    // the window-message filter cannot stop; block it while
+                    // the pointer is over one of our controls.
+                    if (!menuVisible) {
+                        const bool block = (showReplayPanel || showReplaysButton) && ImGui::GetIO().WantCaptureMouse;
+                        if (block != controlsBlockingMouse) {
+                            controlsBlockingMouse = block;
+                            MouseInputBlocker::SetActive(block);
+                        }
+                    } else {
+                        controlsBlockingMouse = false;
+                    }
                     ImGui::Render();
+                    // A video recording copies the raw game frame as well
+                    // (before any overlay); the back buffer stays in PRESENT.
+                    videoCapture.Collect(renderFence->GetCompletedValue());
+                    screenshotCapture.Collect(renderFence->GetCompletedValue());
+                    videoCapture.Record(device.Get(), commandList.Get(), frame.backBuffer.Get(), presentedAt);
+                    screenshotCapture.Record(device.Get(), commandList.Get(), frame.backBuffer.Get(), false);
                     D3D12_RESOURCE_BARRIER barrier{};
                     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
                     barrier.Transition.pResource = frame.backBuffer.Get();
@@ -1094,11 +1683,18 @@ HRESULT STDMETHODCALLTYPE HookPresent(IDXGISwapChain* baseSwapChain, UINT interv
                     ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), commandList.Get());
                     std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
                     commandList->ResourceBarrier(1, &barrier);
+                    // At this point the backbuffer contains the complete ImGui
+                    // composition and is back in PRESENT state.
+                    screenshotCapture.Record(device.Get(), commandList.Get(), frame.backBuffer.Get(), true);
                     if (SUCCEEDED(commandList->Close())) {
                         ID3D12CommandList* lists[]{ commandList.Get() };
                         queue->ExecuteCommandLists(1, lists);
                         const UINT64 signalValue = nextFenceValue++;
-                        if (SUCCEEDED(queue->Signal(renderFence.Get(), signalValue))) frame.fenceValue = signalValue;
+                        if (SUCCEEDED(queue->Signal(renderFence.Get(), signalValue))) {
+                            frame.fenceValue = signalValue;
+                            videoCapture.Submitted(signalValue);
+                            screenshotCapture.Submitted(signalValue);
+                        }
                     }
                 }
             }
@@ -1125,6 +1721,8 @@ bool PrepareForResize(UINT count, DXGI_FORMAT format) noexcept {
     }
     WaitForOverlayGpuIdle();
     frameBlend.Release();
+    videoCapture.Release();
+    screenshotCapture.Release();
     for (auto& frame : frames) {
         frame.backBuffer.Reset();
         frame.fenceValue = 0;
@@ -1147,7 +1745,13 @@ void RebindBackBuffers(IDXGISwapChain* swapChain) noexcept {
 
 HRESULT STDMETHODCALLTYPE HookResize(IDXGISwapChain* swapChain, UINT count, UINT width, UINT height, DXGI_FORMAT format, UINT flags) {
     const CallbackGuard callback;
+    ScreenshotCapture::Shutdown();
     std::scoped_lock lock(stateMutex);
+    DXGI_SWAP_CHAIN_DESC current{};
+    if (SUCCEEDED(swapChain->GetDesc(&current)) && (current.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0) {
+        flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+    }
+    inspectedSwapChain.store(nullptr, std::memory_order_release);
     const bool rebind = PrepareForResize(count, format);
     const HRESULT result = originalResize(swapChain, count, width, height, format, flags);
     if (rebind) {
@@ -1161,6 +1765,11 @@ HRESULT STDMETHODCALLTYPE HookResize1(IDXGISwapChain3* swapChain, UINT count, UI
     DXGI_FORMAT format, UINT flags, const UINT* nodeMasks, IUnknown* const* presentQueues) {
     const CallbackGuard callback;
     std::scoped_lock lock(stateMutex);
+    DXGI_SWAP_CHAIN_DESC current{};
+    if (SUCCEEDED(swapChain->GetDesc(&current)) && (current.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0) {
+        flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+    }
+    inspectedSwapChain.store(nullptr, std::memory_order_release);
     const bool rebind = PrepareForResize(count, format);
     const HRESULT result = originalResize1(swapChain, count, width, height, format, flags, nodeMasks, presentQueues);
     if (rebind) {
@@ -1168,6 +1777,29 @@ HRESULT STDMETHODCALLTYPE HookResize1(IDXGISwapChain3* swapChain, UINT count, UI
         else ReleaseRenderState();
     }
     return result;
+}
+
+HRESULT STDMETHODCALLTYPE HookCreateSwapChainForHwnd(IDXGIFactory2* factory, IUnknown* deviceOrQueue, HWND window,
+    const DXGI_SWAP_CHAIN_DESC1* description, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fullscreen,
+    IDXGIOutput* output, IDXGISwapChain1** swapChain) {
+    const CallbackGuard callback;
+    if (!description || !systemTearingSupported.load(std::memory_order_acquire)) {
+        return originalCreateSwapChainForHwnd(factory, deviceOrQueue, window, description, fullscreen, output, swapChain);
+    }
+    auto tearingDescription = *description;
+    tearingDescription.Flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+    return originalCreateSwapChainForHwnd(factory, deviceOrQueue, window, &tearingDescription, fullscreen, output, swapChain);
+}
+
+HRESULT STDMETHODCALLTYPE HookCreateSwapChainForCoreWindow(IDXGIFactory2* factory, IUnknown* deviceOrQueue,
+    IUnknown* window, const DXGI_SWAP_CHAIN_DESC1* description, IDXGIOutput* output, IDXGISwapChain1** swapChain) {
+    const CallbackGuard callback;
+    if (!description || !systemTearingSupported.load(std::memory_order_acquire)) {
+        return originalCreateSwapChainForCoreWindow(factory, deviceOrQueue, window, description, output, swapChain);
+    }
+    auto tearingDescription = *description;
+    tearingDescription.Flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+    return originalCreateSwapChainForCoreWindow(factory, deviceOrQueue, window, &tearingDescription, output, swapChain);
 }
 
 LRESULT CALLBACK DummyWindowProcedure(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
@@ -1178,6 +1810,8 @@ LRESULT CALLBACK DummyWindowProcedure(HWND window, UINT message, WPARAM wParam, 
 bool Install(ModuleManager& modules, std::wstring& error) noexcept {
     if (installed.exchange(true)) return true;
     moduleManager = &modules;
+    try { vsyncDisabled.store(modules.ModuleSetting(DisableVsyncSetting, "0") == "1", std::memory_order_release); }
+    catch (...) { vsyncDisabled.store(false, std::memory_order_release); }
     if (!pacingWakeEvent) pacingWakeEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     if (pacingWakeEvent) ResetEvent(pacingWakeEvent);
     WNDCLASSW windowClass{};
@@ -1191,11 +1825,106 @@ bool Install(ModuleManager& modules, std::wstring& error) noexcept {
     ComPtr<IDXGIFactory4> factory;
     ComPtr<IDXGISwapChain1> probeSwapChain;
     bool success = false;
-    if (window && SUCCEEDED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&probeDevice)))) {
+    std::wstring adapterLabel = L"unknown adapter";
+    const auto setHresultError = [&error, &adapterLabel](std::wstring_view stage, HRESULT result) {
+        error = std::format(L"Direct3D 12 {} failed on {} (HRESULT 0x{:08X}). Update the graphics driver and restart Minecraft.",
+            stage, adapterLabel, static_cast<std::uint32_t>(result));
+    };
+    const auto describeAdapter = [](IDXGIAdapter1* adapter, bool warp) {
+        DXGI_ADAPTER_DESC1 description{};
+        if (!adapter || FAILED(adapter->GetDesc1(&description))) return std::wstring(warp ? L"WARP software adapter" : L"unknown adapter");
+        return std::format(L"{}{} (vendor 0x{:04X}, device 0x{:04X})",
+            description.Description, warp ? L" [WARP probe]" : L"", description.VendorId, description.DeviceId);
+    };
+
+    if (!window) {
+        error = L"Direct3D 12 probe-window creation failed. Restart Minecraft and close other overlays before trying again.";
+    }
+
+    HRESULT result = window ? CreateDXGIFactory1(IID_PPV_ARGS(&factory)) : E_FAIL;
+    if (window && FAILED(result)) setHresultError(L"factory creation", result);
+
+    // The probe exists only to discover the process-local D3D12/DXGI method
+    // addresses. Prefer the system default, then every high-performance and
+    // enumerated hardware adapter, and finally WARP. This is vendor-neutral
+    // and also covers hybrid laptops where the default adapter is not the GPU
+    // Minecraft actually uses.
+    if (window && factory) {
+        result = D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&probeDevice));
+        ComPtr<IDXGIAdapter1> selectedAdapter;
+        bool usedWarp = false;
+        if (SUCCEEDED(result)) {
+            (void)factory->EnumAdapterByLuid(probeDevice->GetAdapterLuid(), IID_PPV_ARGS(&selectedAdapter));
+        } else {
+            const auto tryAdapter = [&](IDXGIAdapter1* candidate) {
+                if (!candidate) return false;
+                DXGI_ADAPTER_DESC1 description{};
+                if (FAILED(candidate->GetDesc1(&description)) || (description.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) return false;
+                probeDevice.Reset();
+                result = D3D12CreateDevice(candidate, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&probeDevice));
+                if (FAILED(result)) return false;
+                selectedAdapter = candidate;
+                return true;
+            };
+
+            ComPtr<IDXGIFactory6> factory6;
+            if (SUCCEEDED(factory.As(&factory6))) {
+                for (UINT index = 0; !probeDevice; ++index) {
+                    ComPtr<IDXGIAdapter1> candidate;
+                    const auto enumeration = factory6->EnumAdapterByGpuPreference(index,
+                        DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IID_PPV_ARGS(&candidate));
+                    if (enumeration == DXGI_ERROR_NOT_FOUND) break;
+                    if (SUCCEEDED(enumeration)) (void)tryAdapter(candidate.Get());
+                }
+            }
+            for (UINT index = 0; !probeDevice; ++index) {
+                ComPtr<IDXGIAdapter1> candidate;
+                const auto enumeration = factory->EnumAdapters1(index, &candidate);
+                if (enumeration == DXGI_ERROR_NOT_FOUND) break;
+                if (SUCCEEDED(enumeration)) (void)tryAdapter(candidate.Get());
+            }
+            if (!probeDevice) {
+                ComPtr<IDXGIAdapter> warpAdapter;
+                ComPtr<IDXGIAdapter1> warpAdapter1;
+                const auto warpResult = factory->EnumWarpAdapter(IID_PPV_ARGS(&warpAdapter));
+                if (SUCCEEDED(warpResult) && SUCCEEDED(warpAdapter.As(&warpAdapter1))) {
+                    result = D3D12CreateDevice(warpAdapter1.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&probeDevice));
+                    if (SUCCEEDED(result)) {
+                        selectedAdapter = warpAdapter1;
+                        usedWarp = true;
+                    }
+                } else {
+                    result = warpResult;
+                }
+            }
+        }
+
+        if (probeDevice) {
+            adapterLabel = describeAdapter(selectedAdapter.Get(), usedWarp);
+            std::string adapterLog;
+            adapterLog.reserve(adapterLabel.size());
+            for (const wchar_t character : adapterLabel) {
+                adapterLog.push_back(character >= 0 && character <= 0x7f ? static_cast<char>(character) : '?');
+            }
+            Diagnostics::LogLine("info", "dx12_probe", adapterLog);
+        } else {
+            setHresultError(L"device creation", result);
+        }
+    }
+
+    if (window && probeDevice && factory) {
         D3D12_COMMAND_QUEUE_DESC queueDescription{};
         queueDescription.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-        if (SUCCEEDED(probeDevice->CreateCommandQueue(&queueDescription, IID_PPV_ARGS(&probeQueue)))
-            && SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) {
+        result = probeDevice->CreateCommandQueue(&queueDescription, IID_PPV_ARGS(&probeQueue));
+        if (FAILED(result)) {
+            setHresultError(L"command-queue creation", result);
+        } else {
+            ComPtr<IDXGIFactory5> factory5;
+            BOOL allowTearing = FALSE;
+            const bool systemAllowsTearing = SUCCEEDED(factory.As(&factory5))
+                && SUCCEEDED(factory5->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING,
+                    &allowTearing, sizeof(allowTearing))) && allowTearing != FALSE;
+            systemTearingSupported.store(systemAllowsTearing, std::memory_order_release);
             DXGI_SWAP_CHAIN_DESC1 swapDescription{};
             swapDescription.Width = 8;
             swapDescription.Height = 8;
@@ -1204,20 +1933,41 @@ bool Install(ModuleManager& modules, std::wstring& error) noexcept {
             swapDescription.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
             swapDescription.BufferCount = 2;
             swapDescription.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-            if (SUCCEEDED(factory->CreateSwapChainForHwnd(probeQueue.Get(), window, &swapDescription, nullptr, nullptr, &probeSwapChain))) {
+            result = factory->CreateSwapChainForHwnd(probeQueue.Get(), window, &swapDescription, nullptr, nullptr, &probeSwapChain);
+            if (FAILED(result)) {
+                setHresultError(L"probe swap-chain creation", result);
+            } else {
                 void** swapTable = *reinterpret_cast<void***>(probeSwapChain.Get());
                 void** queueTable = *reinterpret_cast<void***>(probeQueue.Get());
                 const auto status = MH_Initialize();
                 if (status == MH_OK || status == MH_ERROR_ALREADY_INITIALIZED) {
+                    void** factoryTable = *reinterpret_cast<void***>(factory.Get());
                     void* executeTarget = queueTable[10];
                     void* presentTarget = swapTable[8];
                     void* resizeTarget = swapTable[13];
-                    success = HookManager::Create(executeTarget, reinterpret_cast<void*>(HookExecute),
-                                  reinterpret_cast<void**>(&originalExecute))
-                        && HookManager::Create(presentTarget, reinterpret_cast<void*>(HookPresent),
-                            reinterpret_cast<void**>(&originalPresent))
-                        && HookManager::Create(resizeTarget, reinterpret_cast<void*>(HookResize),
-                            reinterpret_cast<void**>(&originalResize));
+                    const auto requiredHook = [&error, &adapterLabel](void* target, void* detour, void** original,
+                        std::wstring_view name) {
+                        std::string hookError;
+                        if (HookManager::Create(target, detour, original, &hookError)) return true;
+                        error = std::format(L"Direct3D 12 {} hook failed on {} ({}). Close Discord, GPU, recording, monitoring, ReShade, and other overlays; then restart Minecraft.",
+                            name, adapterLabel, std::wstring(hookError.begin(), hookError.end()));
+                        return false;
+                    };
+                    success = requiredHook(executeTarget, reinterpret_cast<void*>(HookExecute),
+                                  reinterpret_cast<void**>(&originalExecute), L"command submission")
+                        && requiredHook(presentTarget, reinterpret_cast<void*>(HookPresent),
+                            reinterpret_cast<void**>(&originalPresent), L"Present")
+                        && requiredHook(resizeTarget, reinterpret_cast<void*>(HookResize),
+                            reinterpret_cast<void**>(&originalResize), L"resize");
+                    const bool createHooks = success && HookManager::Create(factoryTable[15],
+                            reinterpret_cast<void*>(HookCreateSwapChainForHwnd),
+                            reinterpret_cast<void**>(&originalCreateSwapChainForHwnd))
+                        && HookManager::Create(factoryTable[16],
+                            reinterpret_cast<void*>(HookCreateSwapChainForCoreWindow),
+                            reinterpret_cast<void**>(&originalCreateSwapChainForCoreWindow));
+                    tearingCreationHooksReady.store(createHooks, std::memory_order_release);
+                    Diagnostics::LogLine(createHooks ? "info" : "warning", "vsync_creation_hooks",
+                        std::format("systemTearing={} factoryHooks={}", systemAllowsTearing ? 1 : 0, createHooks ? 1 : 0));
                     // IDXGISwapChain3::ResizeBuffers1 (slot 39) is a separate
                     // entry point. Without this hook a game resizing through
                     // it would find our back-buffer references still alive.
@@ -1233,6 +1983,11 @@ bool Install(ModuleManager& modules, std::wstring& error) noexcept {
                                 "IDXGISwapChain3::ResizeBuffers1 hook failed to install");
                         }
                     }
+                } else {
+                    const char* detail = MH_StatusToString(status);
+                    const std::string hookStatus = detail ? detail : "unknown MinHook error";
+                    error = std::format(L"Direct3D 12 hook engine initialization failed on {} ({}). Restart Minecraft and close other overlays before trying again.",
+                        adapterLabel, std::wstring(hookStatus.begin(), hookStatus.end()));
                 }
             }
         }
@@ -1240,7 +1995,7 @@ bool Install(ModuleManager& modules, std::wstring& error) noexcept {
     if (window) DestroyWindow(window);
     UnregisterClassW(windowClass.lpszClassName, windowClass.hInstance);
     if (!success) {
-        error = L"Direct3D 12 hook validation failed; no overlay was installed.";
+        if (error.empty()) error = L"Direct3D 12 hook validation failed; no overlay was installed.";
         Remove();
     } else {
         if (!HookManager::Create(reinterpret_cast<void*>(&ClipCursor), reinterpret_cast<void*>(HookClipCursor),
@@ -1261,6 +2016,19 @@ bool Install(ModuleManager& modules, std::wstring& error) noexcept {
             Diagnostics::LogLine("warning", "raw_input_hook", "GetRawInputBuffer hook failed to install");
         }
         cursorVisibilityInitialized = false;
+        pauseProbeRequested.store(false, std::memory_order_release);
+        overlayControlsVisible.store(false, std::memory_order_release);
+        menuIsReplayTheater.store(false, std::memory_order_release);
+        menuIsReplayEditor.store(false, std::memory_order_release);
+        replayHotbarActive.store(false, std::memory_order_release);
+        replayEditorAutoOpened = false;
+        replayWorldRendered = false;
+        controlsBlockingMouse = false;
+        loggedInWorld = true;
+        minecraftPauseVisible = false;
+        pauseCandidateUntil = {};
+        pauseCursorHiddenSince = {};
+        previousFrameCursorVisible = false;
         OverlayUi::BeginSession();
     }
     return success;
@@ -1312,6 +2080,27 @@ void ConfigureControlKeys(std::uint32_t menuKey, std::uint32_t unloadKey) noexce
 
 std::uint32_t MenuKey() noexcept { return configuredMenuKey.load(); }
 std::uint32_t UnloadKey() noexcept { return configuredUnloadKey.load(); }
+bool TearingSupported() noexcept { return tearingSupported.load(std::memory_order_acquire); }
+VsyncState CurrentVsyncState() noexcept { return vsyncState.load(std::memory_order_acquire); }
+bool VsyncDisabledRequested() noexcept { return vsyncDisabled.load(std::memory_order_acquire); }
+
+void SetVsyncDisabled(const bool disabled) noexcept {
+    try {
+        if (!moduleManager) return;
+        moduleManager->SetModuleSetting(std::string(DisableVsyncSetting), disabled ? "1" : "0");
+        vsyncDisabled.store(disabled, std::memory_order_release);
+        renderSettingsReadAt = {};
+        settingsDirty.store(true, std::memory_order_release);
+        if (!disabled) ReportVsyncState(VsyncState::Enabled);
+    } catch (...) {}
+}
+bool LowLatencySupported() noexcept { return lowLatencySupported.load(std::memory_order_acquire); }
+
+void QueueReplayHotbarScroll(int notches) noexcept { replayHotbarScroll.fetch_add(notches, std::memory_order_acq_rel); }
+
+void QueueReplayHotbarClick() noexcept { replayHotbarClicks.fetch_add(1, std::memory_order_acq_rel); }
+
+void QueueReplayHotbarRightClick() noexcept { replayHotbarRightClicks.fetch_add(1, std::memory_order_acq_rel); }
 
 void QueueMouseWheel(float delta) noexcept {
     extraVerticalWheel.fetch_add(static_cast<int>(delta * static_cast<float>(WHEEL_DELTA)), std::memory_order_relaxed);
@@ -1324,7 +2113,21 @@ void Remove() noexcept {
     // Wake a render thread parked in a dynamic-FPS wait before draining.
     if (pacingWakeEvent) SetEvent(pacingWakeEvent);
     menuVisible.store(false, std::memory_order_release);
-    ReleaseSprintKey();
+    pauseProbeRequested.store(false, std::memory_order_release);
+    overlayControlsVisible.store(false, std::memory_order_release);
+    menuIsReplayTheater.store(false, std::memory_order_release);
+    menuIsReplayEditor.store(false, std::memory_order_release);
+    replayHotbarActive.store(false, std::memory_order_release);
+    replayEditorAutoOpened = false;
+    replayWorldRendered = false;
+    MouseInputBlocker::SetReplayHotbar(false);
+    controlsBlockingMouse = false;
+    loggedInWorld = true;
+    minecraftPauseVisible = false;
+    pauseCandidateUntil = {};
+    pauseCursorHiddenSince = {};
+    previousFrameCursorVisible = false;
+    ReleaseAssistKeys();
     MouseInputBlocker::SetActive(false);
     RestoreRawInputDataImport();
     HookManager::DisableAll();
@@ -1346,10 +2149,20 @@ void Remove() noexcept {
     }
     std::scoped_lock lock(stateMutex);
     ReleaseRenderState();
+    RestoreFrameLatency();
+    inspectedSwapChain.store(nullptr, std::memory_order_release);
+    tearingSupported.store(false, std::memory_order_release);
+    systemTearingSupported.store(false, std::memory_order_release);
+    tearingCreationHooksReady.store(false, std::memory_order_release);
+    vsyncState.store(VsyncState::Enabled, std::memory_order_release);
+    vsyncDisabled.store(false, std::memory_order_release);
+    renderSettingsReadAt = {};
     if (auto* queue = commandQueue.exchange(nullptr, std::memory_order_acq_rel)) queue->Release();
     originalPresent = nullptr;
     originalResize = nullptr;
     originalResize1 = nullptr;
+    originalCreateSwapChainForHwnd = nullptr;
+    originalCreateSwapChainForCoreWindow = nullptr;
     originalExecute = nullptr;
     originalClipCursor = nullptr;
     originalGetRawInputData = nullptr;
@@ -1366,7 +2179,7 @@ void Remove() noexcept {
     ejectRequested.store(false);
     extraVerticalWheel.store(0);
     extraHorizontalWheel.store(0);
-    heldSprintKey = 0;
+    heldAssistKeys.clear();
     frameCounter = 0;
     lastPresentAt = {};
     // If a detour was still live, pacingWakeEvent was deliberately left open

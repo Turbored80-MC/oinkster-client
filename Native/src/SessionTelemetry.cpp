@@ -1,8 +1,11 @@
+#include <WinSock2.h>
+#include <WS2tcpip.h>
 #include "Oinkster/SessionTelemetry.hpp"
 #include "Oinkster/Diagnostics.hpp"
 #include "Oinkster/HookManager.hpp"
 #include "Oinkster/ModuleManager.hpp"
 #include "Oinkster/SafeMemory.hpp"
+#include "Oinkster/ServerPolicy.hpp"
 #include "Oinkster/SignatureScan.hpp"
 #include "Oinkster/SupportedBuild.hpp"
 #include "Oinkster/UnloadGuard.hpp"
@@ -17,6 +20,7 @@
 #include <format>
 #include <mutex>
 #include <string>
+#include <vector>
 
 namespace Oinkster::SessionTelemetry {
 namespace {
@@ -71,9 +75,15 @@ constexpr auto SampleLogInterval = std::chrono::seconds(10);
 
 using ReceiveFn = void* (*)(void*);
 using GetLevelDataFn = void* (*)(void*);
+using GetAddrInfoAFn = INT(WSAAPI*)(PCSTR, PCSTR, const ADDRINFOA*, PADDRINFOA*);
+using GetAddrInfoWFn = INT(WSAAPI*)(PCWSTR, PCWSTR, const ADDRINFOW*, PADDRINFOW*);
 
 ReceiveFn originalReceive{};
 void* receiveTarget{};
+GetAddrInfoAFn originalGetAddrInfoA{};
+GetAddrInfoWFn originalGetAddrInfoW{};
+void* getAddrInfoATarget{};
+void* getAddrInfoWTarget{};
 std::atomic<ModuleManager*> moduleManager{};
 std::atomic_bool attached{};
 std::atomic_uint32_t activeCallbacks{};
@@ -87,6 +97,20 @@ constexpr std::uint32_t NoPing = 0xFFFFFFFFU;
 std::atomic<std::int64_t> clientSampledAt{};
 std::atomic_uint32_t clientPing{NoPing};
 std::atomic_uint8_t clientKind{static_cast<std::uint8_t>(SessionKind::None)};
+std::atomic_uint8_t clientNetwork{static_cast<std::uint8_t>(ServerNetwork::Local)};
+
+// DNS results are retained only as short-lived in-memory endpoint mappings.
+// Neither hostname nor address is logged, published, or persisted.
+struct ResolvedEndpoint {
+    int family{};
+    std::array<std::uint8_t, 16> address{};
+    ServerNetwork network{ServerNetwork::UnknownRemote};
+    SteadyTime expiresAt{};
+};
+constexpr auto ResolutionLifetime = std::chrono::minutes(10);
+constexpr std::size_t MaxResolvedEndpoints = 64;
+std::mutex resolutionsMutex;
+std::vector<ResolvedEndpoint> resolutions;
 
 // Detour-side bookkeeping, shared by every thread that drains a peer.
 struct PeerRecord { const void* peer{}; SteadyTime sampledAt{}; bool logged{}; };
@@ -136,6 +160,81 @@ bool InText(const void* address) noexcept {
     return value >= textBegin && value < textEnd;
 }
 
+template<typename AddressInfo>
+void RememberResolution(ServerNetwork network, const AddressInfo* results) noexcept {
+    if (network == ServerNetwork::UnknownRemote || !results) return;
+    try {
+        const auto now = SteadyClock::now();
+        std::scoped_lock lock(resolutionsMutex);
+        std::erase_if(resolutions, [&](const ResolvedEndpoint& value) { return value.expiresAt <= now; });
+        for (auto* item = results; item; item = item->ai_next) {
+            ResolvedEndpoint endpoint;
+            endpoint.family = item->ai_family;
+            endpoint.network = network;
+            endpoint.expiresAt = now + ResolutionLifetime;
+            if (item->ai_family == AF_INET && item->ai_addrlen >= sizeof(sockaddr_in)) {
+                const auto* address = reinterpret_cast<const sockaddr_in*>(item->ai_addr);
+                std::memcpy(endpoint.address.data(), &address->sin_addr, 4);
+            } else if (item->ai_family == AF_INET6 && item->ai_addrlen >= sizeof(sockaddr_in6)) {
+                const auto* address = reinterpret_cast<const sockaddr_in6*>(item->ai_addr);
+                std::memcpy(endpoint.address.data(), &address->sin6_addr, 16);
+            } else {
+                continue;
+            }
+            const auto same = [&](const ResolvedEndpoint& value) {
+                return value.family == endpoint.family && value.address == endpoint.address && value.network == endpoint.network;
+            };
+            if (std::ranges::find_if(resolutions, same) == resolutions.end()) {
+                if (resolutions.size() >= MaxResolvedEndpoints) resolutions.erase(resolutions.begin());
+                resolutions.push_back(endpoint);
+            }
+        }
+    } catch (...) {}
+}
+
+INT WSAAPI HookedGetAddrInfoA(PCSTR node, PCSTR service, const ADDRINFOA* hints, PADDRINFOA* result) {
+    const CallbackGuard callback;
+    const INT status = originalGetAddrInfoA ? originalGetAddrInfoA(node, service, hints, result) : EAI_FAIL;
+    if (status == 0 && node && result) RememberResolution(ServerPolicy::ClassifyHostname(node), *result);
+    return status;
+}
+
+INT WSAAPI HookedGetAddrInfoW(PCWSTR node, PCWSTR service, const ADDRINFOW* hints, PADDRINFOW* result) {
+    const CallbackGuard callback;
+    const INT status = originalGetAddrInfoW ? originalGetAddrInfoW(node, service, hints, result) : EAI_FAIL;
+    if (status == 0 && node && result) RememberResolution(ServerPolicy::ClassifyHostname(node), *result);
+    return status;
+}
+
+bool InstallResolverHooks() noexcept {
+    const HMODULE ws2 = GetModuleHandleW(L"ws2_32.dll");
+    if (!ws2) return false;
+    getAddrInfoATarget = reinterpret_cast<void*>(GetProcAddress(ws2, "getaddrinfo"));
+    getAddrInfoWTarget = reinterpret_cast<void*>(GetProcAddress(ws2, "GetAddrInfoW"));
+    bool installedAny{};
+    if (getAddrInfoATarget && HookManager::Create(getAddrInfoATarget, reinterpret_cast<void*>(&HookedGetAddrInfoA),
+        reinterpret_cast<void**>(&originalGetAddrInfoA))) installedAny = true;
+    else getAddrInfoATarget = nullptr;
+    if (getAddrInfoWTarget && HookManager::Create(getAddrInfoWTarget, reinterpret_cast<void*>(&HookedGetAddrInfoW),
+        reinterpret_cast<void**>(&originalGetAddrInfoW))) installedAny = true;
+    else getAddrInfoWTarget = nullptr;
+    return installedAny;
+}
+
+ServerNetwork MatchKnownRemote(int family, const std::array<std::uint8_t, 16>& address, SteadyTime now) noexcept {
+    try {
+        std::scoped_lock lock(resolutionsMutex);
+        std::erase_if(resolutions, [&](const ResolvedEndpoint& value) { return value.expiresAt <= now; });
+        ServerNetwork match = ServerNetwork::UnknownRemote;
+        for (const auto& value : resolutions) {
+            if (value.family != family || value.address != address) continue;
+            if (match != ServerNetwork::UnknownRemote && match != value.network) return ServerNetwork::UnknownRemote;
+            match = value.network;
+        }
+        return match;
+    } catch (...) { return ServerNetwork::UnknownRemote; }
+}
+
 // POD-only so it needs no unwinding (a requirement for __try).
 bool CallGetterGuarded(GetLevelDataFn getter, void* self, void*& result) noexcept {
     __try {
@@ -165,17 +264,31 @@ bool ShouldSample(const void* peer, SteadyTime now, bool& firstSeen) {
     return true;
 }
 
-SessionKind ClassifyRemote(const std::uint8_t* remote) noexcept {
+struct RemoteClassification {
+    SessionKind kind{SessionKind::Server};
+    ServerNetwork network{ServerNetwork::UnknownRemote};
+};
+
+RemoteClassification ClassifyRemote(const std::uint8_t* remote, SteadyTime now) noexcept {
     std::uint16_t family{};
-    if (!SafeMemory::ReadField(remote, RemoteSystem_AddressFamily, family)) return SessionKind::Server;
+    if (!SafeMemory::ReadField(remote, RemoteSystem_AddressFamily, family)) return {};
     if (family == FamilyIpv4) {
         std::array<std::uint8_t, 4> address{};
-        if (SafeMemory::ReadField(remote, RemoteSystem_Ipv4, address)) return Modules::ClassifyRemoteIpv4(address);
+        if (SafeMemory::ReadField(remote, RemoteSystem_Ipv4, address)) {
+            const auto kind = Modules::ClassifyRemoteIpv4(address);
+            if (kind != SessionKind::Server) return {kind, ServerNetwork::Local};
+            std::array<std::uint8_t, 16> key{};
+            std::ranges::copy(address, key.begin());
+            return {kind, MatchKnownRemote(AF_INET, key, now)};
+        }
     } else if (family == FamilyIpv6) {
         std::array<std::uint8_t, 16> address{};
-        if (SafeMemory::ReadField(remote, RemoteSystem_Ipv6, address)) return Modules::ClassifyRemoteIpv6(address);
+        if (SafeMemory::ReadField(remote, RemoteSystem_Ipv6, address)) {
+            const auto kind = Modules::ClassifyRemoteIpv6(address);
+            return {kind, kind == SessionKind::Server ? MatchKnownRemote(AF_INET6, address, now) : ServerNetwork::Local};
+        }
     }
-    return SessionKind::Server;
+    return {};
 }
 
 void SamplePeer(const void* peer) noexcept {
@@ -222,8 +335,13 @@ void SamplePeer(const void* peer) noexcept {
         }
         const auto ping = Modules::AveragePing(ring);
         clientPing.store(ping.value_or(NoPing), std::memory_order_relaxed);
-        clientKind.store(static_cast<std::uint8_t>(ClassifyRemote(connected)), std::memory_order_relaxed);
+        const auto classification = ClassifyRemote(connected, now);
+        clientKind.store(static_cast<std::uint8_t>(classification.kind), std::memory_order_relaxed);
+        clientNetwork.store(static_cast<std::uint8_t>(classification.network), std::memory_order_relaxed);
         clientSampledAt.store(Ticks(now), std::memory_order_release);
+        if (auto* modules = moduleManager.load(std::memory_order_acquire)) {
+            ServerPolicy::Apply(*modules, classification.kind, classification.network);
+        }
     } catch (...) {}
 }
 
@@ -276,6 +394,7 @@ bool Install(ModuleManager& modules, std::wstring& detail) noexcept {
         modules.SetCapability(Capability::ServerState, {CapabilityState::Pending,
             L"Waiting for the first validated LevelData read in Minecraft " + build + L"."});
     } catch (...) {}
+    ServerPolicy::Apply(modules, SessionKind::None, ServerNetwork::Local);
 
     // RakNet::RakPeer::Receive, clang prologue (1.26.5203): the frame sizes
     // are wildcarded; the vtable call at +0x88 (IsActive) and the plugin-list
@@ -291,6 +410,11 @@ bool Install(ModuleManager& modules, std::wstring& detail) noexcept {
         detail = std::move(reason);
         try {
             modules.SetCapability(Capability::NetworkMetrics, {CapabilityState::Unavailable, detail});
+            ServerPolicy::Apply(modules, SessionKind::Server, ServerNetwork::UnknownRemote);
+            modules.SetCapability(Capability::DcPreventPolicy,
+                {CapabilityState::Unavailable, L"Server policy telemetry is unavailable, so DC Prevent is blocked."});
+            modules.SetCapability(Capability::CpsCapPolicy,
+                {CapabilityState::Unavailable, L"Server policy telemetry is unavailable, so CPS Cap is blocked."});
         } catch (...) {}
         moduleManager.store(&modules, std::memory_order_release);
         return false;
@@ -307,12 +431,21 @@ bool Install(ModuleManager& modules, std::wstring& detail) noexcept {
         return fail(L"The network-telemetry hook could not be installed.");
     }
     receiveTarget = target;
+    const bool resolverInstalled = InstallResolverHooks();
+    Diagnostics::LogLine(resolverInstalled ? "info" : "warning", "server_policy_resolver",
+        resolverInstalled ? "Privacy-preserving known-network resolver hooks installed"
+                          : "Resolver hooks unavailable; every remote server will fail closed");
     clientSampledAt.store(0);
     clientPing.store(NoPing);
     clientKind.store(static_cast<std::uint8_t>(SessionKind::None));
+    clientNetwork.store(static_cast<std::uint8_t>(ServerNetwork::Local));
     {
         std::scoped_lock lock(peersMutex);
         peers = {};
+    }
+    {
+        std::scoped_lock lock(resolutionsMutex);
+        resolutions.clear();
     }
     lastPublished = {};
     lastSampleLogged = {};
@@ -338,10 +471,14 @@ void Remove() noexcept {
         try {
             modules->SetCapability(Capability::NetworkMetrics, {CapabilityState::Unavailable, L"Session telemetry was detached."});
             modules->SetCapability(Capability::ServerState, {CapabilityState::Unavailable, L"Session telemetry was detached."});
+            ServerPolicy::Apply(*modules, SessionKind::None, ServerNetwork::Local);
+            modules->SetCapability(Capability::DcPreventPolicy, {CapabilityState::Unavailable, L"Server policy telemetry was detached."});
+            modules->SetCapability(Capability::CpsCapPolicy, {CapabilityState::Unavailable, L"Server policy telemetry was detached."});
         } catch (...) {}
     }
-    if (!receiveTarget) return;
-    (void)HookManager::Disable(receiveTarget);
+    if (receiveTarget) (void)HookManager::Disable(receiveTarget);
+    if (getAddrInfoATarget) (void)HookManager::Disable(getAddrInfoATarget);
+    if (getAddrInfoWTarget) (void)HookManager::Disable(getAddrInfoWTarget);
     for (unsigned attempt = 0; activeCallbacks.load(std::memory_order_acquire) != 0 && attempt < 200; ++attempt) Sleep(5);
     if (activeCallbacks.load(std::memory_order_acquire) != 0) {
         Diagnostics::LogLine("warning", "session_telemetry_remove",
@@ -349,20 +486,41 @@ void Remove() noexcept {
         UnloadGuard::Block("session telemetry trampoline still had a live thread at detach");
         return;
     }
-    (void)HookManager::Remove(receiveTarget);
+    if (receiveTarget) (void)HookManager::Remove(receiveTarget);
+    if (getAddrInfoATarget) (void)HookManager::Remove(getAddrInfoATarget);
+    if (getAddrInfoWTarget) (void)HookManager::Remove(getAddrInfoWTarget);
     receiveTarget = nullptr;
     originalReceive = nullptr;
+    getAddrInfoATarget = nullptr;
+    getAddrInfoWTarget = nullptr;
+    originalGetAddrInfoA = nullptr;
+    originalGetAddrInfoW = nullptr;
+    {
+        std::scoped_lock lock(resolutionsMutex);
+        resolutions.clear();
+    }
 }
 
 void Observe(const void* actor, SteadyTime now) noexcept {
     auto* modules = moduleManager.load(std::memory_order_acquire);
-    if (!modules || !actor || now - lastPublished < PublishInterval) return;
-    lastPublished = now;
+    if (!modules) return;
 
     const auto sampledAt = clientSampledAt.load(std::memory_order_acquire);
+    const bool hadClientSample = sampledAt != 0;
     const bool connected = sampledAt != 0 && Ticks(now) - sampledAt < std::chrono::duration_cast<SteadyClock::duration>(ClientFreshness).count();
     const auto ping = clientPing.load(std::memory_order_relaxed);
-    const auto kind = connected ? static_cast<SessionKind>(clientKind.load(std::memory_order_relaxed)) : SessionKind::Singleplayer;
+    auto kind = connected ? static_cast<SessionKind>(clientKind.load(std::memory_order_relaxed)) : SessionKind::None;
+    auto network = connected ? static_cast<ServerNetwork>(clientNetwork.load(std::memory_order_relaxed)) : ServerNetwork::Local;
+
+    // A missing actor means there is no validated local world. Clear a stale
+    // remote decision immediately on the next observation instead of treating
+    // missing network telemetry as permission to filter input.
+    if (!actor && (ServerPolicy::CurrentSessionKind() != kind || ServerPolicy::CurrentNetwork() != network)) {
+        try { ServerPolicy::Apply(*modules, kind, network); } catch (...) {}
+    }
+    if (!actor && !connected) clientSampledAt.store(0, std::memory_order_release);
+    if (!actor || now - lastPublished < PublishInterval) return;
+    lastPublished = now;
 
     try {
         if (connected && ping != NoPing && attached.load(std::memory_order_acquire)) {
@@ -372,7 +530,12 @@ void Observe(const void* actor, SteadyTime now) noexcept {
 
         std::string rawName;
         if (ReadLevelName(actor, rawName)) {
-            ServerState state{now, kind, Modules::CleanWorldName(rawName)};
+            if (!connected && !hadClientSample) {
+                kind = SessionKind::Singleplayer;
+                network = ServerNetwork::Local;
+            }
+            ServerState state{now, kind, Modules::CleanWorldName(rawName), network};
+            ServerPolicy::Apply(*modules, kind, network);
             Promote(*modules, Capability::ServerState, serverValidated, "LevelData::mLevelName");
             if (state.displayName != lastName) {
                 lastName = state.displayName;

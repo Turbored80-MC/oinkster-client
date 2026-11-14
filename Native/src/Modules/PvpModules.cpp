@@ -146,7 +146,87 @@ PotionCounts CountPotions(const InventorySnapshot& inventory) noexcept {
     return counts;
 }
 
+float AttackRecovery(SteadyTime started, SteadyTime now, SteadyClock::duration duration) noexcept {
+    if (started == SteadyTime{} || duration <= SteadyClock::duration::zero()) return 1.0F;
+    if (now <= started) return 0.0F;
+    return std::clamp(std::chrono::duration<float>(now - started).count()
+        / std::chrono::duration<float>(duration).count(), 0.0F, 1.0F);
+}
+
 namespace {
+class AttackIndicatorModule final : public HudModuleBase<IOverlayModule> {
+public:
+    AttackIndicatorModule(ModuleMetadata metadata, HudLayout layout, SharedServices&)
+        : HudModuleBase(std::move(metadata), {
+            IntSetting("recovery-ms", "Recovery time", 500, 100, 2000, "%d ms",
+                "A local visual timer only; it does not change attacks or claim to expose a Bedrock server cooldown."),
+            ChoiceSetting("style", "Display style", "crosshair", {{"crosshair", "Crosshair ring"}, {"hud", "HUD text"}, {"both", "Both"}}),
+            BoolSetting("hide-ready", "Hide when ready", true),
+            ColorSetting("color", "Indicator color", 0xFFF28FB5U),
+            ColorSetting("confirmed-color", "Confirmed hit color", 0xFF7FE0A3U)}, layout) {}
+    void OnSettingsChanged(const SettingsReader& settings) override {
+        std::scoped_lock lock(mutex_);
+        recovery_ = std::chrono::milliseconds(settings.Int("recovery-ms"));
+        style_ = settings.Choice("style");
+        hideReady_ = settings.Bool("hide-ready");
+        color_ = settings.Color("color");
+        confirmedColor_ = settings.Color("confirmed-color");
+    }
+    void OnMouse(const MouseEvent& event) override {
+        if (event.uiCaptured || !event.pressed || event.changedButton != 1) return;
+        std::scoped_lock lock(mutex_);
+        started_ = event.occurredAt;
+        confirmedAt_ = {};
+    }
+    void OnCombat(const CombatEvent& event) override {
+        if (event.kind != CombatEventKind::LocalHitConfirmed) return;
+        std::scoped_lock lock(mutex_);
+        confirmedAt_ = event.occurredAt;
+    }
+    void OnRender(const RenderEvent& event) override { std::scoped_lock lock(mutex_); NoteRender(event); }
+    [[nodiscard]] HudContent Content() const override {
+        std::scoped_lock lock(mutex_);
+        if (style_ == "crosshair") return {};
+        const float progress = AttackRecovery(started_, RenderNow(), recovery_);
+        if (hideReady_ && progress >= 1.0F) return {};
+        const bool confirmed = confirmedAt_ != SteadyTime{} && RenderNow() >= confirmedAt_
+            && RenderNow() - confirmedAt_ <= std::chrono::milliseconds(250);
+        return {{{std::format("Attack  {:.0f}%", progress * 100.0F), confirmed ? HudTone::Good : HudTone::Accent}}, {}, {}};
+    }
+    [[nodiscard]] OverlayPrimitives Primitives(float width, float height) const override {
+        std::scoped_lock lock(mutex_);
+        OverlayPrimitives primitives;
+        if (style_ == "hud" || width <= 0.0F || height <= 0.0F) return primitives;
+        const float progress = AttackRecovery(started_, RenderNow(), recovery_);
+        if (hideReady_ && progress >= 1.0F) return primitives;
+        const bool confirmed = confirmedAt_ != SteadyTime{} && RenderNow() >= confirmedAt_
+            && RenderNow() - confirmedAt_ <= std::chrono::milliseconds(250);
+        const std::uint32_t color = confirmed ? confirmedColor_ : color_;
+        const float cx = width * 0.5F;
+        const float cy = height * 0.5F;
+        constexpr int Segments = 24;
+        constexpr float Radius = 13.0F;
+        constexpr float Pi = 3.14159265358979323846F;
+        const int shown = static_cast<int>(std::ceil(progress * Segments));
+        for (int segment = 0; segment < shown; ++segment) {
+            const float a = -Pi * 0.5F + 2.0F * Pi * static_cast<float>(segment) / Segments;
+            const float b = -Pi * 0.5F + 2.0F * Pi * static_cast<float>(segment + 1) / Segments;
+            primitives.lines.push_back({cx + std::cos(a) * Radius, cy + std::sin(a) * Radius,
+                cx + std::cos(b) * Radius, cy + std::sin(b) * Radius, color, 2.0F});
+        }
+        return primitives;
+    }
+
+private:
+    SteadyTime started_{};
+    SteadyTime confirmedAt_{};
+    SteadyClock::duration recovery_{std::chrono::milliseconds(500)};
+    std::string style_{"crosshair"};
+    bool hideReady_{true};
+    std::uint32_t color_{0xFFF28FB5U};
+    std::uint32_t confirmedColor_{0xFF7FE0A3U};
+};
+
 class ComboCounterModule final : public HudModuleBase<> {
 public:
     ComboCounterModule(ModuleMetadata metadata, HudLayout layout, SharedServices&)
@@ -306,5 +386,6 @@ std::unique_ptr<IModule> MakeComboCounter(ModuleMetadata m, HudLayout l, SharedS
 std::unique_ptr<IModule> MakeHitDistance(ModuleMetadata m, HudLayout l, SharedServices& s) { return std::make_unique<HitDistanceModule>(std::move(m), l, s); }
 std::unique_ptr<IModule> MakeEquipmentWarnings(ModuleMetadata m, HudLayout l, SharedServices& s) { return std::make_unique<EquipmentWarningsModule>(std::move(m), l, s); }
 std::unique_ptr<IModule> MakePotionCounter(ModuleMetadata m, HudLayout l, SharedServices& s) { return std::make_unique<PotionCounterModule>(std::move(m), l, s); }
+std::unique_ptr<IModule> MakeAttackIndicator(ModuleMetadata m, HudLayout l, SharedServices& s) { return std::make_unique<AttackIndicatorModule>(std::move(m), l, s); }
 
 }

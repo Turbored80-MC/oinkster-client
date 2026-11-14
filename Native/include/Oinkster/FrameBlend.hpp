@@ -37,6 +37,9 @@ public:
     // GPU descriptor of the previous frame's capture, if it is valid to
     // blend this frame. Call before building the overlay draw list.
     [[nodiscard]] std::optional<D3D12_GPU_DESCRIPTOR_HANDLE> PreviousFrame() const noexcept;
+    // GPU descriptor of the slot RecordCapture fills this frame: the raw
+    // current frame, valid for draws recorded after the capture.
+    [[nodiscard]] std::optional<D3D12_GPU_DESCRIPTOR_HANDLE> CurrentFrame() const noexcept;
 
     // Records: backbuffer PRESENT -> COPY_SOURCE, copy into the current
     // history slot, backbuffer -> RENDER_TARGET. Afterwards the backbuffer

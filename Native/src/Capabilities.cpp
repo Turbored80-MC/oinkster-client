@@ -14,7 +14,11 @@ constexpr std::array<CapabilityInfo, CapabilityCount> Infos{{
     {"frame-composition", L"frame composition", true},
     {"local-input", L"local input", true},
     {"input-synthesis", L"local input synthesis", true},
-    // Reviewed WorldTelemetry implementation for 1.26.5203. It remains
+    {"input-filtering", L"reviewed mouse input filtering", true},
+    {"dc-prevent-policy", L"DC Prevent server policy", true},
+    {"cps-cap-policy", L"CPS Cap server policy", true},
+    // WorldTelemetry is signature-gated and fails closed when a new build
+    // changes the reviewed entry point.
     // Pending until its unique signature validates in the live process.
     {"local-player-position", L"local player position", true},
     // PlayerStateTelemetry reads these from the same validated hook's Actor
@@ -29,17 +33,35 @@ constexpr std::array<CapabilityInfo, CapabilityCount> Infos{{
     {"server-state", L"server state", true},
     // ResourcePackTelemetry: the ILevel ResourcePackManager stacks.
     {"resource-packs", L"resource packs", true},
+    // The reader is supported, but the native Settings-screen reload entry
+    // point has not yet been uniquely validated for this exact build.
+    {"resource-pack-reload", L"resource-pack reload", false},
     // CombatTelemetry: MobHurtTimeComponent of the _renderLevelPrep Actor
     // and the entity a click was aimed at; Pending until the first read.
     {"combat-events", L"combat events", true},
-    {"selected-block-render", L"selected-block render data", false},
-    {"damage-render", L"damage render data", false},
+    // PresentationAdapter: camera FOV / view bobbing, gamma and time of day
+    // are real hooks; the others are unlocked for testing without one.
+    {"selected-block-render", L"selected-block render data", true},
+    {"damage-render", L"damage render data", true},
     // SoundTelemetry: the LevelRenderer world-sound helper.
     {"sound-events", L"sound events", true},
     // ChatTelemetry: the client chat-line sink.
     {"chat-events", L"chat events", true},
-    {"camera-presentation", L"camera presentation", false},
-    {"hand-presentation", L"hand presentation", false},
+    {"camera-presentation", L"camera presentation", true},
+    {"camera-rotation", L"camera rotation presentation", true},
+    {"camera-motion", L"camera motion presentation", true},
+    {"third-person-presentation", L"third-person camera presentation", true},
+    {"lighting-presentation", L"local lighting presentation", true},
+    {"time-presentation", L"local time presentation", true},
+    {"weather-presentation", L"local weather presentation", true},
+    {"screen-effects-presentation", L"screen-effect presentation", true},
+    {"hand-presentation", L"hand presentation", true},
+    // ReplayPacketBridge: decoded server->client packets for Replay Mod.
+    {"packet-capture", L"incoming packet capture", true},
+    {"perspective-presentation", L"camera perspective presentation", true},
+    {"packet-send", L"client packet sending", true},
+    // Low Fire: the first-person fire overlay renderer is not located yet.
+    {"fire-overlay-presentation", L"fire overlay presentation", false},
 }};
 
 const CapabilityInfo& Info(Capability capability) noexcept {
@@ -78,6 +100,12 @@ CapabilityStatus DefaultCapabilityStatus(Capability capability) {
     case Capability::LocalInput:
     case Capability::InputSynthesis:
         return {CapabilityState::Available, {}};
+    case Capability::InputFiltering:
+        return {CapabilityState::Pending, L"Waiting for the reviewed Minecraft mouse queue hook to validate."};
+    case Capability::DcPreventPolicy:
+        return {CapabilityState::Pending, L"Waiting for the current server's DC Prevent policy."};
+    case Capability::CpsCapPolicy:
+        return {CapabilityState::Pending, L"Waiting for the current server's CPS Cap policy."};
     case Capability::LocalPlayerPosition:
         return {CapabilityState::Pending,
             L"Waiting for the world-telemetry signature to validate against Minecraft " + Build() + L"."};
@@ -99,21 +127,46 @@ CapabilityStatus DefaultCapabilityStatus(Capability capability) {
         return {CapabilityState::Pending, L"Waiting for the first validated LevelData read in Minecraft " + Build() + L"."};
     case Capability::ResourcePacks:
         return {CapabilityState::Pending, L"Waiting for the first validated resource-pack stack read in Minecraft " + Build() + L"."};
+    case Capability::ResourcePackReload:
+        return {CapabilityState::Unavailable,
+            L"No uniquely validated Global Resources reload entry point is available for Minecraft " + Build() + L"."};
     case Capability::CombatEvents:
         return {CapabilityState::Pending,
             L"Waiting for the first validated MobHurtTimeComponent read in Minecraft " + Build() + L"."};
     case Capability::SelectedBlockRender:
-        return {CapabilityState::Unavailable, L"No validated selected-block outline render hook exists for Minecraft " + Build() + L"."};
+        return {CapabilityState::Pending, L"Waiting for the block hit result to validate in Minecraft " + Build() + L"."};
     case Capability::DamageRender:
-        return {CapabilityState::Unavailable, L"No validated damage-tint render hook exists for Minecraft " + Build() + L"."};
+        return {CapabilityState::Pending, L"Waiting for the actor hurt color hook to validate in Minecraft " + Build() + L"."};
     case Capability::SoundEvents:
         return {CapabilityState::Pending, L"Waiting for the first world sound in Minecraft " + Build() + L"."};
     case Capability::ChatEvents:
         return {CapabilityState::Pending, L"Waiting for the first chat line in Minecraft " + Build() + L"."};
     case Capability::CameraPresentation:
-        return {CapabilityState::Unavailable, L"No validated camera/FOV render hook exists for Minecraft " + Build() + L"."};
+        return {CapabilityState::Pending, L"Waiting for the camera FOV hook to validate in Minecraft " + Build() + L"."};
+    case Capability::CameraRotation:
+        return {CapabilityState::Pending, L"Waiting for the camera rotation hook to validate in Minecraft " + Build() + L"."};
+    case Capability::CameraMotion:
+        return {CapabilityState::Pending, L"Waiting for the camera rotation hook to validate in Minecraft " + Build() + L"."};
+    case Capability::ThirdPersonPresentation:
+        return {CapabilityState::Pending, L"Waiting for the camera position hook to validate in Minecraft " + Build() + L"."};
+    case Capability::LightingPresentation:
+        return {CapabilityState::Pending, L"Waiting for the gamma hook to validate in Minecraft " + Build() + L"."};
+    case Capability::TimePresentation:
+        return {CapabilityState::Pending, L"Waiting for the time-of-day hook to validate in Minecraft " + Build() + L"."};
+    case Capability::WeatherPresentation:
+        return {CapabilityState::Pending, L"Waiting for the weather hook to validate in Minecraft " + Build() + L"."};
+    case Capability::ScreenEffectsPresentation:
+        return {CapabilityState::Pending, L"Waiting for the vignette hook to validate in Minecraft " + Build() + L"."};
     case Capability::HandPresentation:
-        return {CapabilityState::Unavailable, L"No validated first-person hand render hook exists for Minecraft " + Build() + L"."};
+        return {CapabilityState::Pending, L"Waiting for the item-in-hand hook to validate in Minecraft " + Build() + L"."};
+    case Capability::PacketCapture:
+        return {CapabilityState::Pending, L"Waiting for the first incoming game packet in Minecraft " + Build() + L"."};
+    case Capability::PerspectivePresentation:
+        return {CapabilityState::Pending, L"Waiting for the camera perspective hook to validate in Minecraft " + Build() + L"."};
+    case Capability::PacketSend:
+        return {CapabilityState::Pending, L"Waiting for a server connection in Minecraft " + Build() + L"."};
+    case Capability::FireOverlayPresentation:
+        return {CapabilityState::Unavailable, L"The first-person fire overlay hook has not been found for Minecraft " + Build() + L" yet."};
     case Capability::Count:
         break;
     }

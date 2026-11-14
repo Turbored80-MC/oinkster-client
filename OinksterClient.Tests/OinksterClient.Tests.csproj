@@ -11,22 +11,27 @@
     <TreatWarningsAsErrors Condition="'$(Configuration)' == 'Debug'">true</TreatWarningsAsErrors>
   </PropertyGroup>
   <ItemGroup>
-    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
+    <ProjectReference Include="..\Oinkster.MediaBroker\Oinkster.MediaBroker.csproj" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.12.0" />
     <PackageReference Include="xunit" Version="2.9.3" />
-    <PackageReference Include="xunit.runner.visualstudio" Version="3.1.1">
+    <PackageReference Include="xunit.runner.visualstudio" Version="4.0.1">
       <PrivateAssets>all</PrivateAssets>
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
     </PackageReference>
   </ItemGroup>
   <ItemGroup>
+    <Compile Include="..\Models\AppVersion.cs" Link="Models\AppVersion.cs" />
     <Compile Include="..\Models\ClientReleaseManifest.cs" Link="Models\ClientReleaseManifest.cs" />
     <Compile Include="..\Models\ClientUpdateResult.cs" Link="Models\ClientUpdateResult.cs" />
+    <Compile Include="..\Models\CrosshairSettings.cs" Link="Models\CrosshairSettings.cs" />
     <Compile Include="..\Models\ModuleDefinition.cs" Link="Models\ModuleDefinition.cs" />
     <Compile Include="..\Models\NativeClientStatus.cs" Link="Models\NativeClientStatus.cs" />
     <Compile Include="..\Services\IClientUpdateService.cs" Link="Services\IClientUpdateService.cs" />
     <Compile Include="..\Services\ReleaseTrustOptions.cs" Link="Services\ReleaseTrustOptions.cs" />
     <Compile Include="..\Services\GitHubClientUpdateService.cs" Link="Services\GitHubClientUpdateService.cs" />
     <Compile Include="..\Services\ModuleSettingsService.cs" Link="Services\ModuleSettingsService.cs" />
+    <Compile Include="..\Services\BedrockVsyncPreflightService.cs" Link="Services\BedrockVsyncPreflightService.cs" />
+    <Compile Include="..\Services\DevelopmentClientBuildService.cs" Link="Services\DevelopmentClientBuildService.cs" />
   </ItemGroup>
   <ItemGroup>
     <!-- The shipped catalog, at the same relative path the launcher loads it from. -->

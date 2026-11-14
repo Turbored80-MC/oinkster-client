@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#bfe0f5">
+    <meta name="description" content="Found something broken in Oinkster? Report it here and it goes straight to the project's issue tracker.">
+    <title>Report a Bug · Oinkster</title>
+    <link rel="icon" href="favicon.ico" sizes="any">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:ital,wght@0,400;0,700;1,400&family=Pixelify+Sans:wght@500;700&display=swap">
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <a class="skip-link" href="#main">Skip to the form</a>
+
+    <div class="sky">
+        <header class="site-header">
+            <a class="brand" href="./">
+                <img src="assets/pig-64.png" alt="" width="36" height="36">
+                <span>Oinkster</span>
+            </a>
+            <nav aria-label="Main">
+                <a href="./#mods">Mods</a>
+                <a href="./#source">Source code</a>
+                <a href="./#download">Download</a>
+                <a href="bugs.html" aria-current="page">Report a bug</a>
+                <a href="suggestions.html">Suggest an idea</a>
+                <a href="https://github.com/Turbored80-MC/oinkster-client">GitHub</a>
+            </nav>
+        </header>
+        <div class="page-head">
+            <h1>Report a bug</h1>
+            <p>Something broken, crashing or acting strange? Tell us what happened. Your report becomes a public issue on the Oinkster GitHub page, so anyone can follow the fix.</p>
+        </div>
+        <div class="grass" aria-hidden="true"></div>
+    </div>
+
+    <main id="main">
+        <div class="report">
+            <form id="bug-form" novalidate>
+                <div class="field">
+                    <label for="bug-title">Short summary</label>
+                    <input id="bug-title" name="title" type="text" maxlength="120" required placeholder="Zoom stops working after leaving a server">
+                </div>
+
+                <div class="field">
+                    <label for="bug-what">What happened?</label>
+                    <textarea id="bug-what" name="what" maxlength="3000" required></textarea>
+                </div>
+
+                <div class="field">
+                    <label for="bug-steps">How can we make it happen again?</label>
+                    <p class="hint" id="bug-steps-hint">List the steps one per line, starting from opening the launcher.</p>
+                    <textarea id="bug-steps" name="steps" maxlength="3000" aria-describedby="bug-steps-hint"></textarea>
+                </div>
+
+                <div class="field">
+                    <label for="bug-expected">What did you expect instead?</label>
+                    <textarea id="bug-expected" name="expected" maxlength="1500"></textarea>
+                </div>
+
+                <div class="field-row">
+                    <div class="field">
+                        <label for="bug-launcher">Oinkster version</label>
+                        <input id="bug-launcher" name="launcherVersion" type="text" maxlength="40" value="1.1.0 Beta">
+                    </div>
+                    <div class="field">
+                        <label for="bug-bedrock">Minecraft version</label>
+                        <input id="bug-bedrock" name="bedrockVersion" type="text" maxlength="40" value="26.63">
+                    </div>
+                </div>
+
+                <div class="field">
+                    <label for="bug-contact">Discord or GitHub name (optional)</label>
+                    <p class="hint" id="bug-contact-hint">Only if you're happy for it to appear on the public issue. Don't post your email.</p>
+                    <input id="bug-contact" name="contact" type="text" maxlength="60" aria-describedby="bug-contact-hint">
+                </div>
+
+                <!-- Left empty by people; bots tend to fill it in. -->
+                <div class="trap" aria-hidden="true">
+                    <label for="bug-website">Leave this empty</label>
+                    <input id="bug-website" name="website" type="text" tabindex="-1" autocomplete="off">
+                </div>
+
+                <p class="form-status" id="form-status" role="status" hidden></p>
+                <button class="button button-primary" type="submit" id="bug-submit">Send report</button>
+            </form>
+
+            <aside aria-labelledby="tips-title">
+                <h2 id="tips-title">Helpful things to include</h2>
+                <ul>
+                    <li>Which mod was on when it happened.</li>
+                    <li>Whether you were in single player or on a server, and which one.</li>
+                    <li>If the game crashed, the file <code>oinkster-native.log</code> from <code>%LOCALAPPDATA%\Oinkster\Client</code>. You can attach it on the GitHub issue afterwards.</li>
+                </ul>
+                <h2>Keep it clean</h2>
+                <p>Reports with swearing or slurs are rejected, even when they're spelled with symbols. Describe the problem and we'll get on it.</p>
+            </aside>
+        </div>
+    </main>
+
+    <footer class="site-footer">
+        <div class="footer-inner">
+            <a class="brand" href="./"><img src="assets/pig-64.png" alt="" width="32" height="32"><span>Oinkster</span></a>
+            <nav aria-label="Footer">
+                <a href="https://github.com/Turbored80-MC/oinkster-client">Client source</a>
+                <a href="https://github.com/Turbored80-MC/oinkster-client-website">Website source</a>
+                <a href="https://github.com/Turbored80-MC/oinkster-client/issues">All issues</a>
+            </nav>
+            <p class="legal">Not an official Minecraft product. Not approved by or associated with Mojang Studios or Microsoft.</p>
+        </div>
+    </footer>
+
+    <script src="bugs.js" type="module"></script>
+</body>
+</html>

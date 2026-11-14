@@ -34,7 +34,7 @@ Use four-space indentation, file-scoped C# namespaces, nullable reference types,
 
 Launcher service and model logic is covered by the `OinksterClient.Tests` xUnit project (`dotnet test OinksterClient.Tests/OinksterClient.Tests.csproj`); it links individual `Services`/`Models` files rather than referencing the WinUI project, so add new files to its `.csproj` when you put testable logic in one. Name tests `MethodName_Condition_ExpectedResult`. Native tests run via `ctest --preset debug`.
 
-Both C# projects set `TreatWarningsAsErrors` for Debug, so every change must build warning-free in Debug. Release is exempt (trim-analyzer warnings from reflection-based JSON and from WinUI's own assemblies are expected there). The WinUI layer has no automated coverage, so UI changes also need a manual smoke test: verify Play, Settings, Back, resizing, keyboard focus, and asset loading.
+Both C# projects set `TreatWarningsAsErrors` for Debug, so every change must build warning-free in Debug. Release is not trimmed, because trimming breaks the reflection-based JSON the launcher uses at runtime. The WinUI layer has no automated coverage, so UI changes also need a manual smoke test: verify Play, Settings, Back, resizing, keyboard focus, and asset loading.
 
 ## Commit & Pull Request Guidelines
 
