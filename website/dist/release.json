@@ -1,7 +1,7 @@
 {
-    "version": "1.1.0 Beta",
+    "version": "1.1.1 Beta",
     "availability": "available",
-    "downloadUrl": "https://github.com/Turbored80-MC/oinkster-client/releases/download/release-v1.1.0/OinksterClient-Setup-1.1.0.exe",
+    "downloadUrl": "https://github.com/Turbored80-MC/oinkster-client/releases/download/release-v1.1.1/OinksterClient-Setup-1.1.1.exe",
     "platform": "Windows x64",
     "supportedBedrock": "26.63",
     "statusLabel": "Installer",

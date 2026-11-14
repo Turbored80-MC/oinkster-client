@@ -12,7 +12,7 @@
   <Identity
     Name="A2841650-401E-407E-AF67-B8BFAB909B4A"
     Publisher="CN=AppPublisher"
-    Version="1.1.0.0" />
+    Version="1.1.1.0" />
 
   <mp:PhoneIdentity PhoneProductId="A2841650-401E-407E-AF67-B8BFAB909B4A" PhonePublisherId="00000000-0000-0000-0000-000000000000"/>
 
@@ -40,7 +40,7 @@
       EntryPoint="$targetentrypoint$">
       <uap:VisualElements
         DisplayName="Oinkster Client"
-        Description="Oinkster Client 1.1.0 Beta"
+        Description="Oinkster Client 1.1.1 Beta"
         BackgroundColor="transparent"
         Square150x150Logo="Assets\OinksterSquare150x150Logo.png"
         Square44x44Logo="Assets\OinksterAppIcon.png">

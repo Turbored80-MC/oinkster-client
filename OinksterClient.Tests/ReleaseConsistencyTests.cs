@@ -17,16 +17,16 @@ public sealed class ReleaseConsistencyTests
         var manifest = XDocument.Load(Path.Combine(root, "Package.appxmanifest"));
         using var release = JsonDocument.Parse(File.ReadAllText(Path.Combine(root, "website", "dist", "release.json")));
 
-        Assert.Equal("1.1.0", project.Descendants("Version").Single().Value);
+        Assert.Equal("1.1.1", project.Descendants("Version").Single().Value);
         Assert.Equal(AppVersion.SemVer, project.Descendants("InformationalVersion").Single().Value);
-        Assert.Equal("1.1.0.0", manifest.Descendants().Single(element => element.Name.LocalName == "Identity").Attribute("Version")?.Value);
-        Assert.Equal("1.1.0.0", applicationManifest.Descendants().Single(element => element.Name.LocalName == "assemblyIdentity").Attribute("version")?.Value);
+        Assert.Equal("1.1.1.0", manifest.Descendants().Single(element => element.Name.LocalName == "Identity").Attribute("Version")?.Value);
+        Assert.Equal("1.1.1.0", applicationManifest.Descendants().Single(element => element.Name.LocalName == "assemblyIdentity").Attribute("version")?.Value);
         Assert.Contains(manifest.Descendants(), element =>
             element.Name.LocalName == "Capability" && element.Attribute("Name")?.Value == "globalMediaControl");
         Assert.Contains(project.Descendants("ProjectReference"), element =>
             element.Attribute("Include")?.Value == @"Oinkster.MediaBroker\Oinkster.MediaBroker.csproj");
         Assert.Equal(AppVersion.Display, release.RootElement.GetProperty("version").GetString());
-        Assert.Contains("release-v1.1.0/OinksterClient-Setup-1.1.0.exe",
+        Assert.Contains("release-v1.1.1/OinksterClient-Setup-1.1.1.exe",
             release.RootElement.GetProperty("downloadUrl").GetString(), StringComparison.Ordinal);
     }
 
